@@ -65,9 +65,9 @@ data_collection = [
     "lerobot @ git+https://github.com/huggingface/lerobot.git@a445d9c9da6bea99a8972daa4fe1fdd053d711d2",
     "datasets==3.6.0",
 ]
-# Camera server: runs on the robot to publish camera frames over ZMQ
-# Includes depthai (OAK cameras) by default. For other SDKs (pyrealsense2),
-# install them separately into the .venv_camera venv.
+# Camera server: runs on the computer connected to the cameras and publishes over ZMQ.
+# Includes depthai (OAK cameras) by default. Install pyrealsense2 separately for
+# RealSense. The ZED SDK provides pyzed and must be installed from Stereolabs.
 # Usage: pip install -e "gear_sonic[camera]"
 camera = [
     "pyzmq",

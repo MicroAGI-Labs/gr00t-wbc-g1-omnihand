@@ -1,7 +1,7 @@
 # systemd service for the SONIC composed camera server.
 #
-# Publishes JPEG-encoded camera frames over ZMQ so the data exporter
-# (on the workstation) can subscribe and record.
+# Runs on the computer connected to the cameras and publishes JPEG frames over
+# ZMQ. The exporter may run on the same computer (use localhost) or remotely.
 #
 # ── Setup ────────────────────────────────────────────────────────
 #  The install script can generate and install this automatically:
@@ -24,6 +24,8 @@
 #       python -c "import depthai as dai; print(dai.Device.getAllAvailableDevices())"
 #  RealSense:
 #       rs-enumerate-devices --short
+#  ZED:
+#       python -c "import pyzed.sl as sl; print(sl.Camera.get_device_list())"
 #  USB:
 #       ls /dev/video*    # use the index number, e.g. "0" for /dev/video0
 # ─────────────────────────────────────────────────────────────────
@@ -39,6 +41,7 @@ Type=simple
 User=nvidia
 Environment="HOME=/home/nvidia"
 Environment="REPO_DIR=/home/nvidia/GR00T-WholeBodyControl"
+Environment="PYTHONUNBUFFERED=1"
 # ─────────────────────────────────────────────────────────────────
 
 WorkingDirectory=${REPO_DIR}
@@ -55,6 +58,12 @@ ExecStart=${REPO_DIR}/.venv_camera/bin/python -m gear_sonic.camera.composed_came
 #     --ego-view-camera oak --ego-view-device-id EGO_MXID \
 #     --left-wrist-camera oak --left-wrist-device-id LEFT_MXID \
 #     --right-wrist-camera oak --right-wrist-device-id RIGHT_MXID \
+#     --port 5555
+
+# ZED ego-view example (HD720 capture and publication at 60 FPS):
+# ExecStart=${REPO_DIR}/.venv_camera/bin/python -m gear_sonic.camera.composed_camera \
+#     --ego-view-camera zed --ego-view-device-id YOUR_ZED_SERIAL \
+#     --zed-camera-resolution HD720 --zed-camera-fps 60 --fps 60 \
 #     --port 5555
 
 Restart=on-failure
