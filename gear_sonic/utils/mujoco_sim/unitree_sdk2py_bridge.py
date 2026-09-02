@@ -57,7 +57,16 @@ class UnitreeSdk2Bridge:
 
         self.num_body_motor = config["NUM_MOTORS"]
         self.num_hand_motor = config.get("NUM_HAND_MOTORS", 0)
+        self.external_hand_control = config.get("EXTERNAL_HAND_CONTROL", False)
+        if self.external_hand_control:
+            self.num_hand_motor = 0
         self.use_sensor = config["USE_SENSOR"]
+
+        # Subscriber callbacks may run as soon as Init returns, so their locks
+        # must exist before any DDS subscriber is started.
+        self.low_cmd_lock = threading.Lock()
+        self.left_hand_cmd_lock = threading.Lock()
+        self.right_hand_cmd_lock = threading.Lock()
 
         self.have_imu_ = False
         self.have_frame_sensor_ = False
@@ -79,26 +88,26 @@ class UnitreeSdk2Bridge:
         self.torso_imu_puber = ChannelPublisher("rt/secondary_imu", IMUState_)
         self.torso_imu_puber.Init()
 
-        self.left_hand_state = HandState_default()
-        self.left_hand_state_puber = ChannelPublisher("rt/dex3/left/state", HandState_)
-        self.left_hand_state_puber.Init()
-        self.right_hand_state = HandState_default()
-        self.right_hand_state_puber = ChannelPublisher("rt/dex3/right/state", HandState_)
-        self.right_hand_state_puber.Init()
-
         self.low_cmd_suber = ChannelSubscriber("rt/lowcmd", LowCmd_)
         self.low_cmd_suber.Init(self.LowCmdHandler, 1)
 
         self.left_hand_cmd = HandCmd_default()
-        self.left_hand_cmd_suber = ChannelSubscriber("rt/dex3/left/cmd", HandCmd_)
-        self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
         self.right_hand_cmd = HandCmd_default()
-        self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
-        self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
-
-        self.low_cmd_lock = threading.Lock()
-        self.left_hand_cmd_lock = threading.Lock()
-        self.right_hand_cmd_lock = threading.Lock()
+        self.left_hand_state = HandState_default()
+        self.right_hand_state = HandState_default()
+        self.left_hand_state_puber = None
+        self.right_hand_state_puber = None
+        self.left_hand_cmd_suber = None
+        self.right_hand_cmd_suber = None
+        if not self.external_hand_control:
+            self.left_hand_state_puber = ChannelPublisher("rt/dex3/left/state", HandState_)
+            self.left_hand_state_puber.Init()
+            self.right_hand_state_puber = ChannelPublisher("rt/dex3/right/state", HandState_)
+            self.right_hand_state_puber.Init()
+            self.left_hand_cmd_suber = ChannelSubscriber("rt/dex3/left/cmd", HandCmd_)
+            self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
+            self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
+            self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
 
         self.wireless_controller = unitree_go_msg_dds__WirelessController_()
         self.wireless_controller_puber = ChannelPublisher(
@@ -165,6 +174,8 @@ class UnitreeSdk2Bridge:
             left_hand_cmd_received = self.left_hand_cmd_received
         with self.right_hand_cmd_lock:
             right_hand_cmd_received = self.right_hand_cmd_received
+        if self.external_hand_control:
+            return low_cmd_received
         return low_cmd_received or left_hand_cmd_received or right_hand_cmd_received
 
     def PublishLowState(self, obs: Dict[str, any]):
@@ -207,16 +218,18 @@ class UnitreeSdk2Bridge:
 
         self.torso_imu_puber.Write(self.torso_imu_state)
 
-        # publish hand state
-        for i in range(self.num_hand_motor):
-            self.left_hand_state.motor_state[i].q = obs["left_hand_q"][i]
-            self.left_hand_state.motor_state[i].dq = obs["left_hand_dq"][i]
-        self.left_hand_state_puber.Write(self.left_hand_state)
+        if not self.external_hand_control:
+            # Publish only the legacy Dex3 state. The O10 controller receives
+            # measured MuJoCo feedback through its model-qualified ZMQ channel.
+            for i in range(self.num_hand_motor):
+                self.left_hand_state.motor_state[i].q = obs["left_hand_q"][i]
+                self.left_hand_state.motor_state[i].dq = obs["left_hand_dq"][i]
+            self.left_hand_state_puber.Write(self.left_hand_state)
 
-        for i in range(self.num_hand_motor):
-            self.right_hand_state.motor_state[i].q = obs["right_hand_q"][i]
-            self.right_hand_state.motor_state[i].dq = obs["right_hand_dq"][i]
-        self.right_hand_state_puber.Write(self.right_hand_state)
+            for i in range(self.num_hand_motor):
+                self.right_hand_state.motor_state[i].q = obs["right_hand_q"][i]
+                self.right_hand_state.motor_state[i].dq = obs["right_hand_dq"][i]
+            self.right_hand_state_puber.Write(self.right_hand_state)
 
     def GetAction(self) -> Tuple[np.ndarray, bool, bool]:
         with self.low_cmd_lock:
@@ -226,11 +239,16 @@ class UnitreeSdk2Bridge:
         with self.right_hand_cmd_lock:
             right_hand_q = [self.right_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)]
         with self.low_cmd_lock and self.left_hand_cmd_lock and self.right_hand_cmd_lock:
-            is_new_action = self.new_low_cmd and self.new_left_hand_cmd and self.new_right_hand_cmd
+            is_new_action = (
+                self.new_low_cmd
+                if self.external_hand_control
+                else self.new_low_cmd and self.new_left_hand_cmd and self.new_right_hand_cmd
+            )
             if is_new_action:
                 self.new_low_cmd = False
-                self.new_left_hand_cmd = False
-                self.new_right_hand_cmd = False
+                if not self.external_hand_control:
+                    self.new_left_hand_cmd = False
+                    self.new_right_hand_cmd = False
 
         return (
             np.concatenate([body_q[:-7], left_hand_q, body_q[-7:], right_hand_q]),
@@ -325,8 +343,8 @@ class UnitreeSdk2Bridge:
             print("Unsupported gamepad. ")
 
     def PrintSceneInformation(self):
-        import mujoco
         from loguru import logger
+        import mujoco
         from termcolor import colored
 
         print(" ")

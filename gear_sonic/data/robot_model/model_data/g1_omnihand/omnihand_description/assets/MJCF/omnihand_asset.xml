@@ -1,0 +1,44 @@
+<mujoco model="omnihand_asset">
+    <compiler angle="radian"
+        meshdir="../meshes/" />
+    <asset>
+        <mesh name="l_palm" file="l_palm.STL" />
+        <mesh name="l_thumb_roll" file="l_thumb_roll.STL" />
+        <mesh name="r_palm" file="r_palm.STL" />
+        <mesh name="r_thumb_roll" file="r_thumb_roll.STL" />
+        <mesh name="thumb_abad" file="thumb_abad.STL" />
+        <mesh name="thumb_mcp" file="thumb_mcp.STL" />
+        <mesh name="thumb_pip" file="thumb_pip.STL" />
+        <mesh name="thumb_dip" file="thumb_dip.STL" />
+        <mesh name="finger_abad" file="finger_abad.STL" />
+        <mesh name="finger_pip" file="finger_pip.STL" />
+        <mesh name="finger_dip" file="finger_dip.STL" />
+
+        <mesh name="l_palm_col" file="collision/l_palm_col.STL" />
+        <mesh name="l_thumb_roll_col" file="collision/l_thumb_roll_col.STL" />
+        <mesh name="r_palm_col" file="collision/r_palm_col.STL" />
+        <mesh name="r_thumb_roll_col" file="collision/r_thumb_roll_col.STL" />
+        <mesh name="thumb_abad_col" file="collision/thumb_abad_col.STL" />
+        <mesh name="thumb_mcp_col" file="collision/thumb_mcp_col.STL" />
+        <mesh name="thumb_pip_col" file="collision/thumb_pip_col.STL" />
+        <mesh name="thumb_dip_col" file="collision/thumb_dip_col.STL" />
+        <mesh name="finger_pip_col" file="collision/finger_pip_col.STL" />
+        <mesh name="finger_dip_col" file="collision/finger_dip_col.STL" />
+        <material name="white" rgba="0.95 0.95 0.95 1.0" />
+        <material name="read" rgba="1 0.0 0.0 1.0" />
+    </asset>
+
+    <default>
+        <default class="hand_joint">
+            <joint type="hinge" limited="true" damping="0.05" armature="0.001" margin="0.01"
+                frictionloss="0.01" />
+        </default>
+        <default class="plastic_visual">
+            <geom type="mesh" contype="0" conaffinity="0" group="2" material="white" />
+        </default>
+        <default class="plastic_collision">
+            <geom material="read" type="mesh" density="662" friction="1 0.005 0.001" condim="3"
+                margin="0.0005" contype="1" conaffinity="1" group="3" />
+        </default>
+    </default>
+</mujoco>

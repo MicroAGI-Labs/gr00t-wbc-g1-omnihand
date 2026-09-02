@@ -25,6 +25,7 @@
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -35,8 +36,12 @@ from scipy.spatial.transform import Rotation as R, Rotation as sRot
 import torch
 import zmq
 
-from gear_sonic.utils.teleop import input_readers
-from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
+from gear_sonic.end_effectors.controller import TriggerHysteresis
+from gear_sonic.end_effectors.protocol import (
+    HAND_INTENT_SCHEMA,
+    HAND_INTENT_TOPIC,
+    encode as encode_hand_message,
+)
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
@@ -46,6 +51,8 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_angle_axis,
     quaternion_to_rotation_matrix,
 )
+from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
 try:
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -130,6 +137,110 @@ class StreamMode(Enum):
     PLANNER_FROZEN_UPPER_BODY = 3
     POSE_PAUSE = 4
     PLANNER_VR_3PT = 5
+
+
+class FaceChordTracker:
+    """Confirm a two-button face chord only after the whole gesture is released.
+
+    Any third face button cancels the candidate. This lets the four-button
+    policy chord be pressed and released in any order without leaking one of
+    its two-button subsets into mode selection or data collection.
+    """
+
+    CHORDS = {
+        frozenset(("a", "x")): "ax",
+        frozenset(("b", "y")): "by",
+        frozenset(("x", "b")): "xb",
+        frozenset(("y", "a")): "ya",
+        frozenset(("a", "b")): "ab",
+        frozenset(("x", "y")): "xy",
+    }
+
+    def __init__(self) -> None:
+        self._active = False
+        self._candidate: str | None = None
+        self._cancelled = False
+
+    def reset(self) -> None:
+        self._active = False
+        self._candidate = None
+        self._cancelled = False
+
+    def update(self, a: bool, b: bool, x: bool, y: bool) -> str | None:
+        pressed = frozenset(
+            name for name, down in (("a", a), ("b", b), ("x", x), ("y", y)) if down
+        )
+        if not pressed:
+            confirmed = self._candidate if self._active and not self._cancelled else None
+            self.reset()
+            return confirmed
+
+        if not self._active:
+            self._active = True
+
+        if len(pressed) > 2:
+            self._cancelled = True
+            self._candidate = None
+        elif len(pressed) == 2 and not self._cancelled:
+            chord = self.CHORDS.get(pressed)
+            if self._candidate is None:
+                self._candidate = chord
+            elif chord != self._candidate:
+                self._cancelled = True
+                self._candidate = None
+        return None
+
+
+class HandIntentStream:
+    """Publish independent, freshness-qualified close intent for both hands."""
+
+    def __init__(self) -> None:
+        # A controller can outlive and reconnect to this publisher. Seed from
+        # the host monotonic clock so a restarted streamer never replays a
+        # lower sequence that the safety controller must reject as stale.
+        self.sequence = time.monotonic_ns()
+        self.last_source_timestamp_ns: int | None = None
+        self.hysteresis = TriggerHysteresis()
+
+    def publish(self, socket, reader) -> None:
+        _, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(reader)
+        try:
+            source_timestamp_ns = int(reader.get_timestamp_ns())
+        except Exception:
+            source_timestamp_ns = 0
+        valid = source_timestamp_ns > 0 and source_timestamp_ns != self.last_source_timestamp_ns
+        if valid:
+            self.last_source_timestamp_ns = source_timestamp_ns
+        # Preserve the familiar teleop fist control on the side grip while
+        # also accepting the index trigger. The external hand protocol is a
+        # binary open/close contract, so the stronger input is the close
+        # demand passed through hysteresis.
+        left_close = float(np.clip(max(left_trigger, left_grip), 0.0, 1.0))
+        right_close = float(np.clip(max(right_trigger, right_grip), 0.0, 1.0))
+        left_closed = self.hysteresis.update("left", left_close, valid)
+        right_closed = self.hysteresis.update("right", right_close, valid)
+        self.sequence += 1
+        socket.send(
+            encode_hand_message(
+                HAND_INTENT_TOPIC,
+                {
+                    "schema": HAND_INTENT_SCHEMA,
+                    "sequence": self.sequence,
+                    "monotonic_ns": time.monotonic_ns(),
+                    "source": "pico",
+                    "left": {
+                        "valid": valid,
+                        "closed": left_closed,
+                        "trigger": left_close,
+                    },
+                    "right": {
+                        "valid": valid,
+                        "closed": right_closed,
+                        "trigger": right_close,
+                    },
+                },
+            )
+        )
 
 
 ### Parse 3 point pose from SMPL
@@ -803,21 +914,31 @@ class PicoReader:
     Background reader that pulls Pico/XRT data as fast as possible and computes dt/FPS.
     """
 
+    STALE_TIMEOUT = 2.0
+
     def __init__(self, max_queue_size: int = 15):
+        del max_queue_size
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
-        self._last_t = None
         self._fps_ema = 0.0
         self._last_stamp_ns = None
         self._latest = None
         self._lock = threading.Lock()
+        self._last_new_data_time = time.monotonic()
+        self._disconnected = threading.Event()
 
     def start(self):
+        if self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._last_new_data_time = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
-        self._thread.join(timeout=1.0)
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
     def get_latest(self):
         with self._lock:
@@ -825,10 +946,23 @@ class PicoReader:
 
     @property
     def disconnected(self) -> bool:
-        return False
+        return self._disconnected.is_set()
 
     def clear_disconnect(self):
-        pass
+        self._disconnected.clear()
+        self._last_new_data_time = time.monotonic()
+        self._last_stamp_ns = None
+        self._fps_ema = 0.0
+
+    def reconnect(self) -> None:
+        """Reconnect the native XRT client without replacing this reader object."""
+        self.stop()
+        with self._lock:
+            self._latest = None
+        _close_xrt()
+        _connect_xrt_body_stream()
+        self.clear_disconnect()
+        self.start()
 
     def get_timestamp_ns(self) -> int:
         if xrt is None:
@@ -838,12 +972,26 @@ class PicoReader:
     def _run(self):
         last_report = time.time()
         while not self._stop.is_set():
-            if not xrt.is_body_data_available():
+            try:
+                body_available = xrt.is_body_data_available()
+            except Exception as exc:
+                print(f"[PicoReader] availability error: {exc}")
+                body_available = False
+
+            if not body_available:
+                self._flag_disconnect_if_stale("No body data")
                 time.sleep(0.001)
                 continue
-            stamp_ns = xrt.get_time_stamp_ns()
+            try:
+                stamp_ns = xrt.get_time_stamp_ns()
+            except Exception as exc:
+                print(f"[PicoReader] timestamp error: {exc}")
+                self._flag_disconnect_if_stale("Timestamp read failed")
+                time.sleep(0.01)
+                continue
             prev_stamp_ns = self._last_stamp_ns
             if prev_stamp_ns is not None and stamp_ns == prev_stamp_ns:
+                self._flag_disconnect_if_stale("Body timestamps stopped")
                 time.sleep(0.000001)
                 continue
             # Compute device-based dt/fps using timestamp deltas (ns -> s)
@@ -867,6 +1015,10 @@ class PicoReader:
                 }
                 with self._lock:
                     self._latest = sample
+                self._last_new_data_time = time.monotonic()
+                if self._disconnected.is_set():
+                    print("[PicoReader] Fresh body data received; connection restored")
+                    self._disconnected.clear()
                 now = time.time()
                 if now - last_report >= 5.0:
                     print(
@@ -875,6 +1027,14 @@ class PicoReader:
                     last_report = now
             except Exception as e:
                 print(f"[PicoReader] read error: {e}")
+
+    def _flag_disconnect_if_stale(self, reason: str) -> None:
+        if (
+            time.monotonic() - self._last_new_data_time > self.STALE_TIMEOUT
+            and not self._disconnected.is_set()
+        ):
+            print(f"[PicoReader] {reason} for {self.STALE_TIMEOUT:.1f}s; reconnecting")
+            self._disconnected.set()
 
 
 def _pose_stream_common(
@@ -927,10 +1087,12 @@ def _pose_stream_common(
 
     if stop_event is None:
         stop_event = threading.Event()
+    hand_intent = HandIntentStream()
 
     try:
         while not stop_event.is_set():
             streamer.run_once()
+            hand_intent.publish(socket, reader)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1354,11 +1516,11 @@ class PoseStreamer:
         # Get A and B button states for data collection control
         a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
 
-        # Data collection toggle logic (edge-triggered)
-        # Left grip + A = toggle_data_collection
-        # Left grip + B = toggle_data_abort
-        toggle_data_collection_tmp = a_pressed and left_grip > 0.5
-        toggle_data_abort_tmp = b_pressed and left_grip > 0.5
+        # Data collection controls avoid grip/trigger inputs so starting a
+        # recording cannot alter the demonstrated hand pose.
+        # X+B = start/stop-success, Y+A = discard the active take.
+        toggle_data_collection_tmp = x_pressed and b_pressed
+        toggle_data_abort_tmp = y_pressed and a_pressed
 
         # Detect rising edge
         toggle_data_collection = toggle_data_collection_tmp and not self.toggle_data_collection_last
@@ -1565,6 +1727,83 @@ class PoseStreamer:
         self.frame_start = time.time()
 
 
+XRT_SERVICE_HOST = "127.0.0.1"
+XRT_SERVICE_PORT = 60061
+XRT_CONNECT_ATTEMPT_SECONDS = 8.0
+
+
+def _port_is_open(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.25)
+        return probe.connect_ex((host, port)) == 0
+
+
+def _ensure_robotics_service() -> None:
+    """Start the local XRT bridge only when there is not already one listening."""
+    if _port_is_open(XRT_SERVICE_HOST, XRT_SERVICE_PORT):
+        return
+
+    print("[XRT] Starting RoboticsService bridge...")
+    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        if _port_is_open(XRT_SERVICE_HOST, XRT_SERVICE_PORT):
+            print("[XRT] RoboticsService bridge is ready")
+            return
+        time.sleep(0.25)
+    raise RuntimeError(
+        f"RoboticsService did not open {XRT_SERVICE_HOST}:{XRT_SERVICE_PORT}"
+    )
+
+
+def _close_xrt() -> None:
+    if xrt is None:
+        return
+    try:
+        xrt.close()
+    except Exception as exc:
+        print(f"[XRT] SDK close warning: {exc}")
+
+
+def _connect_xrt_body_stream() -> None:
+    """Keep resubscribing until live, advancing full-body timestamps arrive."""
+    if xrt is None:
+        raise ImportError(
+            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run Pico streaming."
+        )
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            _ensure_robotics_service()
+            print(f"[XRT] SDK subscription attempt {attempt}")
+            xrt.init()
+            deadline = time.monotonic() + XRT_CONNECT_ATTEMPT_SECONDS
+            first_stamp_ns = None
+            while time.monotonic() < deadline:
+                if xrt.is_body_data_available():
+                    stamp_ns = int(xrt.get_time_stamp_ns())
+                    if first_stamp_ns is None:
+                        first_stamp_ns = stamp_ns
+                    elif stamp_ns != first_stamp_ns:
+                        print("[XRT] Live full-body stream connected")
+                        return
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            _close_xrt()
+            raise
+        except Exception as exc:
+            print(f"[XRT] Connection attempt failed: {exc}")
+
+        _close_xrt()
+        print(
+            "[XRT] No live body frames. Pane 1 will keep retrying; "
+            "start/restart streaming on the PICO to this PC."
+        )
+        time.sleep(1.0)
+
+
 def _init_input_source(
     input_source: str,
     buffer_size: int,
@@ -1584,12 +1823,8 @@ def _init_input_source(
             "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run Pico streaming."
         )
 
-    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
-    xrt.init()
-    print("Waiting for body tracking data...")
-    while not xrt.is_body_data_available():
-        print("waiting for body data...")
-        time.sleep(1)
+    print("Waiting for live body tracking data...")
+    _connect_xrt_body_stream()
 
     reader = PicoReader(max_queue_size=buffer_size)
     reader.start()
@@ -1641,6 +1876,9 @@ def run_pico(
             reader=reader,
         )
     finally:
+        reader.stop()
+        if input_source == "xrt":
+            _close_xrt()
         socket.close()
         context.term()
         print("Threads stopped, ZMQ socket closed")
@@ -1733,8 +1971,6 @@ class PlannerStreamer:
         self.dt = 1.0 / max(1, poll_hz)
         # Current locomotion mode, default IDLE
         self.mode = LocomotionMode.IDLE
-        self.prev_ab = False
-        self.prev_xy = False
         # Persistent facing buffer (unit vector on XY plane)
         self.yaw_accumulator = YawAccumulator()
         self.last_send = time.time()
@@ -1771,7 +2007,7 @@ class PlannerStreamer:
             )
             self.three_point.reset_with_measured_q(np.zeros(29, dtype=np.float64))
 
-    def run_once(self, stream_mode: StreamMode):
+    def run_once(self, stream_mode: StreamMode, *, face_command: str | None = None):
         """Execute one iteration of the planner control loop."""
         try:
             # Avoid sending old commands if XRT timestamp hasn't advanced, in case of headset disconnect
@@ -1780,18 +2016,14 @@ class PlannerStreamer:
                 return
             self.last_xrt_timestamp = xrt_timestamp
 
-            # A+B => next mode; X+Y => previous mode (rising edges)
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
-            ab_now = bool(a_pressed) and bool(b_pressed)
-            xy_now = bool(x_pressed) and bool(y_pressed)
-            if ab_now and not self.prev_ab:
+            # Face chords are disambiguated by the manager and confirmed on
+            # release. A+B selects the next mode; X+Y selects the previous.
+            if face_command == "ab":
                 self.mode = LocomotionMode(min(LocomotionMode.INJURED_WALK, self.mode + 1))
                 print(f"[PlannerLoop] Mode -> {self.mode.value}: {self.mode.name}")
-            if xy_now and not self.prev_xy:
+            if face_command == "xy":
                 self.mode = LocomotionMode(max(LocomotionMode.IDLE, self.mode - 1))
                 print(f"[PlannerLoop] Mode -> {self.mode.value}: {self.mode.name}")
-            self.prev_ab = ab_now
-            self.prev_xy = xy_now
 
             # Read axes/joysticks to control movement, facing, speed and mode
             lx, ly, rx, ry = get_controller_axes(self.reader)
@@ -1912,18 +2144,29 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    recording_status_host: str = "localhost",
+    recording_status_port: int = 5581,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
+      B+Y: Toggle pose/frozen-upper-body mode
+      X+B: Start/stop-success recording
+      Y+A: Discard active recording
     """
     reader = _init_input_source(input_source, buffer_size)
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
+    recording_status_socket = context.socket(zmq.SUB)
+    recording_status_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+    recording_status_socket.setsockopt(zmq.CONFLATE, 1)
+    recording_status_socket.connect(
+        f"tcp://{recording_status_host}:{recording_status_port}"
+    )
     time.sleep(0.1)
     print(f"[Manager] ZMQ socket bound to port {port}")
 
@@ -1962,6 +2205,7 @@ def run_pico_manager(
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
     )
+    hand_intent = HandIntentStream()
 
     # State machine diagram:
     #
@@ -1978,34 +2222,97 @@ def run_pico_manager(
     #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print(
+        "Manager controls: A+X=toggle mode, "
+        "B+Y=frozen upper body, X+B=record/save, Y+A=discard, "
+        "A+B+X+Y=start/stop policy"
+    )
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
-    prev_toggle_dc = False
-    prev_toggle_da = False
+    recorder_is_recording = False
+    recorder_command_timestamp = 0.0
+    face_chords = FaceChordTracker()
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
         while True:
+            if reader.disconnected:
+                print("[Manager] Teleop frames lost; forcing policy OFF")
+                if current_mode == StreamMode.POSE:
+                    pose_streamer.on_mode_exit()
+                current_mode = StreamMode.OFF
+
+                # Repeat the stop message because PUB/SUB delivery is best-effort.
+                for _ in range(3):
+                    socket.send(build_command_message(start=False, stop=True, planner=True))
+                    socket.send(
+                        pack_pose_message(
+                            {
+                                "stream_mode": np.array(
+                                    [StreamMode.OFF.value], dtype=np.int32
+                                ),
+                                "toggle_data_collection": np.array([False], dtype=bool),
+                                "toggle_data_abort": np.array([False], dtype=bool),
+                            },
+                            topic="manager_state",
+                        )
+                    )
+                    time.sleep(0.05)
+
+                if isinstance(reader, PicoReader):
+                    reader.reconnect()
+                else:
+                    print("[Manager] Waiting for teleop input to reconnect...")
+                    while reader.disconnected:
+                        socket.send(
+                            build_command_message(start=False, stop=True, planner=True)
+                        )
+                        time.sleep(0.5)
+
+                hand_intent = HandIntentStream()
+                prev_ax_pressed = False
+                prev_by_pressed = False
+                prev_start_combo = False
+                prev_left_axis_click = False
+                face_chords.reset()
+                print(
+                    "[Manager] Teleop reconnected; policy remains OFF. "
+                    "Use A+B+X+Y to recalibrate/start when ready."
+                )
+                continue
+
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
+            # Synchronize with the authoritative exporter state. Ignore status
+            # packets older than a locally emitted command to avoid briefly
+            # reverting the optimistic state during PUB/SUB propagation.
+            while recording_status_socket.poll(0):
+                recorder_status = recording_status_socket.recv_json()
+                if float(recorder_status.get("timestamp", 0.0)) >= recorder_command_timestamp:
+                    recorder_is_recording = bool(recorder_status.get("recording", False))
+
+            left_menu_button, _, _, _, _ = get_controller_inputs(reader)
 
             left_axis_click, _ = get_axis_clicks(reader)
 
-            # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
-            ax_pressed = (a_pressed) and (x_pressed)
+            # Confirm a two-button chord only after all face buttons are
+            # released. A third button cancels it, so the four-button policy
+            # gesture cannot leak a subset while being pressed or released.
+            face_command = face_chords.update(
+                bool(a_pressed), bool(b_pressed), bool(x_pressed), bool(y_pressed)
+            )
+            start_combo = bool(a_pressed) and bool(b_pressed) and bool(x_pressed) and bool(y_pressed)
 
-            # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
-            by_pressed = (b_pressed) and (y_pressed)
+            # A+X remains exclusively the POSE/PLANNER mode gesture.
+            ax_pressed = face_command == "ax"
 
-            # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
-            start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+            # B+Y remains the POSE/frozen-upper-body mode gesture.
+            by_pressed = face_command == "by"
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
@@ -2039,7 +2346,6 @@ def run_pico_manager(
                     new_mode = StreamMode.POSE_PAUSE
 
             elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                # Chain 1: POSE <--(by)--> FROZEN <--(left_axis_click)--> VR_3PT
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
                 elif by_pressed and not prev_by_pressed:
@@ -2104,13 +2410,15 @@ def run_pico_manager(
                 or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
                 or new_mode == StreamMode.PLANNER_VR_3PT
             ):
-                planner_streamer.run_once(new_mode)
+                planner_streamer.run_once(
+                    new_mode,
+                    face_command=face_command,
+                )
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
                     socket.send(build_command_message(start=False, stop=True, planner=True))
-                    exit()
                 elif (
                     new_mode == StreamMode.PLANNER
                     or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
@@ -2124,12 +2432,19 @@ def run_pico_manager(
                 current_mode = new_mode
 
             # Mode-independent: send manager_state for data exporter
-            toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
-            toggle_da_tmp = bool(b_pressed) and left_grip_mgr > 0.5
-            toggle_dc = toggle_dc_tmp and not prev_toggle_dc
-            toggle_da = toggle_da_tmp and not prev_toggle_da
-            prev_toggle_dc = toggle_dc_tmp
-            prev_toggle_da = toggle_da_tmp
+            toggle_dc = face_command == "xb"
+            toggle_da = face_command == "ya"
+            if toggle_dc:
+                recorder_is_recording = not recorder_is_recording
+                recorder_command_timestamp = time.time()
+                print(
+                    "[Manager] Recorder X+B -> "
+                    f"{'start' if recorder_is_recording else 'stop/save'}"
+                )
+            elif toggle_da:
+                recorder_is_recording = False
+                recorder_command_timestamp = time.time()
+                print("[Manager] Recorder Y+A -> discard")
             socket.send(
                 pack_pose_message(
                     {
@@ -2141,17 +2456,33 @@ def run_pico_manager(
                 )
             )
 
+            # Keep this last on the shared PUB socket. The hand controller uses
+            # a conflating subscriber, so publishing hand intent last prevents
+            # unrelated manager/pose messages from starving its filtered topic.
+            # Stalled headset timestamps remain invalid rather than implying open.
+            hand_intent.publish(socket, reader)
+
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
+
+            # Active pose/planner streamers pace their own loops. OFF and
+            # POSE_PAUSE do not, so pace them here to avoid flooding the shared
+            # PUB socket with repeated headset timestamps and starving the
+            # freshness-qualified hand-intent frames.
+            if new_mode in {StreamMode.OFF, StreamMode.POSE_PAUSE}:
+                time.sleep(1.0 / max(target_fps, 1))
 
     except KeyboardInterrupt:
         print("\nStopping manager...")
     finally:
         # Cleanup resources
         reader.stop()
+        if input_source == "xrt":
+            _close_xrt()
         three_point.close()
+        recording_status_socket.close()
         socket.close()
         context.term()
         print("[Manager] Shutdown complete")
@@ -2199,6 +2530,18 @@ if __name__ == "__main__":
         type=int,
         default=5557,
         help="ZMQ feedback port (default: 5557)",
+    )
+    parser.add_argument(
+        "--recording-status-host",
+        type=str,
+        default="localhost",
+        help="Recorder status publisher host (default: localhost)",
+    )
+    parser.add_argument(
+        "--recording-status-port",
+        type=int,
+        default=5581,
+        help="Recorder status publisher port (default: 5581)",
     )
     parser.add_argument(
         "--vr3pt_test",
@@ -2292,6 +2635,8 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            recording_status_host=args.recording_status_host,
+            recording_status_port=args.recording_status_port,
         )
     else:
         # Run legacy single-thread pose streaming

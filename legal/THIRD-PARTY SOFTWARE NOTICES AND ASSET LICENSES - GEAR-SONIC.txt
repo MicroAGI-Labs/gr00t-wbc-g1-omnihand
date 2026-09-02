@@ -8,6 +8,11 @@ This project incorporates the following third-party components:
 3. robosuite: Copyright (c) ARISE Initiative. (Apache 2.0)
 4. tmux-plugins/tpm: Copyright (c) tmux-plugins. (MIT)
 5. BeyondMimic: Copyright (c) HybridRobotics. (MIT)
+6. AGILINK/AgiBot OmniHand O10 description assets: declared Apache-2.0 in
+   omnihand_description/package.xml. Imported with checksums and provenance from
+   MicroAGI-Labs/research-atlas-v0 commit
+   14b1406c8d3069870e298341be0cd204cee5515d. Original source:
+   https://www.agibot.com.cn/DOCS/OS/Omnihand-O10
 
 --------------------------------------------------------------------------------
 FULL LICENSE TEXTS
@@ -45,7 +50,7 @@ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
 ---
 
-[Apache License 2.0] - Applied to: robosuite
+[Apache License 2.0] - Applied to: robosuite, OmniHand O10 description assets
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at: http://www.apache.org/licenses/LICENSE-2.0

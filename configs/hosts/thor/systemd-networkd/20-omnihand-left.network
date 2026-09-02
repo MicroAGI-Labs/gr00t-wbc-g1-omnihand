@@ -1,0 +1,15 @@
+[Match]
+Name=can11
+Driver=gs_usb
+Property=ID_SERIAL_SHORT=205B3973534B50042
+
+[Link]
+RequiredForOnline=no
+ActivationPolicy=up
+
+[CAN]
+BitRate=1M
+SamplePoint=80%
+DataBitRate=5M
+DataSamplePoint=75%
+FDMode=yes

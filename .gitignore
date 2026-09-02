@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+build.stale.*/
 develop-eggs/
 dist/
 downloads/
@@ -207,6 +208,12 @@ teleop_vids/
 *.code-workspace
 # Motion/training data (large local datasets, not tracked in git)
 data/
+# The pinned Atlas robot description is source, not collected training data.
+!gear_sonic/data/
+!gear_sonic/data/robot_model/
+!gear_sonic/data/robot_model/model_data/
+!gear_sonic/data/robot_model/model_data/g1_omnihand/
+!gear_sonic/data/robot_model/model_data/g1_omnihand/**
 bones_seed_smpl/
 sonic_release/
 # Training output logs

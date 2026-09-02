@@ -13,7 +13,10 @@ from __future__ import annotations
 
 from typing import Literal
 
+import numpy as np
+
 from gear_sonic.data.robot_model import RobotModel
+from gear_sonic.end_effectors.profiles import HandProfile
 
 EGO_VIEW_HEIGHT: int = 480
 EGO_VIEW_WIDTH: int = 640
@@ -33,21 +36,30 @@ _JOINT_GROUPS_FOR_STATE: list[str] = [
 ]
 
 
-def _get_joint_group_slices(robot_model: RobotModel) -> dict[str, dict[str, int]]:
+def _get_joint_group_slices(
+    robot_model: RobotModel, hand_profile: HandProfile | None = None
+) -> dict[str, dict[str, int]]:
     """Derive ``{group_name: {"start": ..., "end": ...}}`` from the robot model."""
     slices: dict[str, dict[str, int]] = {}
+    cursor = 0
     for group in _JOINT_GROUPS_FOR_STATE:
-        indices = sorted(robot_model.get_joint_group_indices(group))
-        slices[group] = {"start": indices[0], "end": indices[-1] + 1}
+        if hand_profile is not None and group in {"left_hand", "right_hand"}:
+            width = hand_profile.width
+        else:
+            width = len(robot_model.get_joint_group_indices(group))
+        slices[group] = {"start": cursor, "end": cursor + width}
+        cursor += width
     return slices
 
 
-def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
+def get_modality_config_sonic_vla(
+    robot_model: RobotModel, hand_profile: HandProfile | None = None
+) -> dict:
     """Return the modality config for the Sonic VLA dataset.
 
     Produces the exact content of meta/modality.json.
     """
-    group_slices = _get_joint_group_slices(robot_model)
+    group_slices = _get_joint_group_slices(robot_model, hand_profile)
 
     return {
         "state": {
@@ -133,12 +145,12 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
             },
             "left_hand_joints": {
                 "start": 0,
-                "end": 7,
+                "end": hand_profile.width if hand_profile is not None else 7,
                 "original_key": "teleop.left_hand_joints",
             },
             "right_hand_joints": {
                 "start": 0,
-                "end": 7,
+                "end": hand_profile.width if hand_profile is not None else 7,
                 "original_key": "teleop.right_hand_joints",
             },
             "left_wrist_joints": {
@@ -202,13 +214,65 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
     }
 
 
-def get_features_sonic_vla(robot_model: RobotModel) -> dict:
+def dataset_joint_names(
+    robot_model: RobotModel, hand_profile: HandProfile | None = None
+) -> list[str]:
+    """Return canonical body/hand names, replacing only the hand channels."""
+    if hand_profile is None:
+        return robot_model.joint_names
+    names: list[str] = []
+    for group in _JOINT_GROUPS_FOR_STATE:
+        if group == "left_hand":
+            names.extend(hand_profile.left.joint_names)
+        elif group == "right_hand":
+            names.extend(hand_profile.right.joint_names)
+        else:
+            indices = robot_model.get_joint_group_indices(group)
+            names.extend(robot_model.joint_names[index] for index in indices)
+    return names
+
+
+def assemble_dataset_configuration(
+    robot_model: RobotModel,
+    body_actuated_joint_values,
+    left_hand_values,
+    right_hand_values,
+    hand_profile: HandProfile,
+) -> np.ndarray:
+    """Assemble 43/49 values by declared group/name order, never width alone."""
+    left = np.asarray(left_hand_values, dtype=np.float64).reshape(-1)
+    right = np.asarray(right_hand_values, dtype=np.float64).reshape(-1)
+    if left.shape != (hand_profile.width,) or right.shape != (hand_profile.width,):
+        raise ValueError(
+            f"{hand_profile.name} requires {hand_profile.width} values per side"
+        )
+    neutral = np.zeros(7, dtype=np.float64)
+    fk_q = robot_model.get_configuration_from_actuated_joints(
+        body_actuated_joint_values=np.asarray(body_actuated_joint_values),
+        left_hand_actuated_joint_values=neutral,
+        right_hand_actuated_joint_values=neutral,
+    )
+    parts = []
+    for group in _JOINT_GROUPS_FOR_STATE:
+        if group == "left_hand":
+            parts.append(left)
+        elif group == "right_hand":
+            parts.append(right)
+        else:
+            parts.append(fk_q[robot_model.get_joint_group_indices(group)])
+    return np.concatenate(parts)
+
+
+def get_features_sonic_vla(
+    robot_model: RobotModel, hand_profile: HandProfile | None = None
+) -> dict:
     """Return the dataset features for the Sonic VLA dataset.
 
     The returned dict populates the "features" key of meta/info.json.
     """
-    joint_names = robot_model.joint_names
-    num_joints = robot_model.num_joints
+    joint_names = dataset_joint_names(robot_model, hand_profile)
+    num_joints = len(joint_names)
+    hand_width = hand_profile.width if hand_profile is not None else 7
 
     return {
         "observation.images.ego_view": {
@@ -235,6 +299,20 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "dtype": "float64",
             "shape": (num_joints,),
             "names": joint_names,
+        },
+        "control.hand_applied_position": {
+            "dtype": "float64",
+            "shape": (2 * hand_width,),
+            "names": (
+                list(hand_profile.left.joint_names + hand_profile.right.joint_names)
+                if hand_profile is not None
+                else [f"hand_applied_{index}" for index in range(2 * hand_width)]
+            ),
+        },
+        "teleop.hand_closed": {
+            "dtype": "bool",
+            "shape": (2,),
+            "names": ["left", "right"],
         },
         "observation.root_orientation": {
             "dtype": "float64",
@@ -295,12 +373,12 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
         },
         "teleop.left_hand_joints": {
             "dtype": "float32",
-            "shape": (7,),
+            "shape": (hand_width,),
             "names": "left_hand_joints",
         },
         "teleop.right_hand_joints": {
             "dtype": "float32",
-            "shape": (7,),
+            "shape": (hand_width,),
             "names": "right_hand_joints",
         },
         "teleop.smpl_frame_index": {

@@ -30,15 +30,23 @@ from scipy.spatial.transform import Rotation as R
 import tyro
 import zmq
 
+from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.features_sonic_vla import (
+    assemble_dataset_configuration,
     get_features_sonic_vla,
     get_g1_robot_model,
     get_modality_config_sonic_vla,
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
 )
-from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+from gear_sonic.end_effectors.profiles import HandProfile, get_hand_profile
+from gear_sonic.end_effectors.protocol import (
+    HAND_CONFIG_TOPIC,
+    HAND_STATE_TOPIC,
+    decode_config,
+    decode_state,
+)
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
 from gear_sonic.utils.data_collection.telemetry import Telemetry
@@ -102,6 +110,24 @@ class SonicDataExporterConfig:
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
+
+    hand_profile: str = "auto"
+    """Hand profile (auto, dex3.v1, or omnihand_o10.v1)."""
+
+    hand_state_host: str = "localhost"
+    """Host publishing external hand_config/hand_state messages."""
+
+    hand_state_port: int = 5570
+    """Port publishing external hand_config/hand_state messages."""
+
+    hand_config_timeout: float = 0
+    """Seconds to wait for external hand config (0 waits indefinitely)."""
+
+    hand_state_max_age: float = 0.2
+    """Maximum external hand-state age admitted while recording."""
+
+    recording_status_port: int = 5581
+    """ZMQ PUB port for browser-visible recorder status."""
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +225,28 @@ class TimingThresholdMonitor:
         return False
 
 
+def poll_hand_config_zmq(host: str, port: int, timeout_s: float) -> dict:
+    """Wait for a complete bilateral controller config before fixing the schema."""
+    context = zmq.Context()
+    socket = context.socket(zmq.SUB)
+    socket.setsockopt(zmq.SUBSCRIBE, HAND_CONFIG_TOPIC)
+    socket.setsockopt(zmq.RCVHWM, 1)
+    socket.setsockopt(zmq.CONFLATE, 1)
+    socket.connect(f"tcp://{host}:{port}")
+    deadline = None if timeout_s == 0 else time.monotonic() + timeout_s
+    try:
+        while deadline is None or time.monotonic() < deadline:
+            if socket.poll(200):
+                config = decode_config(socket.recv())
+                if set(config.get("selected_sides", ())) != {"left", "right"}:
+                    raise RuntimeError("data collection requires bilateral hand config")
+                return config
+    finally:
+        socket.close(linger=0)
+        context.term()
+    raise TimeoutError(f"timed out waiting for hand_config on {host}:{port}")
+
+
 # ---------------------------------------------------------------------------
 # Data Collector
 # ---------------------------------------------------------------------------
@@ -227,15 +275,31 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        hand_profile: HandProfile | None = None,
+        hand_config: dict | None = None,
+        hand_state_host: str = "localhost",
+        hand_state_port: int = 5570,
+        hand_state_max_age: float = .2,
+        recording_status_port: int = 5581,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
         self.data_exporter = data_exporter
         self.robot_model = robot_model
+        self.hand_profile = hand_profile
+        self.hand_config = hand_config
+        self.hand_state_max_age = hand_state_max_age
+        self.latest_hand_state = None
+        self.latest_hand_state_received_at = None
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
+        self._recording_message = "Ready to record"
+        self._recording_status_ctx = zmq.Context()
+        self._recording_status_socket = self._recording_status_ctx.socket(zmq.PUB)
+        self._recording_status_socket.setsockopt(zmq.SNDHWM, 2)
+        self._recording_status_socket.bind(f"tcp://*:{recording_status_port}")
 
         self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
 
@@ -274,6 +338,16 @@ class GrootDataCollector:
             print(f"[Sonic] Warning: Failed to initialize ZMQ subscriber: {e}")
             self._sonic_zmq_socket = None
 
+        self._hand_zmq_ctx = None
+        self._hand_zmq_socket = None
+        if hand_config is not None:
+            self._hand_zmq_ctx = zmq.Context()
+            self._hand_zmq_socket = self._hand_zmq_ctx.socket(zmq.SUB)
+            self._hand_zmq_socket.setsockopt(zmq.SUBSCRIBE, HAND_STATE_TOPIC)
+            self._hand_zmq_socket.setsockopt(zmq.RCVHWM, 1)
+            self._hand_zmq_socket.setsockopt(zmq.CONFLATE, 1)
+            self._hand_zmq_socket.connect(f"tcp://{hand_state_host}:{hand_state_port}")
+
         self.telemetry = Telemetry(window_size=100)
         self.sonic_timing_monitor = TimingThresholdMonitor(
             max_failures=3, reset_timeout_sec=5, time_delta=0.1
@@ -294,6 +368,41 @@ class GrootDataCollector:
         else:
             print(message)
 
+    def _publish_recording_status(self) -> None:
+        """Publish authoritative recorder state for the loopback browser UI."""
+        state = self._episode_state.get_state()
+        hand_ready = True
+        if self.hand_config is not None:
+            hand_ready = bool(
+                self.latest_hand_state
+                and not self.latest_hand_state.get("input_stale", True)
+                and self.latest_hand_state.get("intent_sequence") is not None
+                and all(
+                    side.get("valid") and side.get("connected")
+                    for side in self.latest_hand_state.get("sides", {}).values()
+                )
+            )
+        payload = {
+            "state": state,
+            "recording": state == self._episode_state.RECORDING,
+            "saving": state == self._episode_state.NEED_TO_SAVE,
+            "episode_index": self.current_episode_index,
+            "frame_count": self.data_exporter.episode_buffer.get("size", 0),
+            "total_episodes": self.data_exporter.meta.info.get("total_episodes", 0),
+            "dataset_root": str(self.data_exporter.meta.root),
+            "sources": {
+                "proprio": self.latest_proprio_msg is not None,
+                "camera": self.latest_image_msg is not None,
+                "hands": hand_ready,
+            },
+            "message": self._recording_message,
+            "timestamp": time.time(),
+        }
+        try:
+            self._recording_status_socket.send_json(payload, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            pass
+
     def _poll_state_zmq(self):
         """Poll the ``g1_debug`` ZMQ topic for robot state (non-blocking)."""
         msg = self._state_subscriber.get_msg(clear=True)
@@ -304,6 +413,58 @@ class GrootDataCollector:
             msg["ros_timestamp"] = time.time()
 
         self.latest_proprio_msg = msg
+
+    def _poll_hand_zmq(self) -> None:
+        if self._hand_zmq_socket is None:
+            return
+        while self._hand_zmq_socket.poll(0):
+            try:
+                state = decode_state(self._hand_zmq_socket.recv())
+            except Exception as exc:
+                print(f"[Hands] rejected state: {exc}")
+                continue
+            if state.get("session_id") != self.hand_config.get("session_id"):
+                print("[Hands] rejected state from a different controller session")
+                continue
+            if state.get("profile") != self.hand_profile.name:
+                print("[Hands] rejected state with a different hand profile")
+                continue
+            self.latest_hand_state = state
+            self.latest_hand_state_received_at = time.monotonic()
+
+    def _external_hand_values(
+        self,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
+        if self.latest_hand_state is None or self.latest_hand_state_received_at is None:
+            raise RuntimeError("external hand state is unavailable")
+        age = time.monotonic() - self.latest_hand_state_received_at
+        if age > self.hand_state_max_age:
+            raise RuntimeError(f"external hand state is stale ({age:.3f}s)")
+        if self.latest_hand_state.get("mode") == "fault":
+            raise RuntimeError("external hand controller is faulted")
+        if self.latest_hand_state.get("input_stale") or self.latest_hand_state.get("intent_sequence") is None:
+            raise RuntimeError("external hand target is missing or stale")
+        for side in ("left", "right"):
+            if self.latest_hand_state.get("sides", {}).get(side, {}).get("intent_closed") is None:
+                raise RuntimeError(f"external {side} hand has no valid click intent")
+        values = []
+        for field in ("requested_position_rad", "applied_position_rad", "measured_position_rad"):
+            for side in ("left", "right"):
+                side_state = self.latest_hand_state.get("sides", {}).get(side)
+                if not side_state or not side_state.get("valid") or not side_state.get("connected"):
+                    raise RuntimeError(f"external {side} hand is invalid or disconnected")
+                array = np.asarray(side_state.get(field), dtype=np.float64).reshape(-1)
+                if array.shape != (self.hand_profile.width,) or not np.all(np.isfinite(array)):
+                    raise RuntimeError(f"external {side} {field} has the wrong shape")
+                values.append(array)
+        return tuple(values)
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
@@ -320,19 +481,31 @@ class GrootDataCollector:
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
+                self._recording_message = f"Recording episode {self.current_episode_index}"
                 self._print_and_say(
                     f"Started recording {self.current_episode_index}", blocking=False
                 )
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
+                self._recording_message = f"Saving episode {self.current_episode_index}"
                 self._print_and_say("Stopping recording, preparing to save", blocking=False)
             elif self._episode_state.get_state() == self._episode_state.IDLE:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
-                self.data_exporter.save_episode_as_discarded()
+                buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+                if buffer_size > 0:
+                    self.data_exporter.save_episode_as_discarded()
+                    message = "Episode discarded"
+                else:
+                    # A discard can arrive before the first complete frame (for
+                    # example while an external hand source is still starting).
+                    # LeRobot rejects zero-frame episodes, so just return the
+                    # recorder to idle in that case.
+                    message = "Nothing discarded: no frames collected"
                 self._episode_state.reset_state()
                 self._initial_yaw = None
-                self._print_and_say("Discarded episode", blocking=False)
+                self._recording_message = message
+                self._print_and_say(message, blocking=False)
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
@@ -543,13 +716,16 @@ class GrootDataCollector:
             print(f"DataExporter Missed: {t_end - t_start} sec")
 
         if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
+            saved_episode = self.current_episode_index
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
                 self.data_exporter.save_episode()
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
+                self._recording_message = f"Saved episode {saved_episode}"
                 self._print_and_say("Finished saving episode")
             else:
+                self._recording_message = "Nothing saved: no frames collected"
                 self._print_and_say("Skipping save: no frames collected", say=False)
             self._episode_state.change_state()
         return True
@@ -569,6 +745,16 @@ class GrootDataCollector:
         if self._episode_state.get_state() != self._episode_state.RECORDING:
             return self._finalize_frame(t_start)
 
+        if self.hand_config is not None:
+            try:
+                self._external_hand_values()
+            except RuntimeError as exc:
+                now = time.monotonic()
+                if now - getattr(self, "_last_hand_block_log", 0.0) > 1.0:
+                    print(f"[Hands] recording blocked: {exc}")
+                    self._last_hand_block_log = now
+                return False
+
         return self._add_data_frame_sonic(t_start)
 
     def _add_data_frame_sonic(self, t_start: float) -> bool:
@@ -576,18 +762,49 @@ class GrootDataCollector:
         assert self.latest_proprio_msg is not None
         proprio = self.latest_proprio_msg
 
-        whole_q = self.robot_model.get_configuration_from_actuated_joints(
-            body_actuated_joint_values=proprio["body_q"],
-            left_hand_actuated_joint_values=proprio["left_hand_q"],
-            right_hand_actuated_joint_values=proprio["right_hand_q"],
-        )
-        whole_action_wbc = self.robot_model.get_configuration_from_actuated_joints(
-            body_actuated_joint_values=proprio["last_action"],
-            left_hand_actuated_joint_values=proprio["last_left_hand_action"],
-            right_hand_actuated_joint_values=proprio["last_right_hand_action"],
-        )
+        if self.hand_config is not None:
+            (
+                requested_left,
+                requested_right,
+                applied_left,
+                applied_right,
+                measured_left,
+                measured_right,
+            ) = self._external_hand_values()
+            whole_q = assemble_dataset_configuration(
+                self.robot_model,
+                proprio["body_q"],
+                measured_left,
+                measured_right,
+                self.hand_profile,
+            )
+            whole_action_wbc = assemble_dataset_configuration(
+                self.robot_model,
+                proprio["last_action"],
+                requested_left,
+                requested_right,
+                self.hand_profile,
+            )
+            neutral = np.zeros(7, dtype=np.float64)
+            fk_q = self.robot_model.get_configuration_from_actuated_joints(
+                body_actuated_joint_values=proprio["body_q"],
+                left_hand_actuated_joint_values=neutral,
+                right_hand_actuated_joint_values=neutral,
+            )
+        else:
+            whole_q = self.robot_model.get_configuration_from_actuated_joints(
+                body_actuated_joint_values=proprio["body_q"],
+                left_hand_actuated_joint_values=proprio["left_hand_q"],
+                right_hand_actuated_joint_values=proprio["right_hand_q"],
+            )
+            whole_action_wbc = self.robot_model.get_configuration_from_actuated_joints(
+                body_actuated_joint_values=proprio["last_action"],
+                left_hand_actuated_joint_values=proprio["last_left_hand_action"],
+                right_hand_actuated_joint_values=proprio["last_right_hand_action"],
+            )
+            fk_q = whole_q
 
-        self.robot_model.cache_forward_kinematics(whole_q)
+        self.robot_model.cache_forward_kinematics(fk_q)
         eef_parts = []
         for side in ["left", "right"]:
             placement = self.robot_model.frame_placement(
@@ -607,6 +824,26 @@ class GrootDataCollector:
         self._add_cpp_state_features(frame_data, proprio)
 
         sonic_latency_ms = self._add_sonic_pose_features(frame_data)
+
+        if self.hand_config is not None:
+            side_states = self.latest_hand_state["sides"]
+            frame_data["teleop.left_hand_joints"] = requested_left.astype(np.float32)
+            frame_data["teleop.right_hand_joints"] = requested_right.astype(np.float32)
+            frame_data["control.hand_applied_position"] = np.concatenate(
+                (applied_left, applied_right)
+            )
+            frame_data["teleop.hand_closed"] = np.asarray(
+                [side_states[side]["intent_closed"] for side in ("left", "right")],
+                dtype=bool,
+            )
+        else:
+            frame_data["control.hand_applied_position"] = np.concatenate(
+                (
+                    np.asarray(proprio["last_left_hand_action"], dtype=np.float64),
+                    np.asarray(proprio["last_right_hand_action"], dtype=np.float64),
+                )
+            )
+            frame_data["teleop.hand_closed"] = np.zeros(2, dtype=bool)
 
         self._add_images_to_frame_data(frame_data)
 
@@ -844,13 +1081,18 @@ class GrootDataCollector:
             self._state_subscriber.close()
         except Exception:
             pass
-        for sock in [self._sonic_zmq_socket]:
+        for sock in [self._sonic_zmq_socket, self._hand_zmq_socket]:
             if sock is not None:
                 try:
                     sock.close()
                 except Exception:
                     pass
-        for ctx in [self._sonic_zmq_ctx]:
+        try:
+            self._recording_status_socket.close(linger=0)
+            self._recording_status_ctx.term()
+        except Exception:
+            pass
+        for ctx in [self._sonic_zmq_ctx, self._hand_zmq_ctx]:
             if ctx is not None:
                 try:
                     ctx.term()
@@ -870,6 +1112,9 @@ class GrootDataCollector:
                     with self.telemetry.timer("poll_sonic"):
                         self._poll_sonic_zmq_messages()
 
+                    with self.telemetry.timer("poll_hands"):
+                        self._poll_hand_zmq()
+
                     with self.telemetry.timer("poll_image"):
                         img_msg = self._image_subscriber.read()
                         if img_msg is not None:
@@ -880,6 +1125,8 @@ class GrootDataCollector:
 
                     with self.telemetry.timer("check_recording_commands"):
                         self._check_recording_commands()
+
+                    self._publish_recording_status()
 
                     end_time = time.monotonic()
 
@@ -911,8 +1158,30 @@ class GrootDataCollector:
 def main(config: SonicDataExporterConfig):
     g1_rm = get_g1_robot_model()
 
-    dataset_features = get_features_sonic_vla(g1_rm)
-    modality_config = get_modality_config_sonic_vla(g1_rm)
+    robot_config = poll_robot_config_zmq(
+        config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
+    )
+    hand_config = None
+    profile_name = config.hand_profile
+    if profile_name == "auto":
+        profile_name = (
+            "omnihand_o10.v1"
+            if robot_config.get("hand_control") == "external"
+            else "dex3.v1"
+        )
+    hand_profile = get_hand_profile(profile_name)
+    if robot_config.get("hand_control") == "external":
+        hand_config = poll_hand_config_zmq(
+            config.hand_state_host, config.hand_state_port, config.hand_config_timeout
+        )
+        if hand_config.get("profile") != hand_profile.name:
+            raise RuntimeError(
+                f"requested {hand_profile.name}, controller reports {hand_config.get('profile')}"
+            )
+
+    schema_profile = hand_profile if hand_config is not None else None
+    dataset_features = get_features_sonic_vla(g1_rm, schema_profile)
+    modality_config = get_modality_config_sonic_vla(g1_rm, schema_profile)
 
     if config.record_wrist_cameras:
         print("[Camera] Wrist cameras enabled — adding to dataset schema")
@@ -926,17 +1195,18 @@ def main(config: SonicDataExporterConfig):
 
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
-    robot_config = poll_robot_config_zmq(
-        config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
-    )
-
     data_exporter = Gr00tDataExporter.create(
         save_root=f"{config.root_output_dir}/{config.dataset_name}",
         fps=config.data_collection_frequency,
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={
+            **robot_config,
+            "record_wrist_cameras": config.record_wrist_cameras,
+            "hand_profile": hand_profile.name,
+            "hand_config": hand_config,
+        },
     )
 
     data_collector = GrootDataCollector(
@@ -950,6 +1220,12 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        hand_profile=hand_profile,
+        hand_config=hand_config,
+        hand_state_host=config.hand_state_host,
+        hand_state_port=config.hand_state_port,
+        hand_state_max_age=config.hand_state_max_age,
+        recording_status_port=config.recording_status_port,
     )
     data_collector.run()
 

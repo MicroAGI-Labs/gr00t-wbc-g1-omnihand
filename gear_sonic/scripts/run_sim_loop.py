@@ -8,12 +8,12 @@ from typing import Dict
 
 import tyro
 
-from gear_sonic.utils.mujoco_sim.simulator_factory import SimulatorFactory, init_channel
-from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
 from gear_sonic.data.robot_model.instantiation.g1 import (
     instantiate_g1_robot_model,
 )
 from gear_sonic.data.robot_model.robot_model import RobotModel
+from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
+from gear_sonic.utils.mujoco_sim.simulator_factory import SimulatorFactory, init_channel
 
 ArgsConfig = SimLoopConfig
 
@@ -45,6 +45,33 @@ def main(config: ArgsConfig):
 
     robot_model = instantiate_g1_robot_model()
 
+    camera_configs = {}
+    if config.enable_offscreen and config.enable_image_publish:
+        if config.stream_camera == "third_person":
+            camera_configs = {
+                "third_person": {
+                    "height": 480,
+                    "width": 640,
+                    "tracking_body": "pelvis",
+                },
+                # Data collection always stores the canonical head-mounted
+                # camera as observation.images.ego_view.  Keep publishing it
+                # when the remote UI also requests the third-person view.
+                "ego_view": {
+                    "height": 480,
+                    "width": 640,
+                    "mjcf_name": "head_camera",
+                },
+            }
+        else:
+            camera_configs = {
+                "ego_view": {
+                    "height": 480,
+                    "width": 640,
+                    "mjcf_name": "head_camera",
+                }
+            }
+
     sim_wrapper = SimWrapper(
         robot_model=robot_model,
         env_name=config.env_name,
@@ -52,7 +79,21 @@ def main(config: ArgsConfig):
         onscreen=wbc_config.get("ENABLE_ONSCREEN", True),
         offscreen=wbc_config.get("ENABLE_OFFSCREEN", False),
         enable_image_publish=config.enable_image_publish,
+        camera_configs=camera_configs,
     )
+    if config.smoke_once:
+        try:
+            sim_wrapper.sim.sim_env.sim_step()
+            env = sim_wrapper.sim.sim_env
+            print(
+                "MuJoCo smoke step OK: "
+                f"nu={env.mj_model.nu}, body={len(env.obs['body_q'])}, "
+                f"left_hand={len(env.obs.get('left_hand_q', ()))}, "
+                f"right_hand={len(env.obs.get('right_hand_q', ()))}"
+            )
+        finally:
+            sim_wrapper.sim.close()
+        return
     # Start simulator as independent process
     SimulatorFactory.start_simulator(
         sim_wrapper.sim,
