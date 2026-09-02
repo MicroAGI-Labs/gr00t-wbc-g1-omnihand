@@ -4,14 +4,15 @@ Runs each camera in its own thread with staggered initialization and
 automatic reconnection.  Publishes all frames as a single merged
 ``ImageMessageSchema`` payload over ZMQ.
 
-Usage (on robot)::
+Usage (on the camera host)::
 
     python -m gear_sonic.camera.composed_camera \\
-        --ego-view-camera oak \\
-        --ego-view-device-id 18443010E1ABC12300 \\
+        --ego-view-camera zed \\
+        --zed-camera-fps 60 \\
+        --fps 60 \\
         --port 5555
 
-Supported camera types: ``oak``, ``oak_mono``, ``realsense``,
+Supported camera types: ``oak``, ``oak_mono``, ``realsense``, ``zed``,
 ``usb``, or a path to an ``.mp4`` file for replay testing.
 
 Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
@@ -56,7 +57,7 @@ class ComposedCameraConfig:
     """Camera type for ego view: oak, oak_mono, realsense, zed, usb, or None."""
 
     ego_view_device_id: str | None = None
-    """Device ID for ego view camera (OAK MxID, RealSense serial, USB /dev/video index)."""
+    """Device ID (OAK MxID, RealSense/ZED serial, or USB /dev/video index)."""
 
     head_camera: str | None = None
     """Camera type for head view."""
@@ -77,7 +78,13 @@ class ComposedCameraConfig:
     """Device ID for right wrist camera."""
 
     fps: int = 30
-    """Publish rate.  OAK cameras run at 30 FPS; lower values add latency."""
+    """ZMQ publish rate, independent of the hardware capture rate."""
+
+    zed_camera_resolution: str = "HD720"
+    """ZED hardware capture resolution."""
+
+    zed_camera_fps: int = 60
+    """ZED hardware capture rate. HD720 supports 60 FPS."""
 
     run_as_server: bool = True
     """Run as ZMQ PUB server (set False for in-process usage)."""
@@ -377,6 +384,23 @@ class ComposedCameraSensor(Sensor, SensorServer):
 
             print(f"Initializing RealSense sensor for camera type: {camera_type}")
             return RealSenseSensor(mount_position=mount_position)
+
+        elif camera_type == "zed":
+            from gear_sonic.camera.drivers.zed import ZEDConfig, ZEDSensor
+
+            zed_config = ZEDConfig(
+                camera_resolution=self.config.zed_camera_resolution,
+                camera_fps=self.config.zed_camera_fps,
+            )
+            print(
+                f"Initializing ZED sensor at {zed_config.camera_resolution}"
+                f"@{zed_config.camera_fps} FPS"
+            )
+            return ZEDSensor(
+                config=zed_config,
+                mount_position=mount_position,
+                device_id=device_id,
+            )
 
         elif camera_type.endswith(".mp4"):
             from gear_sonic.camera.drivers.dummy import ReplayDummySensor
@@ -678,7 +702,12 @@ if __name__ == "__main__":
     if config.run_as_server:
         composed_camera = ComposedCameraSensor(config)
         print("Running composed camera server...")
-        composed_camera.run_server()
+        try:
+            composed_camera.run_server()
+        except KeyboardInterrupt:
+            print("Stopping composed camera server...")
+        finally:
+            composed_camera.close()
     else:
         composed_client = ComposedCameraClientSensor(server_ip="localhost", port=config.port)
         try:

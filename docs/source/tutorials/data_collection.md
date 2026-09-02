@@ -4,12 +4,12 @@ Record teleop demonstrations as [LeRobot](https://github.com/huggingface/lerobot
 
 ```{admonition} Deployment model
 :class: important
-Everything runs **offboard on your workstation** except the **camera server**, which runs **onboard the robot computer** (e.g., Jetson Orin) where the physical cameras are connected. The camera server publishes JPEG frames over ZMQ to the workstation.
+Run the camera server on the computer physically connected to the cameras. In the Thor setup, the C++ deployment, PICO server, camera server, data exporter, and viewer all run from the same repo clone on Thor; use `localhost` for their ZMQ connections. No camera process is needed on the G1 Orin.
 ```
 
 ```{admonition} Supported cameras
 :class: note
-The tested and supported camera setup uses **Luxonis OAK cameras** (OAK-D, OAK-1, etc.). This includes a head/ego-view OAK camera and optional OAK wrist cameras. Other camera drivers (RealSense, USB webcam) are included in the codebase but have not been tested recently.
+The composed camera server supports **ZED**, **Luxonis OAK**, RealSense, and generic USB cameras. The ZED integration publishes the rectified left RGB image; depth is not sent through the JPEG transport.
 
 A 3D-printable mount for the head/ego-view **OAK-D W** camera is available under [`hardware/camera_mount/`](https://github.com/NVlabs/GR00T-WholeBodyControl/blob/main/hardware/camera_mount/README.md) — see its README for print settings, the bill of materials, and how it mounts on the G1.
 ```
@@ -18,14 +18,14 @@ A 3D-printable mount for the head/ego-view **OAK-D W** camera is available under
 :class: note
 1. **Completed the [Quick Start](../getting_started/quickstart.md)** — you can run the sim2sim loop (includes [installing the deployment](../getting_started/installation_deploy.md) and [downloading model checkpoints](../getting_started/download_models.md)).
 2. **Completed the [VR Teleop Setup](../getting_started/vr_teleop_setup.md)** — PICO hardware is calibrated and `.venv_teleop` is ready.
-3. **Camera server running on the robot** — see [Camera Server Setup](#camera-server-setup-on-robot) below. For simulation, the MuJoCo sim loop publishes camera images automatically — no camera server needed.
+3. **Camera server running on the camera host** — see [Camera Server Setup](#camera-server-setup-on-the-camera-host) below. For simulation, the MuJoCo sim loop publishes camera images automatically — no camera server needed.
 ```
 
 ---
 
-## One-Time Setup (Workstation)
+## One-Time Setup (Thor or Workstation)
 
-On your **workstation** (where you run the C++ deployment, teleop, and data exporter), run the install script from the repo root to create a dedicated virtual environment with all data collection dependencies (LeRobot, PyAV, OpenCV, etc.):
+On the computer running deployment and collection (Thor in the onboard setup), run the install script from the repo root to create a dedicated virtual environment with all data collection dependencies (LeRobot, PyAV, OpenCV, etc.):
 
 ```sh
 bash install_scripts/install_data_collection.sh
@@ -39,27 +39,23 @@ This environment is separate from `.venv_teleop` and `.venv_sim` — the data ex
 
 ---
 
-## Camera Server Setup (On-Robot)
+## Camera Server Setup (On the Camera Host)
 
-The camera server is the **only component that runs on the robot computer** (e.g., Jetson Orin). Everything else — the C++ deployment, PICO teleop streamer, data exporter, and camera viewer — runs on your workstation.
+The camera server must run where the camera USB cable is connected. For the onboard ZED setup, that is Thor. It can publish locally to the exporter over `localhost` while using the same ZMQ interface as a remote setup.
 
-The camera server captures frames from the OAK cameras physically connected to the robot and publishes them over ZMQ to the workstation.
+### Step 1: Clone the repo on the camera host
 
-### Step 1: Clone the repo on the robot
-
-SSH into your robot computer and clone this repository:
+One clone is sufficient when every process runs on Thor:
 
 ```sh
-git clone https://github.com/NVlabs/GR00T-WholeBodyControl.git
-cd GR00T-WholeBodyControl
+git clone https://github.com/MicroAGI-Labs/gr00t-wbc-g1-omnihand.git
+cd gr00t-wbc-g1-omnihand
 ```
 
 ### Step 2: Run the install script
 
-The install script handles everything: creates the virtual environment, installs all
-dependencies (including the DepthAI SDK for OAK cameras), detects connected cameras,
-and optionally installs a systemd service so the camera server starts automatically
-on boot.
+The install script creates the virtual environment, installs the common camera
+dependencies, detects the selected camera type, and can install a systemd service.
 
 ```sh
 bash install_scripts/install_camera_server.sh
@@ -68,7 +64,7 @@ bash install_scripts/install_camera_server.sh
 The script will:
 
 1. Create `.venv_camera` with `gear_sonic[camera]` (DepthAI, ZMQ, msgpack, OpenCV, tyro).
-2. Detect connected OAK cameras and list their MxIDs.
+2. Detect the selected OAK or ZED camera and list its device ID.
 3. Prompt you for each camera position (ego view, and optionally left/right wrist) and its device ID.
 4. Ask whether to install the camera server as a **systemd service** (recommended). If you answer **y**, it generates the unit file, installs, enables, and starts the service automatically.
 
@@ -80,7 +76,7 @@ journalctl -u composed_camera_server.service -f
 ```
 
 ```{note}
-Other camera drivers (RealSense, USB webcam) are included in the codebase but have not been tested recently for data collection. If you need RealSense, install `pyrealsense2` into the venv after setup. See the driver files in `gear_sonic/camera/drivers/` for details.
+The Stereolabs ZED SDK is a system dependency and is not installed by pip. After installing it on Thor, add its Python API to the camera environment with `.venv_camera/bin/python /usr/local/zed/get_python_api.py`.
 ```
 
 ### Manual setup (alternative)
@@ -89,17 +85,17 @@ If you prefer not to use the install script, or need to reconfigure:
 
 **Finding camera device IDs:**
 
-Each OAK camera has a unique MxID. List all connected OAK devices:
+List connected ZED cameras and their serial numbers:
 
 ```sh
 source .venv_camera/bin/activate
-python -c "import depthai as dai; print(dai.Device.getAllAvailableDevices())"
+python -c "import pyzed.sl as sl; print(sl.Camera.get_device_list())"
 ```
 
-Example output:
+For OAK cameras, list MxIDs with:
 
-```text
-[XLinkDeviceState.X_LINK_BOOTED, MxId: 18443010E1ABC12300, ...]
+```sh
+python -c "import depthai as dai; print(dai.Device.getAllAvailableDevices())"
 ```
 
 **Starting the camera server manually:**
@@ -107,10 +103,13 @@ Example output:
 ```sh
 source .venv_camera/bin/activate
 
-# Single camera (ego view only)
+# ZED: capture and publish HD720 at 60 FPS; the exporter samples at 50 Hz
 python -m gear_sonic.camera.composed_camera \
-    --ego-view-camera oak \
-    --ego-view-device-id <YOUR_MXID> \
+    --ego-view-camera zed \
+    --ego-view-device-id <YOUR_ZED_SERIAL> \
+    --zed-camera-resolution HD720 \
+    --zed-camera-fps 60 \
+    --fps 60 \
     --port 5555
 
 # Multiple cameras (ego view + wrist cameras)
@@ -136,28 +135,34 @@ sudo systemctl enable composed_camera_server.service
 sudo systemctl start composed_camera_server.service
 ```
 
-Once the systemd service is running, the camera server starts automatically whenever the robot boots — no manual intervention needed.
+Once the systemd service is running, the camera server starts automatically whenever the camera host boots.
 
-### Connecting from the workstation
+### Connecting to the Camera Server
 
-On your workstation, the data exporter and camera viewer connect to the robot's camera server over the network. Pass the robot's IP address (the G1 robot's default IP is `192.168.123.164`):
+When the exporter and camera server both run on Thor, keep the default camera host, `localhost`:
 
 ```sh
 # Data exporter
 python gear_sonic/scripts/run_data_exporter.py \
-    --task-prompt "pick up the cup" \
-    --camera-host 192.168.123.164 --camera-port 5555
+    --task-prompt "pick up the cup"
 
 # Camera viewer (to verify the feed)
-python gear_sonic/scripts/run_camera_viewer.py \
-    --camera-host 192.168.123.164 --camera-port 5555
+python gear_sonic/scripts/run_camera_viewer.py
 ```
 
-The tmux launcher also accepts `--camera-host`:
+Pass `--camera-host <THOR_IP>` only when a client runs on another computer.
+
+### Frame Rates
+
+- Existing 30 FPS cameras publish only new frames. The 50 Hz exporter reuses its cached latest image when no new image arrived.
+- ZED captures and publishes at 60 FPS. The exporter samples the latest message at 50 Hz; ZMQ discards superseded messages rather than interpolating frames.
+- The dataset timeline is controlled by `--data-collection-frequency` (50 Hz by default).
+
+The tmux launcher accepts the same host setting:
 
 ```sh
 python gear_sonic/scripts/launch_data_collection.py \
-    --camera-host 192.168.123.164 \
+    --camera-host <THOR_IP> \
     --task-prompt "pick up the cup"
 ```
 
@@ -178,37 +183,23 @@ Images are JPEG-compressed (quality 80) and either base64-encoded strings or raw
 
 ## Architecture
 
-The data exporter receives data from three ZMQ sources. The C++ deployment, PICO teleop, and data exporter all run **offboard on the workstation**. The camera server runs **onboard the robot** and streams frames to the workstation over the network.
+In the Thor setup, all application processes below run onboard Thor.
 
-```text
-    Workstation (offboard)                           Robot (onboard)
-┌──────────────────────┐  ┌──────────────────────┐  ┌───────────────┐
-│  C++ deploy          │  │  pico_manager         │  │  Camera       │
-│  (zmq_output_handler)│  │  _thread_server.py    │  │  server       │
-│                      │  │                       │  │  (OAK cameras)│
-│  port 5557           │  │  port 5556            │  │  port 5555    │
-│  topics: g1_debug,   │  │  topic: pose          │  │  (JPEG/ZMQ)   │
-│          robot_config│  │  (SMPL body params)   │  │               │
-└──────────┬───────────┘  └──────────┬────────────┘  └──────┬────────┘
-           │                         │                       │
-           └────────────┬────────────┘───────────────────────┘
-                        │              (network)
-               ┌────────▼────────┐
-               │  run_data_      │
-               │  exporter.py    │
-               │  (workstation)  │
-               │                 │
-               │  LeRobot dataset│
-               │  (parquet + mp4)│
-               └─────────────────┘
+```mermaid
+flowchart LR
+    Pico[PICO server] --> Sonic[SONIC deploy]
+    Pico --> Exporter[Data exporter]
+    Sonic --> Exporter
+    ZED[ZED camera] --> Camera[Camera server]
+    Camera --> Exporter
 ```
 
 | Source | Runs on | ZMQ Topic | Default Port | Provides |
 |---|---|---|---|---|
-| C++ deployment | Workstation | `g1_debug` | 5557 | Joint positions, velocities, IMU quaternion |
-| C++ deployment | Workstation | `robot_config` | 5557 | One-shot robot configuration at startup |
-| PICO teleop streamer | Workstation | `pose` | 5556 | SMPL body parameters (teleop target poses) |
-| Camera server | Robot | *(raw TCP)* | 5555 | JPEG-compressed camera images (ego view + optional wrist views) |
+| C++ deployment | Thor | `g1_debug` | 5557 | Joint positions, velocities, IMU quaternion |
+| C++ deployment | Thor | `robot_config` | 5557 | Robot configuration at startup |
+| PICO teleop streamer | Thor | `pose` | 5556 | SMPL body parameters |
+| Camera server | Thor | *(raw TCP)* | 5555 | JPEG-compressed camera images |
 
 ---
 
@@ -240,11 +231,10 @@ Requires `tmux` to be installed (`sudo apt install tmux`).
 python gear_sonic/scripts/launch_data_collection.py --sim
 ```
 
-**For real robot** (camera server running on robot at `192.168.123.164`):
+**For a real robot with the camera server on the same Thor:**
 
 ```bash
 python gear_sonic/scripts/launch_data_collection.py \
-    --camera-host 192.168.123.164 \
     --task-prompt "pick up the cup"
 ```
 
@@ -252,7 +242,6 @@ python gear_sonic/scripts/launch_data_collection.py \
 
 ```bash
 python gear_sonic/scripts/launch_data_collection.py \
-    --camera-host 192.168.123.164 \
     --task-prompt "pick up the cup" \
     --record-wrist-cameras
 ```
@@ -270,7 +259,7 @@ Common options:
 | `--task-prompt` | `"demo"` | Language task description (e.g., `"pick up the cup"`) |
 | `--dataset-name` | *(auto: timestamp)* | Dataset name; omit to auto-generate |
 | `--sim / --no-sim` | `False` | Run deploy.sh in sim mode (also starts the sim loop) |
-| `--camera-host` | `localhost` | Camera server host (e.g., `192.168.123.164` for real robot) |
+| `--camera-host` | `localhost` | Camera server host; set the Thor IP only for a remote client |
 | `--camera-port` | `5555` | Camera server port |
 | `--no-camera-viewer` | *(viewer on)* | Disable the camera viewer pane |
 | `--data-exporter-frequency` | `50` | Recording frequency (Hz) |

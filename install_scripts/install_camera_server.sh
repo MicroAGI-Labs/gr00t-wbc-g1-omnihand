@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # install_camera_server.sh
 # Sets up the .venv_camera venv for running the composed camera server
-# on the robot computer.
+# on the computer physically connected to the cameras (the Thor in this setup).
 #
 # Installs gear_sonic[camera] which includes the ZMQ-based camera server
-# framework and the depthai SDK (OAK cameras). For other camera SDKs
-# (e.g. pyrealsense2), install them into the venv after setup.
+# framework and the depthai SDK (OAK cameras). Other vendor SDKs are installed
+# separately; pyzed is supplied by the Stereolabs ZED SDK.
 #
 # Usage:  bash install_scripts/install_camera_server.sh   (run from repo root)
 
@@ -54,7 +54,7 @@ rm -rf .venv_camera
 
 # ── 4. Create venv & install camera extra ────────────────────────────────────
 echo "[INFO] Creating .venv_camera with uv-managed Python 3.10 …"
-uv venv .venv_camera --python "$MANAGED_PY" --prompt gear_sonic_camera
+uv venv .venv_camera --python "$MANAGED_PY" --prompt gear_sonic_camera --seed
 # shellcheck disable=SC1091
 source .venv_camera/bin/activate
 echo "[INFO] Installing gear_sonic[camera] …"
@@ -70,6 +70,8 @@ echo "    source .venv_camera/bin/activate"
 echo ""
 echo "  For other camera SDKs, install into the venv:"
 echo "    pip install pyrealsense2     # Intel RealSense"
+echo "    .venv_camera/bin/python /usr/local/zed/get_python_api.py"
+echo "                               # ZED (after installing the ZED SDK)"
 echo ""
 echo "  See docs/source/tutorials/data_collection.md for full setup."
 echo "══════════════════════════════════════════════════════════════"
@@ -91,6 +93,7 @@ if [[ ! "$INSTALL_SERVICE" =~ ^[Yy]$ ]]; then
     echo "  Skipped systemd install. You can run the camera server manually:"
     echo "    source .venv_camera/bin/activate"
     echo "    python -m gear_sonic.camera.composed_camera --ego-view-camera oak --port 5555"
+    echo "    python -m gear_sonic.camera.composed_camera --ego-view-camera zed --fps 60 --zed-camera-fps 60 --port 5555"
     echo ""
     exit 0
 fi
@@ -101,6 +104,9 @@ echo "── Camera service configuration ──"
 echo "  Each camera needs a type and a device ID so the server knows"
 echo "  which physical camera maps to each mount position (ego, wrist, etc.)."
 echo ""
+
+read -rp "  Ego-view camera type (oak, oak_mono, realsense, zed, usb) [oak]: " EGO_TYPE
+EGO_TYPE="${EGO_TYPE:-oak}"
 
 detect_oak_cameras() {
     "${REPO_ROOT}/.venv_camera/bin/python" -c "
@@ -128,36 +134,90 @@ for i, d in enumerate(devices):
 " 2>&1
 }
 
-while true; do
-    echo "  Detecting connected OAK cameras …"
-    OAK_DEVICES="$(detect_oak_cameras)" && OAK_FOUND=true || OAK_FOUND=false
+detect_zed_cameras() {
+    "${REPO_ROOT}/.venv_camera/bin/python" -c "
+import pyzed.sl as sl
+devices = sl.Camera.get_device_list()
+if not devices:
+    exit(1)
+for i, device in enumerate(devices):
+    print(f'    [{i}] serial: {device.serial_number}  model: {device.camera_model}')
+" 2>&1
+}
 
-    if $OAK_FOUND && [ -n "$OAK_DEVICES" ]; then
-        echo "$OAK_DEVICES"
-        break
-    else
-        echo "  (no OAK devices detected)"
-        if [ -n "$OAK_DEVICES" ]; then
-            echo "  depthai output: $OAK_DEVICES"
-        fi
-        echo ""
-        read -rp "  Retry detection? [Y/n] (or 'n' to enter device IDs manually): " RETRY
-        if [[ "$RETRY" =~ ^[Nn]$ ]]; then
-            break
-        fi
-        echo ""
+ensure_zed_python_api() {
+    local camera_python="${REPO_ROOT}/.venv_camera/bin/python"
+    local zed_python_installer="/usr/local/zed/get_python_api.py"
+    local zed_install_tmp
+
+    if "$camera_python" -c "import pyzed.sl" &>/dev/null; then
+        return 0
     fi
-done
+    if [ ! -f "$zed_python_installer" ]; then
+        echo "[ERROR] ZED SDK not found at /usr/local/zed."
+        echo "        Install the L4T-matched ZED SDK first."
+        return 1
+    fi
+
+    echo "[INFO] Installing pyzed into .venv_camera …"
+    echo "       pyzed 5.x uses NumPy 2.x in this isolated environment."
+    zed_install_tmp="$(mktemp -d)"
+    if ! (cd "$zed_install_tmp" && "$camera_python" "$zed_python_installer"); then
+        rm -rf -- "$zed_install_tmp"
+        return 1
+    fi
+    rm -rf -- "$zed_install_tmp"
+    "$camera_python" -c "import pyzed.sl as sl; print(f'[OK] ZED SDK {sl.Camera.get_sdk_version()}')"
+}
+
+if [[ "$EGO_TYPE" == "oak" || "$EGO_TYPE" == "oak_mono" ]]; then
+    while true; do
+        echo "  Detecting connected OAK cameras …"
+        OAK_DEVICES="$(detect_oak_cameras)" && OAK_FOUND=true || OAK_FOUND=false
+
+        if $OAK_FOUND && [ -n "$OAK_DEVICES" ]; then
+            echo "$OAK_DEVICES"
+            break
+        else
+            echo "  (no OAK devices detected)"
+            if [ -n "$OAK_DEVICES" ]; then
+                echo "  depthai output: $OAK_DEVICES"
+            fi
+            echo ""
+            read -rp "  Retry detection? [Y/n] (or 'n' to enter a device ID manually): " RETRY
+            if [[ "$RETRY" =~ ^[Nn]$ ]]; then
+                break
+            fi
+            echo ""
+        fi
+    done
+elif [[ "$EGO_TYPE" == "zed" ]]; then
+    ensure_zed_python_api
+    echo "  Detecting connected ZED cameras …"
+    ZED_DEVICES="$(detect_zed_cameras)" && ZED_FOUND=true || ZED_FOUND=false
+    if $ZED_FOUND && [ -n "$ZED_DEVICES" ]; then
+        echo "$ZED_DEVICES"
+    else
+        echo "  (unable to detect a ZED camera)"
+        if [ -n "$ZED_DEVICES" ]; then
+            echo "  pyzed output: $ZED_DEVICES"
+        fi
+        echo "  Install the ZED SDK, then run:"
+        echo "    .venv_camera/bin/python /usr/local/zed/get_python_api.py"
+    fi
+fi
 echo ""
 
 # Build ExecStart args incrementally
 CAMERA_ARGS=""
+USES_ZED=false
 
 # --- Ego-view camera (required) ---
-read -rp "  Ego-view camera type (oak, oak_mono, realsense, usb) [oak]: " EGO_TYPE
-EGO_TYPE="${EGO_TYPE:-oak}"
-read -rp "  Ego-view device ID (MxID or /dev/video index): " EGO_DEVICE_ID
+read -rp "  Ego-view device ID (MxID, serial, or /dev/video index): " EGO_DEVICE_ID
 CAMERA_ARGS="--ego-view-camera ${EGO_TYPE}"
+if [[ "$EGO_TYPE" == "zed" ]]; then
+    USES_ZED=true
+fi
 if [ -n "$EGO_DEVICE_ID" ]; then
     CAMERA_ARGS="${CAMERA_ARGS} --ego-view-device-id ${EGO_DEVICE_ID}"
 fi
@@ -168,8 +228,11 @@ read -rp "  Add a left-wrist camera? [y/N]: " ADD_LEFT
 if [[ "$ADD_LEFT" =~ ^[Yy]$ ]]; then
     read -rp "  Left-wrist camera type [oak]: " LEFT_TYPE
     LEFT_TYPE="${LEFT_TYPE:-oak}"
-    read -rp "  Left-wrist device ID (MxID): " LEFT_DEVICE_ID
+    read -rp "  Left-wrist device ID (MxID, serial, or /dev/video index): " LEFT_DEVICE_ID
     CAMERA_ARGS="${CAMERA_ARGS} --left-wrist-camera ${LEFT_TYPE}"
+    if [[ "$LEFT_TYPE" == "zed" ]]; then
+        USES_ZED=true
+    fi
     if [ -n "$LEFT_DEVICE_ID" ]; then
         CAMERA_ARGS="${CAMERA_ARGS} --left-wrist-device-id ${LEFT_DEVICE_ID}"
     fi
@@ -181,14 +244,29 @@ read -rp "  Add a right-wrist camera? [y/N]: " ADD_RIGHT
 if [[ "$ADD_RIGHT" =~ ^[Yy]$ ]]; then
     read -rp "  Right-wrist camera type [oak]: " RIGHT_TYPE
     RIGHT_TYPE="${RIGHT_TYPE:-oak}"
-    read -rp "  Right-wrist device ID (MxID): " RIGHT_DEVICE_ID
+    read -rp "  Right-wrist device ID (MxID, serial, or /dev/video index): " RIGHT_DEVICE_ID
     CAMERA_ARGS="${CAMERA_ARGS} --right-wrist-camera ${RIGHT_TYPE}"
+    if [[ "$RIGHT_TYPE" == "zed" ]]; then
+        USES_ZED=true
+    fi
     if [ -n "$RIGHT_DEVICE_ID" ]; then
         CAMERA_ARGS="${CAMERA_ARGS} --right-wrist-device-id ${RIGHT_DEVICE_ID}"
     fi
 fi
 
 echo ""
+if $USES_ZED; then
+    ensure_zed_python_api
+fi
+
+DEFAULT_PUBLISH_FPS=30
+if $USES_ZED; then
+    DEFAULT_PUBLISH_FPS=60
+fi
+read -rp "  Camera publish rate [${DEFAULT_PUBLISH_FPS}]: " PUBLISH_FPS
+PUBLISH_FPS="${PUBLISH_FPS:-$DEFAULT_PUBLISH_FPS}"
+CAMERA_ARGS="${CAMERA_ARGS} --fps ${PUBLISH_FPS}"
+
 read -rp "  ZMQ port [5555]: " CFG_PORT
 CFG_PORT="${CFG_PORT:-5555}"
 CAMERA_ARGS="${CAMERA_ARGS} --port ${CFG_PORT}"
@@ -216,6 +294,7 @@ Type=simple
 User=$USER
 Environment="HOME=$HOME"
 Environment="REPO_DIR=$REPO_ROOT"
+Environment="PYTHONUNBUFFERED=1"
 WorkingDirectory=$REPO_ROOT
 ExecStart=$EXEC_START
 Restart=on-failure
