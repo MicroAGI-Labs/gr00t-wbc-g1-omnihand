@@ -1,22 +1,20 @@
 """
 All-in-one tmux launcher for SONIC data collection.
 
-Starts the full data collection stack in a single tmux session:
+Starts the full data collection stack in one visible tmux dashboard. With
+``--sim --hand-backend omnihand`` the dashboard has all six component panes:
 
-    Window 0 — data_collection (4 panes):
+    Window 0 — data_collection:
     ┌───────────────────────┬───────────────────────┐
-    │ Pane 0: C++ Deploy    │ Pane 2: Data Exporter │
-    │ (gear_sonic_deploy)   │ (.venv_data_collection)│
+    │ Pane 0: C++ Deploy    │ Pane 1: Teleop        │
     ├───────────────────────┼───────────────────────┤
-    │ Pane 1: Teleop        │ Pane 3: Camera Viewer │
-    │ (.venv_teleop)        │ (.venv_data_collection)│
+    │ Pane 2: Data Exporter │ Pane 3: Camera Viewer │
+    ├───────────────────────┼───────────────────────┤
+    │ Pane 4: MuJoCo Sim    │ Pane 5: OmniHand      │
     └───────────────────────┴───────────────────────┘
 
-    Window 1 — sim  (only when --sim is passed):
-    ┌─────────────────────────────────────────────────┐
-    │ MuJoCo Simulator (run_sim_loop.py)              │
-    │ (.venv_sim)                                     │
-    └─────────────────────────────────────────────────┘
+The simulator and hand panes are included only when their corresponding
+options are enabled.
 
 Prerequisites:
     - tmux installed (sudo apt install tmux)
@@ -30,24 +28,27 @@ Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_data_collection.py                          # real robot (default)
     python gear_sonic/scripts/launch_data_collection.py --sim                    # MuJoCo sim
     python gear_sonic/scripts/launch_data_collection.py --no-camera-viewer       # skip viewer
-    python gear_sonic/scripts/launch_data_collection.py --pico-input-source isaac-teleop  # in-process CloudXR / DeviceIO
+    # In-process CloudXR / DeviceIO:
+    python gear_sonic/scripts/launch_data_collection.py --pico-input-source isaac-teleop
 """
 
 from dataclasses import dataclass
-from pathlib import Path
 import os
+from pathlib import Path
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+from typing import Literal
 
 
 def _bootstrap_venv():
     """Re-exec with the .venv_data_collection Python if tyro is not available."""
     try:
         import tyro  # noqa: F401
+
         return
     except ImportError:
         pass
@@ -67,7 +68,7 @@ def _bootstrap_venv():
 
 _bootstrap_venv()
 
-import tyro
+import tyro  # noqa: E402
 
 
 def _get_local_ip() -> str:
@@ -113,6 +114,24 @@ class DataCollectionLaunchConfig:
     deploy_output_type: str = ""
     """Output type for deploy.sh. Leave empty for default."""
 
+    hand_backend: Literal["dex3", "omnihand", "none"] = "dex3"
+    """Hand owner. OmniHand uses the external controller in sim and hardware."""
+
+    omnihand_close_scale: float = 0.35
+    """Fraction of the provisional O10 closed pose admitted for hardware motion."""
+
+    omnihand_sim_close_scale: float = 1.0
+    """Fraction of the O10 closed pose used by the Atlas MuJoCo model."""
+
+    omnihand_transition_duration: float = 1.0
+    """Seconds for either simulated or physical OmniHand to open or close."""
+
+    omnihand_left_interface: str = "can11"
+    """Serial-bound SocketCAN interface for the physical left O10."""
+
+    omnihand_right_interface: str = "can10"
+    """Serial-bound SocketCAN interface for the physical right O10."""
+
     # Teleop streamer options
     pico_manager: bool = True
     """Run pico_manager_thread_server with --manager flag."""
@@ -153,10 +172,26 @@ class DataCollectionLaunchConfig:
     """Camera server host (shared by data exporter and viewer)."""
 
     camera_port: int = 5555
-    """Camera server port (shared by data exporter and viewer)."""
+    """Stable camera endpoint: MuJoCo in simulation, ZED on hardware."""
+
+    manage_camera_service: bool = True
+    """Stop the ZED system service for simulation and start it for hardware."""
+
+    sim_elastic_band: bool = False
+    """Suspend the simulated robot with MuJoCo's virtual elastic band."""
+
+    remote_ui: bool = False
+    """Run MuJoCo headlessly and serve a browser UI through an SSH port forward."""
+
+    remote_ui_port: int = 8080
+    """Loopback-only HTTP port used by the browser UI."""
 
 
 SESSION_NAME = "sonic_data_collection"
+DASHBOARD_WINDOW = f"{SESSION_NAME}:data_collection"
+DASHBOARD_PANE = f"{DASHBOARD_WINDOW}.0"
+CORE_PANE_COUNT = 4
+SIM_PANE = 4
 
 
 def _check_prerequisites(config: DataCollectionLaunchConfig):
@@ -166,31 +201,50 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
     if not shutil.which("tmux"):
         errors.append("tmux is not installed. Install with: sudo apt install tmux")
 
+    if config.remote_ui and not config.sim:
+        errors.append("--remote-ui is only supported with --sim")
+    if config.remote_ui_port == config.camera_port:
+        errors.append("--remote-ui-port and --camera-port must be different")
+    if not 1 <= config.remote_ui_port <= 65535:
+        errors.append("--remote-ui-port must be between 1 and 65535")
+    if not 1 <= config.camera_port <= 65535:
+        errors.append("--camera-port must be between 1 and 65535")
+
     repo_root = Path(__file__).resolve().parent.parent.parent
 
     if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
-        errors.append(
-            ".venv_teleop not found. Run: bash install_scripts/install_pico.sh"
-        )
+        errors.append(".venv_teleop not found. Run: bash install_scripts/install_pico.sh")
 
     if not (repo_root / ".venv_data_collection" / "bin" / "activate").exists():
-        errors.append(
-            ".venv_data_collection not found. Run: "
-            "bash install_scripts/install_data_collection.sh"
-        )
+        errors.append(".venv_data_collection not found. Run: bash install_scripts/install_data_collection.sh")
 
     deploy_dir = repo_root / "gear_sonic_deploy"
     if not (deploy_dir / "deploy.sh").exists():
         errors.append(
-            f"gear_sonic_deploy/deploy.sh not found at {deploy_dir}. "
-            "Ensure the deploy directory is set up."
+            f"gear_sonic_deploy/deploy.sh not found at {deploy_dir}. Ensure the deploy directory is set up."
         )
 
     if config.sim and not (repo_root / ".venv_sim" / "bin" / "activate").exists():
-        errors.append(
-            ".venv_sim not found. Set up the simulation venv first "
-            "(see install instructions)."
+        errors.append(".venv_sim not found. Set up the simulation venv first (see install instructions).")
+
+    if config.hand_backend == "omnihand" and not config.sim:
+        if not (repo_root / ".venv_omnihand" / "bin" / "activate").exists():
+            errors.append(".venv_omnihand not found. Run: bash install_scripts/install_omnihand.sh")
+    if config.hand_backend == "omnihand" and config.sim:
+        scene = repo_root / "gear_sonic/data/robot_model/model_data/g1_omnihand/scene_49dof.xml"
+        mesh = (
+            repo_root / "gear_sonic/data/robot_model/model_data/g1_omnihand/"
+            "omnihand_description/assets/meshes/l_palm.STL"
         )
+        if not scene.is_file() or not mesh.is_file() or mesh.stat().st_size < 1000:
+            errors.append("Atlas OmniHand MuJoCo assets are unavailable or still LFS pointers. Run: git lfs pull")
+
+    if not 0.0 <= config.omnihand_close_scale <= 1.0:
+        errors.append("--omnihand-close-scale must be between zero and one")
+    if not 0.0 <= config.omnihand_sim_close_scale <= 1.0:
+        errors.append("--omnihand-sim-close-scale must be between zero and one")
+    if config.omnihand_transition_duration <= 0.0:
+        errors.append("--omnihand-transition-duration must be positive")
 
     if config.pico_input_source not in {"xrt", "isaac-teleop"}:
         errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
@@ -211,8 +265,44 @@ def _kill_existing_session():
     )
 
 
-def _create_tmux_session():
-    """Create a 4-pane tmux layout."""
+def _camera_port_is_listening(port: int) -> bool:
+    """Return whether a local process currently owns the camera endpoint."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.2)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _switch_camera_source(config: DataCollectionLaunchConfig) -> None:
+    """Give the stable camera port to MuJoCo or the physical ZED service."""
+    if not config.manage_camera_service:
+        return
+
+    service = "composed_camera_server.service"
+    action = "stop" if config.sim else "start"
+    source = "MuJoCo" if config.sim else "ZED"
+    print(f"Switching camera source to {source} on port {config.camera_port}...")
+    result = subprocess.run(["sudo", "systemctl", action, service])
+    if result.returncode != 0:
+        raise RuntimeError(f"Could not {action} {service}")
+
+    deadline = time.monotonic() + (10.0 if config.sim else 60.0)
+    expected_listening = not config.sim
+    while time.monotonic() < deadline:
+        if _camera_port_is_listening(config.camera_port) == expected_listening:
+            return
+        time.sleep(0.25)
+
+    state = "become free" if config.sim else "start listening"
+    raise RuntimeError(f"Camera port {config.camera_port} did not {state} after service {action}")
+
+
+def _hand_pane(config: DataCollectionLaunchConfig) -> int:
+    """Return the OmniHand pane index for the selected launch configuration."""
+    return CORE_PANE_COUNT + int(config.sim)
+
+
+def _create_tmux_session(config: DataCollectionLaunchConfig):
+    """Create one tiled dashboard containing every requested component."""
     # Create detached session
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", SESSION_NAME],
@@ -230,37 +320,41 @@ def _create_tmux_session():
     )
 
     # Rename default window
+    subprocess.run(["tmux", "rename-window", "-t", SESSION_NAME, "data_collection"], check=True)
     subprocess.run(
-        ["tmux", "rename-window", "-t", f"{SESSION_NAME}:0", "data_collection"],
+        ["tmux", "set-window-option", "-t", DASHBOARD_WINDOW, "pane-base-index", "0"],
+        check=True,
     )
 
-    # Split into 4 panes:
-    #   0 | 1
-    #   -----
-    #   2 | 3
-
-    # Split horizontally: pane 0 (left) and pane 1 (right)
-    subprocess.run(
-        ["tmux", "split-window", "-t", f"{SESSION_NAME}:0", "-h"],
-    )
-
-    # Split left pane vertically: pane 0 (top-left) and pane 2 (bottom-left)
-    subprocess.run(
-        ["tmux", "split-window", "-t", f"{SESSION_NAME}:0.0", "-v"],
-    )
-
-    # Split right pane vertically: pane 1 becomes top-right, new pane 3 bottom-right
-    subprocess.run(
-        ["tmux", "split-window", "-t", f"{SESSION_NAME}:0.2", "-v"],
-    )
+    pane_count = CORE_PANE_COUNT + int(config.sim) + int(config.hand_backend == "omnihand")
+    for _ in range(1, pane_count):
+        subprocess.run(
+            ["tmux", "split-window", "-d", "-t", DASHBOARD_WINDOW],
+            check=True,
+        )
+        # Without rebalancing here, every split targets the still-active pane 0
+        # and eventually fails with "no space for new pane" on small terminals.
+        subprocess.run(["tmux", "select-layout", "-t", DASHBOARD_WINDOW, "tiled"], check=True)
 
     # Let all pane shells finish initialization (.bashrc, conda, etc.)
     time.sleep(5)
 
 
+def _select_dashboard():
+    """Make the data-collection dashboard the visible tmux view."""
+    subprocess.run(
+        ["tmux", "select-window", "-t", DASHBOARD_WINDOW],
+        check=True,
+    )
+    subprocess.run(
+        ["tmux", "select-pane", "-t", DASHBOARD_PANE],
+        check=True,
+    )
+
+
 def _send_to_pane(pane_index: int, cmd: str, wait: float = 1.0):
     """Send a command string to a tmux pane."""
-    target = f"{SESSION_NAME}:0.{pane_index}"
+    target = f"{DASHBOARD_WINDOW}.{pane_index}"
 
     subprocess.run(
         ["tmux", "send-keys", "-t", target, cmd, "C-m"],
@@ -270,7 +364,7 @@ def _send_to_pane(pane_index: int, cmd: str, wait: float = 1.0):
 
 def _check_pane_alive(pane_index: int) -> bool:
     """Check if a tmux pane's process is still running."""
-    target = f"{SESSION_NAME}:0.{pane_index}"
+    target = f"{DASHBOARD_WINDOW}.{pane_index}"
     result = subprocess.run(
         ["tmux", "list-panes", "-t", target, "-F", "#{pane_dead}"],
         capture_output=True,
@@ -283,7 +377,6 @@ def main(config: DataCollectionLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
     _check_prerequisites(config)
-    _kill_existing_session()
 
     print("=" * 60)
     print("  SONIC Data Collection Launcher")
@@ -293,43 +386,48 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Dataset name:    {config.dataset_name or '(auto)'}")
     print(f"  Deploy input:    {config.deploy_input_type}")
     print(f"  Teleop input:    {config.pico_input_source}")
+    print(f"  Hand backend:    {config.hand_backend}")
     if config.deploy_checkpoint:
         print(f"  Checkpoint:      {config.deploy_checkpoint}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
     print(f"  DC frequency:    {config.data_exporter_frequency} Hz")
-    print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
+    viewer_mode = "Browser" if config.remote_ui else ("Native" if config.camera_viewer else "No")
+    print(f"  Camera viewer:   {viewer_mode}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
     print(f"  Teleop vis:      vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print("=" * 60)
 
-    _create_tmux_session()
+    if config.hand_backend == "omnihand" and not config.sim:
+        acknowledgement = input("Physical OmniHand control may move both hands. Type OMNIHAND to continue: ")
+        if acknowledgement != "OMNIHAND":
+            print("OmniHand launch cancelled; no hardware commands were enabled.")
+            return
+
+    _kill_existing_session()
+    _switch_camera_source(config)
+    _create_tmux_session(config)
     print(f"Created tmux session: {SESSION_NAME}")
 
-    # --- Window 1 (sim only): MuJoCo Simulator ---
+    # --- Pane 4 (sim only): MuJoCo Simulator ---
     if config.sim:
-        subprocess.run(
-            ["tmux", "new-window", "-t", SESSION_NAME, "-n", "sim"],
-        )
+        python_prefix = "MUJOCO_GL=egl python" if config.remote_ui else "python"
         sim_cmd = (
             f"cd {repo_root} && "
             f"source .venv_sim/bin/activate && "
-            f"python gear_sonic/scripts/run_sim_loop.py "
+            f"{python_prefix} gear_sonic/scripts/run_sim_loop.py "
             f"--enable-image-publish --enable-offscreen "
             f"--camera-port {config.camera_port}"
         )
-        sim_target = f"{SESSION_NAME}:sim"
-        subprocess.run(
-            ["tmux", "send-keys", "-t", sim_target, sim_cmd, "C-m"],
-        )
-        print("Starting MuJoCo simulator (window: sim)...")
-        time.sleep(3.0)
-
-        # Switch back to the data_collection window for the remaining panes
-        subprocess.run(
-            ["tmux", "select-window", "-t", f"{SESSION_NAME}:data_collection"],
-        )
+        if config.remote_ui:
+            sim_cmd += " --no-enable-onscreen --stream-camera third_person"
+        if not config.sim_elastic_band:
+            sim_cmd += " --no-enable-elastic-band"
+        if config.hand_backend == "omnihand":
+            sim_cmd += " --external-hand-control"
+        print(f"Starting MuJoCo simulator (pane {SIM_PANE})...")
+        _send_to_pane(SIM_PANE, sim_cmd, wait=3.0)
 
     # --- Pane 0 (top-left): C++ Deploy ---
     deploy_mode = "sim" if config.sim else "real"
@@ -339,6 +437,12 @@ def main(config: DataCollectionLaunchConfig):
         f"--input-type {config.deploy_input_type} "
         f"--zmq-host {config.deploy_zmq_host} "
     )
+    hand_control = {
+        "dex3": "legacy-dex3",
+        "omnihand": "external",
+        "none": "none",
+    }[config.hand_backend]
+    deploy_cmd += f"--hand-control {hand_control} "
     if config.deploy_checkpoint:
         deploy_cmd += f"--cp {config.deploy_checkpoint} "
     if config.deploy_obs_config:
@@ -357,27 +461,71 @@ def main(config: DataCollectionLaunchConfig):
     if not _check_pane_alive(0):
         print("WARNING: C++ deploy pane may have failed to start.")
 
-    # --- Pane 2 (bottom-left): Teleop Streamer ---
-    pico_cmd = (
-        f"cd {repo_root} && "
-        f"source .venv_teleop/bin/activate && "
-        f"python gear_sonic/scripts/pico_manager_thread_server.py "
+    # --- Pane 1 (top-right): Teleop Streamer ---
+    pico_process_cmd = (
+        "python gear_sonic/scripts/pico_manager_thread_server.py "
         f"--input-source {config.pico_input_source}"
     )
     if config.pico_manager:
-        pico_cmd += " --manager"
+        pico_process_cmd += " --manager"
     if config.pico_vis_vr3pt:
-        pico_cmd += " --vis_vr3pt"
+        pico_process_cmd += " --vis_vr3pt"
     if config.pico_vis_smpl:
-        pico_cmd += " --vis_smpl"
+        pico_process_cmd += " --vis_smpl"
     if config.pico_waist_tracking:
-        pico_cmd += " --waist_tracking"
+        pico_process_cmd += " --waist_tracking"
 
-    print("Starting teleop streamer (pane 2)...")
+    # The vendor XRT extension is native code and can abort the Python worker on
+    # a broken connection. Keep pane 1 alive and restart only unexpected exits;
+    # a clean exit or Ctrl-C still stops the supervisor.
+    pico_cmd = (
+        f"cd {repo_root} && "
+        "source .venv_teleop/bin/activate && "
+        "while true; do "
+        f"{pico_process_cmd}; "
+        "status=$?; "
+        'if [ "$status" -eq 0 ] || [ "$status" -eq 130 ]; then break; fi; '
+        'echo "[PICO supervisor] Worker exited with status $status; restarting in 2s"; '
+        "sleep 2; "
+        "done"
+    )
+
+    print("Starting teleop streamer (pane 1)...")
     _send_to_pane(1, pico_cmd, wait=2.0)
 
-    # --- Pane 3 (bottom-right): Camera Viewer ---
-    if config.camera_viewer:
+    # --- Dedicated hand controller pane (OmniHand only) ---
+    if config.hand_backend == "omnihand":
+        hand_pane = _hand_pane(config)
+        hand_venv = ".venv_sim" if config.sim else ".venv_omnihand"
+        hand_backend = "sim" if config.sim else "omnihand"
+        close_scale = config.omnihand_sim_close_scale if config.sim else config.omnihand_close_scale
+        hand_cmd = (
+            f"cd {repo_root} && source {hand_venv}/bin/activate && "
+            f"python -m gear_sonic.end_effectors.controller run "
+            f"--backend {hand_backend} --sides both "
+            f"--left-interface {config.omnihand_left_interface} "
+            f"--right-interface {config.omnihand_right_interface} "
+            f"--close-scale {close_scale} "
+            f"--transition-duration {config.omnihand_transition_duration}"
+        )
+        if not config.sim:
+            hand_cmd += " --enable-command"
+        print(f"Starting OmniHand controller (pane {hand_pane})...")
+        _send_to_pane(hand_pane, hand_cmd)
+
+    # --- Pane 3 (middle-right): Native or browser camera viewer ---
+    if config.remote_ui:
+        viewer_cmd = (
+            f"cd {repo_root} && "
+            f"source .venv_data_collection/bin/activate && "
+            f"python gear_sonic/scripts/run_camera_web_viewer.py "
+            f"--camera-host {config.camera_host} "
+            f"--camera-port {config.camera_port} "
+            f"--http-port {config.remote_ui_port}"
+        )
+        print(f"Starting browser viewer on loopback port {config.remote_ui_port} (pane 3)...")
+        _send_to_pane(3, viewer_cmd, wait=2.0)
+    elif config.camera_viewer:
         viewer_cmd = (
             f"cd {repo_root} && "
             f"source .venv_data_collection/bin/activate && "
@@ -388,7 +536,7 @@ def main(config: DataCollectionLaunchConfig):
         print("Starting camera viewer (pane 3)...")
         _send_to_pane(3, viewer_cmd, wait=2.0)
 
-    # --- Pane 1 (top-right): Data Exporter ---
+    # --- Pane 2 (middle-left): Data Exporter ---
     exporter_cmd = (
         f"cd {repo_root} && "
         f"source .venv_data_collection/bin/activate && "
@@ -405,13 +553,11 @@ def main(config: DataCollectionLaunchConfig):
     if not config.text_to_speech:
         exporter_cmd += " --no-text-to-speech"
 
-    print("Starting data exporter (pane 1)...")
+    print("Starting data exporter (pane 2)...")
     _send_to_pane(2, exporter_cmd, wait=1.0)
 
-    # Select the data exporter pane so the user lands there for interactive input
-    subprocess.run(
-        ["tmux", "select-pane", "-t", f"{SESSION_NAME}:0.2"],
-    )
+    # Focus deploy, which may be waiting for confirmation or a sudo password.
+    _select_dashboard()
 
     print()
     print("=" * 60)
@@ -419,31 +565,44 @@ def main(config: DataCollectionLaunchConfig):
     print()
     print(f"  tmux session: {SESSION_NAME}")
     print()
-    if config.sim:
-        print("  Window 'sim':")
-        print("    MuJoCo Simulator (.venv_sim)")
+    print("  Window 'data_collection' (all panels visible):")
+    print("    Pane 0: C++ Deploy  <-- you are here")
+    print("    Pane 1: Teleop Streamer")
+    print("    Pane 2: Data Exporter")
+    if config.remote_ui:
+        print(f"    Pane 3: Browser UI on 127.0.0.1:{config.remote_ui_port}")
         print()
-    print("  Window 'data_collection':")
-    print("    Pane 0 (top-left):     C++ Deploy")
-    print("    Pane 1 (bottom-left):  Teleop Streamer")
-    print("    Pane 2 (top-right):    Data Exporter  <-- you are here")
-    if config.camera_viewer:
-        print("    Pane 3 (bottom-right): Camera Viewer")
+        print("  On your computer, open another terminal and run:")
+        print(f"    ssh -N -L {config.remote_ui_port}:127.0.0.1:{config.remote_ui_port} unitree@<robot-host>")
+        print(f"  Then open: http://127.0.0.1:{config.remote_ui_port}")
+    elif config.camera_viewer:
+        print("    Pane 3: Camera Viewer")
+    if config.sim:
+        print(f"    Pane {SIM_PANE}: MuJoCo Simulator")
+    if config.hand_backend == "omnihand":
+        print(f"    Pane {_hand_pane(config)}: OmniHand controller")
     print()
     print("  ** deploy.sh (pane 0) is waiting for confirmation —")
     print("     click on pane 0 and press Enter to proceed **")
     print()
     print("  Controls:")
     print("    Ctrl+b, arrow keys  - Switch between panes")
-    if config.sim:
-        print("    Ctrl+b, n / p       - Next / previous window")
     print("    Ctrl+b, d           - Detach from session")
     print("    Ctrl+\\              - Kill entire session")
     print("=" * 60)
 
     # Attach to the session
     try:
-        subprocess.run(["tmux", "attach", "-t", SESSION_NAME])
+        if os.environ.get("TMUX"):
+            subprocess.run(
+                ["tmux", "switch-client", "-t", DASHBOARD_WINDOW],
+                check=True,
+            )
+            return
+        subprocess.run(
+            ["tmux", "attach-session", "-t", DASHBOARD_WINDOW],
+            check=True,
+        )
     except KeyboardInterrupt:
         pass
 

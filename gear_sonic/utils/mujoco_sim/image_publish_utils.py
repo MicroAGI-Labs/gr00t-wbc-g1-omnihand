@@ -123,27 +123,21 @@ class ImagePublishProcess:
         self.shared_memory_blocks.clear()
 
     @staticmethod
-    def _image_publish_worker(
-        shared_memory_info, image_dt, zmq_port, stop_event, data_ready_event, verbose
-    ):
+    def _image_publish_worker(shared_memory_info, image_dt, zmq_port, stop_event, data_ready_event, verbose):
         """Worker function that runs in the subprocess"""
+        sensor_server = None
+        shm_blocks = {}
         try:
             sensor_server = SensorServer()
             sensor_server.start_server(port=zmq_port)
 
             shared_arrays = {}
-            shm_blocks = {}
             for camera_name, info in shared_memory_info.items():
                 shm = shared_memory.SharedMemory(name=info["name"])
                 shm_blocks[camera_name] = shm
-                shared_arrays[camera_name] = np.ndarray(
-                    info["shape"], dtype=info["dtype"], buffer=shm.buf
-                )
+                shared_arrays[camera_name] = np.ndarray(info["shape"], dtype=info["dtype"], buffer=shm.buf)
 
-            print(
-                f"Image publishing subprocess started with {len(shared_arrays)} cameras "
-                f"on ZMQ port {zmq_port}"
-            )
+            print(f"Image publishing subprocess started with {len(shared_arrays)} cameras on ZMQ port {zmq_port}")
 
             loop_count = 0
             last_data_time = time.time()
@@ -196,6 +190,7 @@ class ImagePublishProcess:
             try:
                 for shm in shm_blocks.values():
                     shm.close()
-                sensor_server.stop_server()
+                if sensor_server is not None:
+                    sensor_server.stop_server()
             except Exception as e:
                 print(f"Error during subprocess cleanup: {e}")

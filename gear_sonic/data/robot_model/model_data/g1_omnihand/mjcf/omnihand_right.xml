@@ -1,0 +1,5 @@
+<mujoco model="atlas_omnihand_right">
+  <!-- Atlas composition wrapper; the included vendor files remain unmodified. -->
+  <include file="omnihand_asset.xml" />
+  <include file="../omnihand_description/assets/MJCF/omnihand_right.xml" />
+</mujoco>

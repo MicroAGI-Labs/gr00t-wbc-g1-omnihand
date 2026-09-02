@@ -17,6 +17,7 @@ from gear_sonic.utils.network.network_utils import resolve_interface
 
 WBC_VERSIONS = ["sonic_model12"]
 
+
 @dataclass
 class ArgsConfigTemplate:
     """Args Config for running the data collection loop."""
@@ -48,9 +49,7 @@ class ArgsConfigTemplate:
         allowed_keys: list[str] | None = None,
     ):
         instance = cls()
-        instance.update(
-            config_dict=config_dict, strict=strict, skip_keys=skip_keys, allowed_keys=allowed_keys
-        )
+        instance.update(config_dict=config_dict, strict=strict, skip_keys=skip_keys, allowed_keys=allowed_keys)
         return instance
 
     def to_dict(self):
@@ -60,9 +59,7 @@ class ArgsConfigTemplate:
         return getattr(self, key) if hasattr(self, key) else default
 
 
-def override_wbc_config(
-    wbc_config: dict, config: "BaseConfig", missed_keys_only: bool = False
-) -> dict:
+def override_wbc_config(wbc_config: dict, config: "BaseConfig", missed_keys_only: bool = False) -> dict:
     """Override WBC YAML values with dataclass values."""
     key_to_value = {
         "INTERFACE": config.interface,
@@ -75,6 +72,14 @@ def override_wbc_config(
         "model_path": config.wbc_model_path,
         "enable_waist": config.enable_waist,
         "with_hands": config.with_hands,
+        "EXTERNAL_HAND_CONTROL": config.external_hand_control,
+        "HAND_STATE_ENDPOINT": config.hand_state_endpoint,
+        "HAND_SIM_FEEDBACK_ENDPOINT": config.hand_sim_feedback_endpoint,
+        "OMNIHAND_SIM_KP": config.omnihand_sim_kp,
+        "OMNIHAND_SIM_KD": config.omnihand_sim_kd,
+        "OMNIHAND_SIM_STATE_TIMEOUT": config.omnihand_sim_state_timeout,
+        "ENABLE_ELASTIC_BAND": config.enable_elastic_band,
+        "RESET_HOLD_SECONDS": config.reset_hold_seconds,
         "verbose": config.verbose,
         "verbose_timing": config.verbose_timing,
         "upper_body_max_joint_speed": config.upper_body_joint_speed,
@@ -90,6 +95,8 @@ def override_wbc_config(
         "hand_torque_limit": config.hand_torque_limit,
         "enable_natural_walk": config.enable_natural_walk,
     }
+    if config.external_hand_control:
+        key_to_value["ROBOT_SCENE"] = "gear_sonic/data/robot_model/model_data/g1_omnihand/scene_49dof.xml"
 
     if missed_keys_only:
         for key in key_to_value:
@@ -145,6 +152,30 @@ class BaseConfig(ArgsConfigTemplate):
 
     with_hands: bool = True
     """Enable hand functionality."""
+
+    external_hand_control: bool = False
+    """Load the Atlas G1+O10 scene and let the sibling controller own both hands."""
+
+    hand_state_endpoint: str = "tcp://localhost:5570"
+    """Controller state endpoint consumed by the O10 MuJoCo actuator bridge."""
+
+    hand_sim_feedback_endpoint: str = "tcp://*:5571"
+    """Endpoint publishing measured O10 MuJoCo state back to the controller."""
+
+    omnihand_sim_kp: float = 4.0
+    """O10 position-controller proportional gain in MuJoCo."""
+
+    omnihand_sim_kd: float = 0.08
+    """O10 position-controller derivative gain in MuJoCo."""
+
+    omnihand_sim_state_timeout: float = 0.5
+    """Age after which the MuJoCo bridge reports controller state as stale."""
+
+    enable_elastic_band: bool = True
+    """Suspend the floating base with the simulator's virtual elastic band."""
+
+    reset_hold_seconds: float = 0.5
+    """Hold the reset pose briefly while the controller receives fresh state."""
 
     high_elbow_pose: bool = False
     """Enable high elbow pose configuration."""
@@ -300,9 +331,7 @@ class BaseConfig(ArgsConfigTemplate):
             self.gravity_compensation_joints = ["arms"]
 
         try:
-            self.commit_id = (
-                subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
-            )
+            self.commit_id = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
         except Exception:
             self.commit_id = ""
 
@@ -316,10 +345,7 @@ class BaseConfig(ArgsConfigTemplate):
         if self.wbc_version == "sonic_model12":
             config_path = str(configs_dir / "g1_29dof_sonic_model12.yaml")
         else:
-            raise ValueError(
-                f"Invalid wbc_version: {self.wbc_version}, please use one of: "
-                f"sonic_model12"
-            )
+            raise ValueError(f"Invalid wbc_version: {self.wbc_version}, please use one of: sonic_model12")
 
         with open(config_path) as file:
             wbc_config = yaml.load(file, Loader=yaml.FullLoader)
@@ -333,6 +359,9 @@ class BaseConfig(ArgsConfigTemplate):
 class SimLoopConfig(BaseConfig):
     """Config for running the simulation loop."""
 
+    smoke_once: bool = False
+    """Construct the selected model, execute one physics step, and exit."""
+
     mp_start_method: str = "spawn"
     """Multiprocessing start method"""
 
@@ -341,6 +370,9 @@ class SimLoopConfig(BaseConfig):
 
     camera_port: int = 5555
     """Camera port for image publishing"""
+
+    stream_camera: Literal["ego", "third_person"] = "ego"
+    """Camera view published by the simulator."""
 
     verbose: bool = False
     """Verbose output, override the base config verbose"""

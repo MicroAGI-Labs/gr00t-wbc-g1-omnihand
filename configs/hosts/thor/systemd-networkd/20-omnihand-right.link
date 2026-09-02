@@ -1,0 +1,10 @@
+# Thor right OmniHand; do not collide with the built-in mttcan can4 device.
+[Match]
+OriginalName=can*
+Driver=gs_usb
+Property=ID_SERIAL_SHORT=2082395E534B50052
+
+[Link]
+NamePolicy=
+Name=can10
+TransmitQueueLength=1000

@@ -356,8 +356,8 @@ There are two ways to control recording: **PICO VR controllers** (recommended du
 
 | Input | Action |
 |---|---|
-| **Left Grip + A** | **Toggle** recording — starts a new episode, or stops and saves the current one |
-| **Left Grip + B** | **Discard** the current episode (saved to disk but flagged for removal during post-processing) |
+| **X + B** | **Toggle on release** — starts a new episode, or stops and saves the current one |
+| **Y + A** | **Discard on release** — saves the active episode flagged for removal during post-processing |
 
 These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent of the mode-switching controls.
 
@@ -365,8 +365,8 @@ These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent
 
 | Key | Action |
 |---|---|
-| `c` | **Toggle** recording (same as Left Grip + A) |
-| `x` | **Discard** episode (same as Left Grip + B — flagged for removal) |
+| `c` | **Toggle** recording (same as X + B) |
+| `x` | **Discard** episode (same as Y + A — flagged for removal) |
 
 ```{note}
 Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.
@@ -479,7 +479,7 @@ source .venv_data_collection/bin/activate
 
 ### Remove Discarded Episodes
 
-Episodes discarded during collection (`x` key or Left Grip + B) are saved to disk
+Episodes discarded during collection (`x` key or Y + A) are saved to disk
 but flagged in `meta/info.json`. By default, the processing script removes these
 flagged episodes so they are excluded from fine-tuning:
 

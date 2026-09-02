@@ -211,6 +211,7 @@ show_usage() {
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
+    echo "  --hand-control MODE     legacy-dex3, external, or none"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -242,6 +243,7 @@ MOTION_DATA_DEFAULT="reference/example/"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
+HAND_CONTROL_DEFAULT="legacy-dex3"
 
 # Initialize with defaults (will be set after parsing)
 CHECKPOINT="$CHECKPOINT_DEFAULT"
@@ -251,6 +253,7 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
+HAND_CONTROL="$HAND_CONTROL_DEFAULT"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -313,6 +316,14 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ZMQ_HOST="$2"
+            shift 2
+            ;;
+        --hand-control)
+            if [[ "$2" != "legacy-dex3" && "$2" != "external" && "$2" != "none" ]]; then
+                echo -e "${RED}Error: --hand-control must be legacy-dex3, external, or none${NC}" >&2
+                exit 1
+            fi
+            HAND_CONTROL="$2"
             shift 2
             ;;
         sim|real)
@@ -515,6 +526,7 @@ echo -e "  Planner:            ${GREEN}$PLANNER${NC}"
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
+echo -e "  Hand Control:       ${GREEN}$HAND_CONTROL${NC}"
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "  Extra Args:         ${GREEN}$EXTRA_ARGS${NC}"
 fi
@@ -530,6 +542,7 @@ echo -e "${BLUE}    --planner-file $PLANNER \\${NC}"
 echo -e "${BLUE}    --input-type $INPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --output-type $OUTPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --zmq-host $ZMQ_HOST${NC}"
+echo -e "${BLUE}    --hand-control $HAND_CONTROL${NC}"
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "${BLUE}    $EXTRA_ARGS${NC}"
 fi
@@ -560,6 +573,7 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
             --input-type "$INPUT_TYPE" \
             --output-type "$OUTPUT_TYPE" \
             --zmq-host "$ZMQ_HOST" \
+            --hand-control "$HAND_CONTROL" \
             $EXTRA_ARGS
     else
         just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
@@ -568,7 +582,8 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
             --planner-file "$PLANNER" \
             --input-type "$INPUT_TYPE" \
             --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST"
+            --zmq-host "$ZMQ_HOST" \
+            --hand-control "$HAND_CONTROL"
     fi
 else
     echo ""

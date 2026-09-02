@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "asset": "omnihand_o10_official_description",
+  "description": "Official AGILINK/AgiBot OmniHand O10 left/right URDF, Xacro, meshes, and MuJoCo models.",
+  "entry_points": {
+    "left_urdf": "omnihand_description/assets/urdf/omnihand_left.urdf",
+    "right_urdf": "omnihand_description/assets/urdf/omnihand_right.urdf",
+    "left_collision_urdf": "omnihand_description/assets/urdf_mesh_col/omnihand_left.urdf",
+    "right_collision_urdf": "omnihand_description/assets/urdf_mesh_col/omnihand_right.urdf",
+    "left_mjcf": "omnihand_description/assets/MJCF/omnihand_left.xml",
+    "right_mjcf": "mjcf/omnihand_right.xml",
+    "bilateral_mjcf": "omnihand_description/assets/MJCF/scene.xml"
+  },
+  "model_properties": {
+    "joints_per_hand": 16,
+    "actuators_per_hand": 10,
+    "coupled_joints_per_hand": 6,
+    "bilateral_nq": 32,
+    "bilateral_nv": 32,
+    "bilateral_nu": 20,
+    "loaded_with": "mujoco 3.10.0",
+    "loaded_utc": "2026-08-06"
+  },
+  "source": {
+    "document_center": "https://www.agibot.com.cn/DOCS/OS/Omnihand-O10",
+    "archive": "https://www.agibot.com.cn/file/ueditor/php/upload/file/20260201/1769933923166393.zip",
+    "archive_sha256": "c18a1e977accaf37fb5e8af0a714d73fd831bfaca9c5d383963438bffe12c1ce",
+    "archive_git_revision": "b599cccd79d610a1001be1be4e21bcc642d35222",
+    "retrieved_utc": "2026-08-06"
+  },
+  "license": {
+    "declared_spdx": "Apache-2.0",
+    "evidence": "omnihand_description/package.xml",
+    "license_text_in_archive": false
+  },
+  "checksums": "omnihand_description.sha256",
+  "verified": {
+    "archive_integrity": true,
+    "vendor_tree_preserved": true,
+    "left_loads_in_mujoco": true,
+    "bilateral_scene_loads_in_mujoco": true,
+    "vendor_right_loads_standalone": false,
+    "atlas_right_wrapper_loads_standalone": true,
+    "joint_and_actuator_order_matches_atlas_contract": true,
+    "mass_properties_vs_physical_hand": false,
+    "collision_geometry_vs_physical_hand": false,
+    "mount_transform_vs_physical_adapter": false
+  },
+  "notes": [
+    "The imported omnihand_description directory is an unmodified copy of the official archive; Atlas-derived files live beside it.",
+    "The official MJCF contains nonlinear equality constraints for the six passive joints and is the preferred simulation source. The URDF documentation states that URDF coupling is only a linear approximation.",
+    "The official omnihand_right.xml comments out its omnihand_asset.xml include, so it does not load standalone. The official bilateral scene loads because the left model includes the shared defaults and assets first.",
+    "The archive declares Apache-2.0 in package.xml but does not include a license text; redistribution review remains open."
+  ]
+}
