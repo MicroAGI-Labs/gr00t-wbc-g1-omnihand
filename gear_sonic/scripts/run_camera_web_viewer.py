@@ -29,7 +29,7 @@ _INDEX_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>SONIC Simulation</title>
+  <title>SONIC Teleoperation</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; }
     body { margin: 0; background: #11151a; color: #edf2f7; }
@@ -62,9 +62,9 @@ _INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <header><h1>SONIC · G1 OmniHand simulation</h1><span id="camera-status">connecting…</span></header>
+  <header><h1>SONIC · G1 Teleoperation</h1><span id="camera-status">connecting…</span></header>
   <main>
-    <img id="stream" src="/stream.mjpg" alt="Waiting for simulation camera stream">
+    <img id="stream" src="/stream.mjpg" alt="Waiting for camera stream">
     <section class="recorder">
       <span id="record-state">CONNECTING</span>
       <div class="recorder-info">
@@ -90,7 +90,7 @@ _INDEX_HTML = """<!doctype html>
         const health = await response.json();
         cameraStatus.textContent = health.streaming
           ? `${health.camera_count} camera${health.camera_count === 1 ? '' : 's'} · live`
-          : 'waiting for simulator…';
+          : 'waiting for camera…';
         cameraStatus.style.color = health.streaming ? '#72d69c' : '#f6c85f';
       } catch (_) {
         cameraStatus.textContent = 'viewer disconnected';

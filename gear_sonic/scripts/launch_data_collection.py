@@ -14,7 +14,8 @@ Starts the full data collection stack in one visible tmux dashboard. With
     └───────────────────────┴───────────────────────┘
 
 The simulator and hand panes are included only when their corresponding
-options are enabled.
+options are enabled. Real-hardware runs also include a read-only camera-server
+log pane; systemd remains the owner of the camera process.
 
 Prerequisites:
     - tmux installed (sudo apt install tmux)
@@ -124,7 +125,7 @@ class DataCollectionLaunchConfig:
     """Fraction of the O10 closed pose used by the Atlas MuJoCo model."""
 
     omnihand_transition_duration: float = 1.0
-    """Seconds for either simulated or physical OmniHand to open or close."""
+    """Seconds for OmniHand to open or close; lower values respond faster."""
 
     omnihand_left_interface: str = "can11"
     """Serial-bound SocketCAN interface for the physical left O10."""
@@ -132,9 +133,18 @@ class DataCollectionLaunchConfig:
     omnihand_right_interface: str = "can10"
     """Serial-bound SocketCAN interface for the physical right O10."""
 
+    hand_intent_port: int = 5569
+    """Dedicated latest-only hand-intent ZMQ port."""
+
     # Teleop streamer options
     pico_manager: bool = True
     """Run pico_manager_thread_server with --manager flag."""
+
+    pico_teleop_mode: Literal["vr3pt", "pose"] = "vr3pt"
+    """A+X teleop mode: upper-body VR 3-point or legacy full-body pose."""
+
+    pico_locomotion_mode: Literal["idle", "slow_walk", "walk", "run"] = "slow_walk"
+    """Initial joystick locomotion gait for planner and VR 3-point modes."""
 
     pico_input_source: str = "xrt"
     """Teleop input source for pico_manager_thread_server.py (xrt or isaac-teleop)."""
@@ -177,11 +187,17 @@ class DataCollectionLaunchConfig:
     manage_camera_service: bool = True
     """Stop the ZED system service for simulation and start it for hardware."""
 
+    camera_server_logs: bool = True
+    """Show the systemd camera-server log in a read-only hardware pane."""
+
     sim_elastic_band: bool = False
     """Suspend the simulated robot with MuJoCo's virtual elastic band."""
 
     remote_ui: bool = False
-    """Run MuJoCo headlessly and serve a browser UI through an SSH port forward."""
+    """Serve the camera and recorder UI through an SSH port forward.
+
+    In simulation this also runs MuJoCo headlessly.
+    """
 
     remote_ui_port: int = 8080
     """Loopback-only HTTP port used by the browser UI."""
@@ -201,8 +217,6 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
     if not shutil.which("tmux"):
         errors.append("tmux is not installed. Install with: sudo apt install tmux")
 
-    if config.remote_ui and not config.sim:
-        errors.append("--remote-ui is only supported with --sim")
     if config.remote_ui_port == config.camera_port:
         errors.append("--remote-ui-port and --camera-port must be different")
     if not 1 <= config.remote_ui_port <= 65535:
@@ -245,6 +259,10 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
         errors.append("--omnihand-sim-close-scale must be between zero and one")
     if config.omnihand_transition_duration <= 0.0:
         errors.append("--omnihand-transition-duration must be positive")
+    if not 1 <= config.hand_intent_port <= 65535:
+        errors.append("--hand-intent-port must be between 1 and 65535")
+    if config.hand_intent_port in {config.camera_port, config.remote_ui_port}:
+        errors.append("--hand-intent-port must differ from the camera and remote UI ports")
 
     if config.pico_input_source not in {"xrt", "isaac-teleop"}:
         errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
@@ -280,13 +298,26 @@ def _switch_camera_source(config: DataCollectionLaunchConfig) -> None:
     service = "composed_camera_server.service"
     action = "stop" if config.sim else "start"
     source = "MuJoCo" if config.sim else "ZED"
+    currently_active = subprocess.run(
+        ["systemctl", "is-active", "--quiet", service],
+        capture_output=True,
+    ).returncode == 0
+    expected_listening = not config.sim
+    if (
+        currently_active == (action == "start")
+        and _camera_port_is_listening(config.camera_port) == expected_listening
+    ):
+        print(f"Camera source already set to {source} on port {config.camera_port}.")
+        return
     print(f"Switching camera source to {source} on port {config.camera_port}...")
-    result = subprocess.run(["sudo", "systemctl", action, service])
+    result = subprocess.run(["sudo", "-n", "systemctl", action, service])
     if result.returncode != 0:
-        raise RuntimeError(f"Could not {action} {service}")
+        raise RuntimeError(
+            f"Could not {action} {service} without a password prompt. "
+            f"Run 'sudo systemctl {action} {service}' once, then launch again."
+        )
 
     deadline = time.monotonic() + (10.0 if config.sim else 60.0)
-    expected_listening = not config.sim
     while time.monotonic() < deadline:
         if _camera_port_is_listening(config.camera_port) == expected_listening:
             return
@@ -299,6 +330,11 @@ def _switch_camera_source(config: DataCollectionLaunchConfig) -> None:
 def _hand_pane(config: DataCollectionLaunchConfig) -> int:
     """Return the OmniHand pane index for the selected launch configuration."""
     return CORE_PANE_COUNT + int(config.sim)
+
+
+def _camera_server_log_pane(config: DataCollectionLaunchConfig) -> int:
+    """Return the hardware camera log pane after optional sim/hand panes."""
+    return CORE_PANE_COUNT + int(config.sim) + int(config.hand_backend == "omnihand")
 
 
 def _create_tmux_session(config: DataCollectionLaunchConfig):
@@ -326,7 +362,12 @@ def _create_tmux_session(config: DataCollectionLaunchConfig):
         check=True,
     )
 
-    pane_count = CORE_PANE_COUNT + int(config.sim) + int(config.hand_backend == "omnihand")
+    pane_count = (
+        CORE_PANE_COUNT
+        + int(config.sim)
+        + int(config.hand_backend == "omnihand")
+        + int(not config.sim and config.camera_server_logs)
+    )
     for _ in range(1, pane_count):
         subprocess.run(
             ["tmux", "split-window", "-d", "-t", DASHBOARD_WINDOW],
@@ -399,12 +440,6 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Teleop vis:      vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print("=" * 60)
 
-    if config.hand_backend == "omnihand" and not config.sim:
-        acknowledgement = input("Physical OmniHand control may move both hands. Type OMNIHAND to continue: ")
-        if acknowledgement != "OMNIHAND":
-            print("OmniHand launch cancelled; no hardware commands were enabled.")
-            return
-
     _kill_existing_session()
     _switch_camera_source(config)
     _create_tmux_session(config)
@@ -434,6 +469,7 @@ def main(config: DataCollectionLaunchConfig):
     deploy_cmd = (
         f"cd {repo_root / 'gear_sonic_deploy'} && "
         f"./deploy.sh "
+        f"--yes "
         f"--input-type {config.deploy_input_type} "
         f"--zmq-host {config.deploy_zmq_host} "
     )
@@ -464,7 +500,10 @@ def main(config: DataCollectionLaunchConfig):
     # --- Pane 1 (top-right): Teleop Streamer ---
     pico_process_cmd = (
         "python gear_sonic/scripts/pico_manager_thread_server.py "
-        f"--input-source {config.pico_input_source}"
+        f"--input-source {config.pico_input_source} "
+        f"--hand-intent-port {config.hand_intent_port} "
+        f"--teleop-mode {config.pico_teleop_mode} "
+        f"--initial-locomotion-mode {config.pico_locomotion_mode}"
     )
     if config.pico_manager:
         pico_process_cmd += " --manager"
@@ -503,6 +542,7 @@ def main(config: DataCollectionLaunchConfig):
             f"cd {repo_root} && source {hand_venv}/bin/activate && "
             f"python -m gear_sonic.end_effectors.controller run "
             f"--backend {hand_backend} --sides both "
+            f"--intent-endpoint tcp://localhost:{config.hand_intent_port} "
             f"--left-interface {config.omnihand_left_interface} "
             f"--right-interface {config.omnihand_right_interface} "
             f"--close-scale {close_scale} "
@@ -512,6 +552,16 @@ def main(config: DataCollectionLaunchConfig):
             hand_cmd += " --enable-command"
         print(f"Starting OmniHand controller (pane {hand_pane})...")
         _send_to_pane(hand_pane, hand_cmd)
+
+    # --- Read-only system camera service log (hardware only) ---
+    if not config.sim and config.camera_server_logs:
+        camera_log_pane = _camera_server_log_pane(config)
+        camera_log_cmd = (
+            "journalctl -u composed_camera_server.service "
+            "--follow --lines 100 --no-pager"
+        )
+        print(f"Following camera server logs (pane {camera_log_pane})...")
+        _send_to_pane(camera_log_pane, camera_log_cmd)
 
     # --- Pane 3 (middle-right): Native or browser camera viewer ---
     if config.remote_ui:
@@ -556,7 +606,7 @@ def main(config: DataCollectionLaunchConfig):
     print("Starting data exporter (pane 2)...")
     _send_to_pane(2, exporter_cmd, wait=1.0)
 
-    # Focus deploy, which may be waiting for confirmation or a sudo password.
+    # Focus deploy for live controller diagnostics.
     _select_dashboard()
 
     print()
@@ -581,9 +631,13 @@ def main(config: DataCollectionLaunchConfig):
         print(f"    Pane {SIM_PANE}: MuJoCo Simulator")
     if config.hand_backend == "omnihand":
         print(f"    Pane {_hand_pane(config)}: OmniHand controller")
+    if not config.sim and config.camera_server_logs:
+        print(
+            f"    Pane {_camera_server_log_pane(config)}: "
+            "Camera server logs (read-only)"
+        )
     print()
-    print("  ** deploy.sh (pane 0) is waiting for confirmation —")
-    print("     click on pane 0 and press Enter to proceed **")
+    print("  deploy.sh was started with non-interactive confirmation.")
     print()
     print("  Controls:")
     print("    Ctrl+b, arrow keys  - Switch between panes")

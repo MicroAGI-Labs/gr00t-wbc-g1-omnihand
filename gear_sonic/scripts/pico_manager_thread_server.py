@@ -38,6 +38,7 @@ import zmq
 
 from gear_sonic.end_effectors.controller import TriggerHysteresis
 from gear_sonic.end_effectors.protocol import (
+    DEFAULT_HAND_INTENT_PORT,
     HAND_INTENT_SCHEMA,
     HAND_INTENT_TOPIC,
     encode as encode_hand_message,
@@ -202,7 +203,7 @@ class HandIntentStream:
         self.last_source_timestamp_ns: int | None = None
         self.hysteresis = TriggerHysteresis()
 
-    def publish(self, socket, reader) -> None:
+    def publish(self, socket, reader, *, hold: bool = False) -> None:
         _, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(reader)
         try:
             source_timestamp_ns = int(reader.get_timestamp_ns())
@@ -228,6 +229,7 @@ class HandIntentStream:
                     "sequence": self.sequence,
                     "monotonic_ns": time.monotonic_ns(),
                     "source": "pico",
+                    "hold": hold,
                     "left": {
                         "valid": valid,
                         "closed": left_closed,
@@ -1039,6 +1041,7 @@ class PicoReader:
 
 def _pose_stream_common(
     socket,
+    hand_socket,
     buffer_size: int,
     num_frames_to_send: int,
     target_fps: int,
@@ -1092,7 +1095,7 @@ def _pose_stream_common(
     try:
         while not stop_event.is_set():
             streamer.run_once()
-            hand_intent.publish(socket, reader)
+            hand_intent.publish(hand_socket, reader)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1834,6 +1837,7 @@ def _init_input_source(
 def run_pico(
     buffer_size: int = 15,
     port: int = 5556,
+    hand_intent_port: int = DEFAULT_HAND_INTENT_PORT,
     num_frames_to_send: int = 5,
     target_fps: int = 50,
     use_cuda: bool = False,
@@ -1850,6 +1854,9 @@ def run_pico(
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
+    hand_socket = context.socket(zmq.PUB)
+    hand_socket.setsockopt(zmq.SNDHWM, 1)
+    hand_socket.bind(f"tcp://*:{hand_intent_port}")
     time.sleep(0.1)
     print(f"ZMQ socket bound to port {port}")
     if build_command_message is not None and build_planner_message is not None:
@@ -1861,6 +1868,7 @@ def run_pico(
     try:
         _pose_stream_common(
             socket=socket,
+            hand_socket=hand_socket,
             buffer_size=buffer_size,
             num_frames_to_send=num_frames_to_send,
             target_fps=target_fps,
@@ -1880,6 +1888,7 @@ def run_pico(
         if input_source == "xrt":
             _close_xrt()
         socket.close()
+        hand_socket.close()
         context.term()
         print("Threads stopped, ZMQ socket closed")
 
@@ -1960,6 +1969,7 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        initial_mode: LocomotionMode = LocomotionMode.IDLE,
     ):
         self.socket = socket
         self.reader = reader
@@ -1969,8 +1979,9 @@ class PlannerStreamer:
         )
 
         self.dt = 1.0 / max(1, poll_hz)
-        # Current locomotion mode, default IDLE
-        self.mode = LocomotionMode.IDLE
+        # Persistent gait selection. Zero stick input still sends IDLE, but
+        # movement begins in this gait as soon as the joystick leaves deadzone.
+        self.mode = LocomotionMode(initial_mode)
         # Persistent facing buffer (unit vector on XY plane)
         self.yaw_accumulator = YawAccumulator()
         self.last_send = time.time()
@@ -2131,6 +2142,7 @@ class PlannerStreamer:
 
 def run_pico_manager(
     port: int = 5556,
+    hand_intent_port: int = DEFAULT_HAND_INTENT_PORT,
     buffer_size: int = 15,
     num_frames_to_send: int = 5,
     target_fps: int = 50,
@@ -2144,11 +2156,13 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    teleop_mode: str = "pose",
+    initial_locomotion_mode: str = "idle",
     recording_status_host: str = "localhost",
     recording_status_port: int = 5581,
 ):
     """
-    Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
+    Manager: publishes body and latest-only hand intent on separate sockets.
     Controller input:
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
@@ -2157,10 +2171,31 @@ def run_pico_manager(
       Y+A: Discard active recording
     """
     reader = _init_input_source(input_source, buffer_size)
+    if teleop_mode not in {"pose", "vr3pt"}:
+        raise ValueError("teleop_mode must be 'pose' or 'vr3pt'")
+    try:
+        initial_mode = LocomotionMode[initial_locomotion_mode.upper()]
+    except KeyError as exc:
+        raise ValueError(
+            "initial_locomotion_mode must be idle, slow_walk, walk, or run"
+        ) from exc
+    if initial_mode not in {
+        LocomotionMode.IDLE,
+        LocomotionMode.SLOW_WALK,
+        LocomotionMode.WALK,
+        LocomotionMode.RUN,
+    }:
+        raise ValueError("initial_locomotion_mode must be idle, slow_walk, walk, or run")
+    teleop_stream_mode = (
+        StreamMode.PLANNER_VR_3PT if teleop_mode == "vr3pt" else StreamMode.POSE
+    )
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
+    hand_socket = context.socket(zmq.PUB)
+    hand_socket.setsockopt(zmq.SNDHWM, 1)
+    hand_socket.bind(f"tcp://*:{hand_intent_port}")
     recording_status_socket = context.socket(zmq.SUB)
     recording_status_socket.setsockopt_string(zmq.SUBSCRIBE, "")
     recording_status_socket.setsockopt(zmq.CONFLATE, 1)
@@ -2168,7 +2203,10 @@ def run_pico_manager(
         f"tcp://{recording_status_host}:{recording_status_port}"
     )
     time.sleep(0.1)
-    print(f"[Manager] ZMQ socket bound to port {port}")
+    print(
+        f"[Manager] Body ZMQ socket bound to port {port}; "
+        f"latest-only hand intent bound to port {hand_intent_port}"
+    )
 
     # Print available locomotion modes
     try:
@@ -2204,10 +2242,17 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        initial_mode=initial_mode,
     )
     hand_intent = HandIntentStream()
 
     # State machine diagram:
+    #
+    #   With --teleop-mode vr3pt (data-collection default):
+    #     OFF --(A+B+X+Y)--> PLANNER <--(A+X)--> PLANNER_VR_3PT
+    #     PLANNER_VR_3PT <--(B+Y)--> PLANNER_FROZEN_UPPER_BODY
+    #
+    #   With --teleop-mode pose, retain the legacy two chains below.
     #
     #   Chain 1 (by_pressed enters/exits, left_axis_click toggles sub-mode):
     #     POSE <--(by)--> PLANNER_FROZEN_UPPER_BODY <--(left_axis_click)--> PLANNER_VR_3PT
@@ -2223,9 +2268,9 @@ def run_pico_manager(
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
     print(
-        "Manager controls: A+X=toggle mode, "
+        f"Manager controls: A+X=toggle {teleop_mode.upper()} teleop, "
         "B+Y=frozen upper body, X+B=record/save, Y+A=discard, "
-        "A+B+X+Y=start/stop policy"
+        f"A+B+X+Y=start/stop policy; initial gait={initial_mode.name}"
     )
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
@@ -2311,7 +2356,7 @@ def run_pico_manager(
             # A+X remains exclusively the POSE/PLANNER mode gesture.
             ax_pressed = face_command == "ax"
 
-            # B+Y remains the POSE/frozen-upper-body mode gesture.
+            # B+Y freezes both upper body and external OmniHands until toggled off.
             by_pressed = face_command == "by"
 
             new_mode = current_mode
@@ -2327,11 +2372,12 @@ def run_pico_manager(
                         print("[Manager] WARNING: No SMPL data available for calibration")
 
             elif current_mode == StreamMode.PLANNER:
-                # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
+                # Data collection defaults A+X to upper-body VR_3PT while the
+                # legacy standalone manager can retain full-body POSE.
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
                 elif ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.POSE
+                    new_mode = teleop_stream_mode
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = StreamMode.PLANNER_VR_3PT
 
@@ -2349,7 +2395,7 @@ def run_pico_manager(
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
                 elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.POSE
+                    new_mode = teleop_stream_mode
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = StreamMode.PLANNER_VR_3PT
 
@@ -2369,9 +2415,17 @@ def run_pico_manager(
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = vr3pt_parent_mode  # Return to parent mode
                 elif ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.POSE
+                    new_mode = (
+                        StreamMode.PLANNER
+                        if teleop_stream_mode == StreamMode.PLANNER_VR_3PT
+                        else StreamMode.POSE
+                    )
                 elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.POSE
+                    new_mode = (
+                        StreamMode.PLANNER_FROZEN_UPPER_BODY
+                        if teleop_stream_mode == StreamMode.PLANNER_VR_3PT
+                        else StreamMode.POSE
+                    )
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
@@ -2456,11 +2510,14 @@ def run_pico_manager(
                 )
             )
 
-            # Keep this last on the shared PUB socket. The hand controller uses
-            # a conflating subscriber, so publishing hand intent last prevents
-            # unrelated manager/pose messages from starving its filtered topic.
-            # Stalled headset timestamps remain invalid rather than implying open.
-            hand_intent.publish(socket, reader)
+            # The dedicated hand socket and conflating subscriber keep exactly
+            # the newest intent even when bilateral SDK calls are slower than
+            # the Pico stream. Stalled timestamps remain invalid, not open.
+            hand_intent.publish(
+                hand_socket,
+                reader,
+                hold=current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY,
+            )
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
@@ -2484,6 +2541,7 @@ def run_pico_manager(
         three_point.close()
         recording_status_socket.close()
         socket.close()
+        hand_socket.close()
         context.term()
         print("[Manager] Shutdown complete")
 
@@ -2495,6 +2553,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--buffer_size", type=int, default=15, help="Sliding window buffer size")
     parser.add_argument("--port", type=int, default=5556, help="ZMQ server port (default: 5556)")
+    parser.add_argument(
+        "--hand-intent-port",
+        type=int,
+        default=DEFAULT_HAND_INTENT_PORT,
+        help=f"Latest-only hand-intent port (default: {DEFAULT_HAND_INTENT_PORT})",
+    )
     parser.add_argument(
         "--num_frames_to_send", type=int, default=5, help="Number of frames to send (default: 200)"
     )
@@ -2594,6 +2658,18 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument(
+        "--teleop-mode",
+        choices=["pose", "vr3pt"],
+        default="pose",
+        help="A+X teleop mode: legacy full-body pose or upper-body VR 3-point",
+    )
+    parser.add_argument(
+        "--initial-locomotion-mode",
+        choices=["idle", "slow_walk", "walk", "run"],
+        default="idle",
+        help="Initial joystick gait in planner and VR 3-point modes",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2622,6 +2698,7 @@ if __name__ == "__main__":
     if args.manager:
         run_pico_manager(
             port=args.port,
+            hand_intent_port=args.hand_intent_port,
             buffer_size=args.buffer_size,
             num_frames_to_send=args.num_frames_to_send,
             target_fps=args.target_fps,
@@ -2635,6 +2712,8 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            teleop_mode=args.teleop_mode,
+            initial_locomotion_mode=args.initial_locomotion_mode,
             recording_status_host=args.recording_status_host,
             recording_status_port=args.recording_status_port,
         )
@@ -2643,6 +2722,7 @@ if __name__ == "__main__":
         run_pico(
             buffer_size=args.buffer_size,
             port=args.port,
+            hand_intent_port=args.hand_intent_port,
             num_frames_to_send=args.num_frames_to_send,
             target_fps=args.target_fps,
             use_cuda=args.cuda,

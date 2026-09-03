@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
+import copy
 import json
 import math
 from pathlib import Path
+import threading
 import time
 from typing import Any
 import uuid
@@ -19,6 +21,7 @@ from .backends.mujoco import MuJoCoHandTransport, MuJoCoSimHandBackend
 from .backends.omnihand import OmniHandBackend, vendor_output_to_stderr
 from .profiles import HandProfile, HandSide, get_hand_profile
 from .protocol import (
+    DEFAULT_HAND_INTENT_PORT,
     HAND_CONFIG_SCHEMA,
     HAND_CONFIG_TOPIC,
     HAND_INTENT_TOPIC,
@@ -29,10 +32,156 @@ from .protocol import (
 )
 
 STARTUP_FEEDBACK_TOLERANCE_RAD = 0.01
+HOLD_ERROR_LIMIT_RAD = 0.02
+HARD_MOTOR_ERROR_MASK = 0x0F
+COMMUNICATION_ERROR_MASK = 0x10
+
+
+def _has_hard_motor_error(masks: Sequence[int]) -> bool:
+    """Treat bits 0-3 as motor faults; bit 4 is transport telemetry."""
+    return any(int(mask) & HARD_MOTOR_ERROR_MASK for mask in masks)
 
 
 class HandControllerError(RuntimeError):
     pass
+
+
+class FixedRateHandStatePublisher:
+    """Publish the latest controller snapshot without blocking on hand I/O.
+
+    Physical feedback and health queries may wait for CAN replies.  Keeping the
+    PUB socket on its own deadline-driven thread prevents those waits from
+    turning a nominal 50 Hz hand-state stream into a bursty 10--30 Hz stream.
+    The controller timestamp and sequence are deliberately retained so a
+    consumer can distinguish a fresh control update from a held snapshot.
+    """
+
+    def __init__(self, endpoint: str, frequency: float) -> None:
+        if frequency <= 0:
+            raise ValueError("hand-state publish frequency must be positive")
+        self.endpoint = endpoint
+        self.frequency = float(frequency)
+        self.period = 1.0 / self.frequency
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._state: dict[str, Any] | None = None
+        self._config: dict[str, Any] | None = None
+        self._startup_error: BaseException | None = None
+        self._publish_sequence = 0
+        self._deadline_misses = 0
+
+    def update_state(self, state: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._state = copy.deepcopy(dict(state))
+
+    def update_config(self, config: Mapping[str, Any]) -> None:
+        payload = copy.deepcopy(dict(config))
+        payload["state_publish_frequency_hz"] = self.frequency
+        with self._lock:
+            self._config = payload
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("hand-state publisher is already started")
+        self._thread = threading.Thread(
+            target=self._run,
+            name="hand-state-publisher",
+            daemon=True,
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=5.0):
+            raise HandControllerError("timed out starting hand-state publisher")
+        if self._startup_error is not None:
+            raise HandControllerError(
+                f"could not start hand-state publisher: {self._startup_error}"
+            ) from self._startup_error
+
+    def close(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        self._thread = None
+
+    def _snapshot(self, published_at: float) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        with self._lock:
+            state = copy.deepcopy(self._state)
+            config = copy.deepcopy(self._config)
+        if state is not None:
+            control_ns = state.get("monotonic_ns")
+            control_at = (
+                float(control_ns) / 1e9
+                if isinstance(control_ns, int) and not isinstance(control_ns, bool)
+                else None
+            )
+            state["publish_sequence"] = self._publish_sequence
+            state["published_monotonic_ns"] = int(published_at * 1e9)
+            state["state_age_s"] = None if control_at is None else max(0.0, published_at - control_at)
+            state["publisher_target_frequency_hz"] = self.frequency
+            state["publisher_deadline_misses"] = self._deadline_misses
+        return state, config
+
+    def _run(self) -> None:
+        context = zmq.Context()
+        socket = context.socket(zmq.PUB)
+        socket.setsockopt(zmq.SNDHWM, 2)
+        socket.setsockopt(zmq.LINGER, 0)
+        try:
+            socket.bind(self.endpoint)
+        except BaseException as exc:
+            self._startup_error = exc
+            self._ready.set()
+            socket.close(linger=0)
+            context.term()
+            return
+
+        self._ready.set()
+        deadline = time.monotonic()
+        last_config_at = -math.inf
+        report_started = deadline
+        report_count = 0
+        try:
+            while not self._stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining > 0 and self._stop.wait(remaining):
+                    break
+
+                published_at = time.monotonic()
+                lateness = published_at - deadline
+                if lateness >= self.period:
+                    skipped = int(lateness / self.period)
+                    self._deadline_misses += skipped
+                    deadline += skipped * self.period
+
+                state, config = self._snapshot(published_at)
+                if state is not None:
+                    try:
+                        socket.send(encode(HAND_STATE_TOPIC, state), flags=zmq.NOBLOCK)
+                    except zmq.Again:
+                        pass
+                    self._publish_sequence += 1
+                    report_count += 1
+                if config is not None and published_at - last_config_at >= 2.0:
+                    try:
+                        socket.send(encode(HAND_CONFIG_TOPIC, config), flags=zmq.NOBLOCK)
+                    except zmq.Again:
+                        pass
+                    last_config_at = published_at
+
+                report_elapsed = published_at - report_started
+                if report_elapsed >= 5.0:
+                    print(
+                        f"[Hands] state publisher: {report_count / report_elapsed:.2f} Hz, "
+                        f"deadline misses: {self._deadline_misses}"
+                    )
+                    report_started = published_at
+                    report_count = 0
+                deadline += self.period
+        finally:
+            socket.close(linger=0)
+            context.term()
 
 
 class TriggerHysteresis:
@@ -96,6 +245,8 @@ class SafeHandController:
         self.intent_closed: dict[str, bool | None] = {side: None for side in self.devices}
         self.errors: dict[str, str | None] = {side: None for side in self.devices}
         self.fault_latched = False
+        self.explicit_hold = False
+        self._hold_write_pending: set[str] = set()
         self._connect_hold()
 
     def _connect_hold(self) -> None:
@@ -110,7 +261,7 @@ class SafeHandController:
             if np.any(np.abs(bounded - measured) > STARTUP_FEEDBACK_TOLERANCE_RAD):
                 raise HandControllerError(f"{side} startup feedback exceeds admitted limits")
             health = device.read_health()
-            if any(int(mask) != 0 for mask in health.get("error_masks", ())):
+            if _has_hard_motor_error(health.get("error_masks", ())):
                 raise HandControllerError(f"{side} reported a startup motor error")
             startup_positions[side] = bounded
             startup_health[side] = health
@@ -135,9 +286,25 @@ class SafeHandController:
             return False
         accepted = False
         received_at = self.clock() if now is None else now
+        hold = bool(payload["hold"])
         for side in self.devices:
             side_intent = payload[side]
             if not side_intent["valid"]:
+                continue
+            self.last_valid_intent_at[side] = received_at
+            accepted = True
+            if hold:
+                if not self.explicit_hold:
+                    # Cancel an in-progress open/close slew at the latest
+                    # measured position. Merely stopping new intent would
+                    # leave the previous motor setpoint active.
+                    side_profile = self.profile.side(side)
+                    frozen = np.clip(
+                        self.measured[side], side_profile.lower_rad, side_profile.upper_rad
+                    )
+                    self.requested[side] = frozen.copy()
+                    self.applied[side] = frozen.copy()
+                    self._hold_write_pending.add(side)
                 continue
             side_profile = self.profile.side(side)
             target = side_profile.target(bool(side_intent["closed"]), self.close_scale)
@@ -148,12 +315,11 @@ class SafeHandController:
                     nominal_duration = float(np.max(np.abs(target - self.applied[side]) / base_velocity))
                     self.velocity_scale[side] = nominal_duration / self.transition_duration_s
             self.intent_closed[side] = bool(side_intent["closed"])
-            self.last_valid_intent_at[side] = received_at
-            accepted = True
         self.last_intent_sequence = sequence
         if accepted:
             self.last_intent_at = received_at
-            self.mode = "tracking"
+            self.explicit_hold = hold
+            self.mode = "hold" if hold else "tracking"
         return accepted
 
     def step(self, *, now: float | None = None) -> dict[str, Any]:
@@ -172,18 +338,28 @@ class SafeHandController:
             # before allowing a write to either hand in this cycle.
             for side, device in self.devices.items():
                 self.health[side] = device.read_health()
-                if any(int(mask) != 0 for mask in self.health[side].get("error_masks", ())):
+                if _has_hard_motor_error(self.health[side].get("error_masks", ())):
                     self.fault_latched = True
                     self.mode = "fault"
                     self.errors[side] = "non-zero motor error mask (latched)"
         for side, device in self.devices.items():
             side_profile = self.profile.side(side)
-            if not stale_by_side[side] and self.mode == "tracking" and not self.fault_latched:
+            if side in self._hold_write_pending and not self.fault_latched:
+                # Send the captured measured pose once so the device abandons
+                # its earlier open/close target immediately.
+                device.write_positions(self.applied[side])
+                self._hold_write_pending.remove(side)
+            elif not stale_by_side[side] and self.mode == "tracking" and not self.fault_latched:
                 target = np.clip(self.requested[side], side_profile.lower_rad, side_profile.upper_rad)
                 maximum = np.asarray(side_profile.velocity_rad_s) * self.velocity_scale[side] * dt
                 safe = self.applied[side] + np.clip(target - self.applied[side], -maximum, maximum)
-                device.write_positions(safe)
-                self.applied[side] = safe
+                # The AGILINK all-joint call expands into multiple CAN
+                # transactions. Re-sending an already reached setpoint every
+                # cycle can fill the vendor queue with old poses, making a new
+                # trigger command appear many seconds late.
+                if not np.array_equal(safe, self.applied[side]):
+                    device.write_positions(safe)
+                    self.applied[side] = safe
             self.measured[side] = np.asarray(device.read_positions(), dtype=np.float64).copy()
             if self.measured[side].shape != (side_profile.width,) or not np.all(np.isfinite(self.measured[side])):
                 raise HandControllerError(f"{side} feedback became invalid")
@@ -206,6 +382,8 @@ class SafeHandController:
                 "closed_rad": list(p.closed_rad),
                 "sdk_version": device.sdk_version,
                 "sdk_commit": device.sdk_commit,
+                "request_interval_ms": getattr(device, "request_interval_ms", None),
+                "frame_recv_timeout_ms": getattr(device, "frame_recv_timeout_ms", None),
             }
         return {
             "schema": HAND_CONFIG_SCHEMA,
@@ -229,6 +407,7 @@ class SafeHandController:
             "backend": self.backend_name,
             "profile": self.profile.name,
             "mode": self.mode,
+            "explicit_hold": self.explicit_hold,
             "target_source": "pico_open_close",
             "intent_sequence": self.last_intent_sequence,
             "input_stale": stale,
@@ -327,8 +506,30 @@ def probe(args: argparse.Namespace) -> int:
             side: {"positions_rad": device.read_positions().tolist(), "health": device.read_health()}
             for side, device in devices.items()
         }
-        print(json.dumps({"passed": True, "profile": profile.name, "sides": report}, indent=2))
-        return 0
+        faulted = {
+            side: [int(mask) for mask in side_report["health"].get("error_masks", ())]
+            for side, side_report in report.items()
+            if _has_hard_motor_error(side_report["health"].get("error_masks", ()))
+        }
+        communication_warnings = {
+            side: [int(mask) for mask in side_report["health"].get("error_masks", ())]
+            for side, side_report in report.items()
+            if any(
+                int(mask) & COMMUNICATION_ERROR_MASK
+                for mask in side_report["health"].get("error_masks", ())
+            )
+        }
+        passed = not faulted
+        payload = {"passed": passed, "profile": profile.name, "sides": report}
+        if faulted:
+            payload["error"] = f"non-zero motor error masks: {faulted}"
+        if communication_warnings:
+            payload["warnings"] = {
+                "commu_except_masks": communication_warnings,
+                "policy": "reported but not latched while SocketCAN remains ERROR-ACTIVE with zero counters",
+            }
+        print(json.dumps(payload, indent=2))
+        return 0 if passed else 1
     except Exception as exc:
         print(json.dumps({"passed": False, "error": str(exc)}, indent=2))
         return 1
@@ -337,30 +538,107 @@ def probe(args: argparse.Namespace) -> int:
             device.close()
 
 
+def hold(args: argparse.Namespace) -> int:
+    """Send one measured-position hold after all physical safety gates pass."""
+    if args.backend != "omnihand":
+        raise HandControllerError("hold is only supported by the physical OmniHand backend")
+    if not args.enable_command:
+        raise HandControllerError("--enable-command is required for the physical hold")
+
+    profile = get_hand_profile("omnihand_o10.v1")
+    devices: dict[str, HandBackend] = {}
+    controller: SafeHandController | None = None
+    try:
+        with vendor_output_to_stderr():
+            for side in _selected_sides(args.sides):
+                devices[side] = _make_hardware_device(args, side, profile)
+        controller = SafeHandController(
+            profile,
+            devices,
+            backend_name="omnihand",
+            session_id=uuid.uuid4().hex,
+        )
+        # The constructor writes exactly the measured startup pose. Re-read
+        # after a short settle and reject any unexpected movement.
+        time.sleep(0.25)
+        state = controller.step()
+        following_error = {
+            side: float(
+                np.max(
+                    np.abs(
+                        np.asarray(side_state["measured_position_rad"])
+                        - np.asarray(side_state["applied_position_rad"])
+                    )
+                )
+            )
+            for side, side_state in state["sides"].items()
+        }
+        passed = all(error <= HOLD_ERROR_LIMIT_RAD for error in following_error.values())
+        payload = {
+            "passed": passed,
+            "operation": "zero_delta_hold",
+            "profile": profile.name,
+            "following_error_rad": following_error,
+            "limit_rad": HOLD_ERROR_LIMIT_RAD,
+            "sides": state["sides"],
+        }
+        if not passed:
+            payload["error"] = "zero-delta hold following error exceeded its limit"
+        print(json.dumps(payload, indent=2))
+        return 0 if passed else 1
+    except Exception as exc:
+        print(json.dumps({"passed": False, "operation": "zero_delta_hold", "error": str(exc)}, indent=2))
+        return 1
+    finally:
+        if controller is not None:
+            controller.close()
+        else:
+            for device in devices.values():
+                device.close()
+
+
 def run(args: argparse.Namespace) -> int:
     if args.backend == "omnihand" and not args.enable_command:
         raise HandControllerError("--enable-command is required for physical OmniHand writes")
     profile = get_hand_profile("omnihand_o10.v1")
     context = zmq.Context()
     subscriber = context.socket(zmq.SUB)
-    # This endpoint is shared with pose/planner/manager topics. SUB filtering
-    # leaves only hand intent, while a small HWM bounds latency. ZMQ_CONFLATE
-    # is deliberately avoided because it can retain an unrelated last message
-    # before topic filtering and intermittently starve this subscriber.
-    subscriber.setsockopt(zmq.RCVHWM, 4)
+    # Hand intent owns a dedicated endpoint, so CONFLATE safely guarantees
+    # latest-only behavior while bilateral SDK calls are busy.
+    subscriber.setsockopt(zmq.RCVHWM, 1)
+    subscriber.setsockopt(zmq.CONFLATE, 1)
     subscriber.setsockopt(zmq.SUBSCRIBE, HAND_INTENT_TOPIC)
     subscriber.connect(args.intent_endpoint)
-    publisher = context.socket(zmq.PUB)
-    publisher.setsockopt(zmq.SNDHWM, 2)
-    publisher.bind(args.state_endpoint)
     selected_sides = _selected_sides(args.sides)
     session_id = uuid.uuid4().hex
     controller: SafeHandController | None = None
     next_reconnect_at = 0.0
     last_error: str | None = None
+    state_publisher = FixedRateHandStatePublisher(args.state_endpoint, args.frequency)
+
+    def disconnected_state(now: float) -> dict[str, Any]:
+        return {
+            "schema": HAND_STATE_SCHEMA,
+            "session_id": session_id,
+            "sequence": 0,
+            "monotonic_ns": int(now * 1e9),
+            "backend": args.backend,
+            "profile": profile.name,
+            "mode": "disconnected",
+            "target_source": "pico_open_close",
+            "intent_sequence": None,
+            "input_stale": True,
+            "input_age_s": None,
+            "sides": {
+                side: {"valid": False, "connected": False, "error": last_error}
+                for side in selected_sides
+            },
+        }
+
+    state_publisher.update_state(disconnected_state(time.monotonic()))
     try:
+        state_publisher.start()
         period = 1.0 / args.frequency
-        last_config = -math.inf
         while True:
             started = time.monotonic()
             just_connected = False
@@ -378,7 +656,7 @@ def run(args: argparse.Namespace) -> int:
                         session_id=session_id,
                     )
                     last_error = None
-                    last_config = -math.inf
+                    state_publisher.update_config(controller.config_payload())
                     # A reconnect is admitted from measured feedback only. Drop
                     # anything queued while disconnected and require a target
                     # published after this hold was established.
@@ -394,49 +672,23 @@ def run(args: argparse.Namespace) -> int:
             if controller is not None:
                 try:
                     if not just_connected:
-                        # A shared high-rate publisher can leave a backlog
-                        # across streamer reconnects. Drain it in one cycle
-                        # and apply only the newest intent; otherwise stale
-                        # pre-restart sequences can take minutes to clear one
-                        # message at a time while the hands remain in hold.
+                        # CONFLATE normally leaves one frame. Drain defensively
+                        # across reconnects and apply only the newest intent.
                         latest_raw = None
                         while subscriber.poll(0):
                             latest_raw = subscriber.recv(zmq.NOBLOCK)
                         if latest_raw is not None:
                             controller.accept_intent(decode_intent(latest_raw), now=started)
                     state = controller.step(now=started)
-                    publisher.send(encode(HAND_STATE_TOPIC, state))
-                    if started - last_config >= 2.0:
-                        publisher.send(encode(HAND_CONFIG_TOPIC, controller.config_payload()))
-                        last_config = started
+                    state_publisher.update_state(state)
                 except Exception as exc:
                     last_error = str(exc)
                     controller.close()
                     controller = None
                     next_reconnect_at = started + args.reconnect_interval
+                    state_publisher.update_state(disconnected_state(time.monotonic()))
             else:
-                publisher.send(
-                    encode(
-                        HAND_STATE_TOPIC,
-                        {
-                            "schema": HAND_STATE_SCHEMA,
-                            "session_id": session_id,
-                            "sequence": 0,
-                            "monotonic_ns": int(started * 1e9),
-                            "backend": args.backend,
-                            "profile": profile.name,
-                            "mode": "disconnected",
-                            "target_source": "pico_open_close",
-                            "intent_sequence": None,
-                            "input_stale": True,
-                            "input_age_s": None,
-                            "sides": {
-                                side: {"valid": False, "connected": False, "error": last_error}
-                                for side in selected_sides
-                            },
-                        },
-                    )
-                )
+                state_publisher.update_state(disconnected_state(started))
             remaining = period - (time.monotonic() - started)
             if remaining > 0:
                 time.sleep(remaining)
@@ -446,14 +698,14 @@ def run(args: argparse.Namespace) -> int:
         if controller is not None:
             controller.close()
         subscriber.close(linger=0)
-        publisher.close(linger=0)
+        state_publisher.close()
         context.term()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("probe", "run"):
+    for name in ("probe", "hold", "run"):
         command = sub.add_parser(name)
         command.add_argument("--backend", choices=("sim", "omnihand"), default="sim")
         command.add_argument("--sides", choices=("left", "right", "both"), default="both")
@@ -461,7 +713,9 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--right-interface", default="can10")
         command.add_argument("--enable-command", action="store_true")
     runner = sub.choices["run"]
-    runner.add_argument("--intent-endpoint", default="tcp://localhost:5556")
+    runner.add_argument(
+        "--intent-endpoint", default=f"tcp://localhost:{DEFAULT_HAND_INTENT_PORT}"
+    )
     runner.add_argument("--state-endpoint", default="tcp://*:5570")
     runner.add_argument("--frequency", type=float, default=50.0)
     runner.add_argument("--target-timeout", type=float, default=0.5)
@@ -476,7 +730,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return probe(args) if args.command == "probe" else run(args)
+    if args.command == "probe":
+        return probe(args)
+    if args.command == "hold":
+        return hold(args)
+    return run(args)
 
 
 if __name__ == "__main__":

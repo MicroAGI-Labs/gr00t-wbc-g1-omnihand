@@ -192,6 +192,9 @@ external_dependencies/doc/
 # XRoboToolkit pybind (cloned locally on aarch64 by install_pico.sh)
 external_dependencies/XRoboToolkit-PC-Service-Pybind/
 
+# Pinned OmniHand SDK checkout (managed by install_omnihand.sh)
+external_dependencies/agillink_omnihand_sdk/
+
 # UV
 uv.lock
 

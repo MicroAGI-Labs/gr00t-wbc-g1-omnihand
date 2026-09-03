@@ -13,7 +13,8 @@ if command -v jetson_clocks &> /dev/null; then
     else
         # Bare-metal Jetson - set max performance
         echo "🚀 Setting Jetson to max performance..."
-        sudo jetson_clocks 2>/dev/null || echo "⚠️  jetson_clocks failed (needs sudo)"
+        sudo -n jetson_clocks 2>/dev/null || \
+            echo "⚠️  jetson_clocks skipped (non-interactive sudo is not configured)"
     fi
 fi
 
@@ -184,8 +185,8 @@ if [ -n "$TensorRT_ROOT" ]; then
         # Create missing libcudla.so.1 symlink if needed (TensorRT expects this name)
         if [ -f "/usr/lib/aarch64-linux-gnu/nvidia/libnvcudla.so" ] && [ ! -f "/usr/lib/aarch64-linux-gnu/nvidia/libcudla.so.1" ]; then
             echo "   🔗 Creating libcudla.so.1 symlink for TensorRT compatibility..."
-            sudo ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so.1 2>/dev/null || echo "   ⚠️  Could not create symlink (may need sudo)"
-            sudo ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so 2>/dev/null || echo "   ⚠️  Could not create symlink (may need sudo)"
+            sudo -n ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so.1 2>/dev/null || echo "   ⚠️  Could not create symlink (non-interactive sudo is not configured)"
+            sudo -n ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so 2>/dev/null || echo "   ⚠️  Could not create symlink (non-interactive sudo is not configured)"
             echo "   ✅ libcudla.so.1 → libnvcudla.so"
         fi
         
@@ -348,4 +349,3 @@ echo ""
 if [ -n "$BASH_VERSION" ]; then
     export PS1="(g1_deploy) $PS1"
 fi
-
