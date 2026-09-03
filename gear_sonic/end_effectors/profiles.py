@@ -70,11 +70,33 @@ _O10_RIGHT_UPPER = (1.1213, 0.0453, 0.8412, 0.0, 1.4835, 1.4835, 0.1692, 1.4835,
 _O10_LEFT_LOWER = (-1.1213, -0.0453, -0.8412, 0.0, 0.0, 0.0, -0.1692, 0.0, -0.1850, 0.0)
 _O10_LEFT_UPPER = (0.0296, 1.6423, 0.0, 0.1640, 1.4835, 1.4835, 0.0, 1.4835, 0.0, 1.4835)
 _O10_VELOCITY = (0.164, 0.164, 0.308, 0.164, 0.308, 0.308, 0.164, 0.308, 0.164, 0.308)
-# Keep the thumb MCP slightly flexed in the nominal open pose.  A fully
-# extended thumb can cause an electrical short on this hardware revision.
-_O10_THUMB_MCP_OPEN_FLEX_RAD = 0.08
-_O10_RIGHT_OPEN = (0.0, 0.0, _O10_THUMB_MCP_OPEN_FLEX_RAD, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-_O10_LEFT_OPEN = (0.0, 0.0, -_O10_THUMB_MCP_OPEN_FLEX_RAD, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+# Median measured pose from both powered hands in their desired safe-open
+# configuration.  In particular, the thumb roll and ab/ad joints remain away
+# from the fully extended geometry that can short this hardware revision.
+_O10_RIGHT_OPEN = (
+    0.549773,
+    -0.757866,
+    0.002735,
+    -0.074805,
+    0.0,
+    0.0,
+    0.083381,
+    0.000840,
+    0.094930,
+    0.000840,
+)
+_O10_LEFT_OPEN = (
+    -0.555388,
+    0.802839,
+    0.0,
+    0.077109,
+    0.0,
+    0.0,
+    -0.083962,
+    0.0,
+    -0.092402,
+    0.0,
+)
 _O10_RIGHT_CLOSED = (0.728845, -0.903265, 0.757080, 0.0, 1.335150, 1.335150, 0.0, 1.335150, 0.0, 1.335150)
 _O10_LEFT_CLOSED = (-0.728845, 0.903265, -0.757080, 0.0, 1.335150, 1.335150, 0.0, 1.335150, 0.0, 1.335150)
 

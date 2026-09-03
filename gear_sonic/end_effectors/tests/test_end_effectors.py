@@ -37,11 +37,13 @@ def test_o10_profile_has_exact_bilateral_contract():
     assert OMNIHAND_O10.width == 10
     assert OMNIHAND_O10.right.joint_names[0] == "R_thumb_roll_joint"
     assert OMNIHAND_O10.left.joint_names[-1] == "L_pinky_pip_joint"
-    assert OMNIHAND_O10.right.open_rad[2] == pytest.approx(0.08)
-    assert OMNIHAND_O10.left.open_rad[2] == pytest.approx(-0.08)
+    np.testing.assert_allclose(
+        OMNIHAND_O10.right.open_rad[:3], (0.549773, -0.757866, 0.002735)
+    )
+    np.testing.assert_allclose(
+        OMNIHAND_O10.left.open_rad[:3], (-0.555388, 0.802839, 0.0)
+    )
     for side in (OMNIHAND_O10.left, OMNIHAND_O10.right):
-        assert np.count_nonzero(side.open_rad) == 1
-        assert side.open_rad[2] != 0.0
         assert np.all(np.asarray(side.closed_rad) >= np.asarray(side.lower_rad))
         assert np.all(np.asarray(side.closed_rad) <= np.asarray(side.upper_rad))
         assert np.all(np.asarray(side.open_rad) >= np.asarray(side.lower_rad))
@@ -83,12 +85,15 @@ def test_controller_holds_first_feedback_then_slews_independent_targets():
     assert controller.accept_intent(_intent(1, left_closed=True, right_closed=False), now=10.0)
     now[0] = 10.1
     state = controller.step(now=now[0])
-    np.testing.assert_allclose(state["sides"]["left"]["applied_position_rad"][0], -0.0164)
+    np.testing.assert_allclose(
+        state["sides"]["left"]["applied_position_rad"][0],
+        OMNIHAND_O10.left.open_rad[0] - 0.1 * OMNIHAND_O10.left.velocity_rad_s[0],
+    )
     np.testing.assert_allclose(
         state["sides"]["right"]["applied_position_rad"], OMNIHAND_O10.right.open_rad
     )
     assert state["sides"]["left"]["requested_position_rad"][0] == pytest.approx(
-        0.5 * OMNIHAND_O10.left.closed_rad[0]
+        OMNIHAND_O10.left.target(True, close_scale=0.5)[0]
     )
 
 
