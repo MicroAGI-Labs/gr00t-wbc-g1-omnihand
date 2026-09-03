@@ -70,14 +70,31 @@ _O10_RIGHT_UPPER = (1.1213, 0.0453, 0.8412, 0.0, 1.4835, 1.4835, 0.1692, 1.4835,
 _O10_LEFT_LOWER = (-1.1213, -0.0453, -0.8412, 0.0, 0.0, 0.0, -0.1692, 0.0, -0.1850, 0.0)
 _O10_LEFT_UPPER = (0.0296, 1.6423, 0.0, 0.1640, 1.4835, 1.4835, 0.0, 1.4835, 0.0, 1.4835)
 _O10_VELOCITY = (0.164, 0.164, 0.308, 0.164, 0.308, 0.308, 0.164, 0.308, 0.164, 0.308)
+# Keep the thumb MCP slightly flexed in the nominal open pose.  A fully
+# extended thumb can cause an electrical short on this hardware revision.
+_O10_THUMB_MCP_OPEN_FLEX_RAD = 0.08
+_O10_RIGHT_OPEN = (0.0, 0.0, _O10_THUMB_MCP_OPEN_FLEX_RAD, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+_O10_LEFT_OPEN = (0.0, 0.0, -_O10_THUMB_MCP_OPEN_FLEX_RAD, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 _O10_RIGHT_CLOSED = (0.728845, -0.903265, 0.757080, 0.0, 1.335150, 1.335150, 0.0, 1.335150, 0.0, 1.335150)
 _O10_LEFT_CLOSED = (-0.728845, 0.903265, -0.757080, 0.0, 1.335150, 1.335150, 0.0, 1.335150, 0.0, 1.335150)
 
 OMNIHAND_O10 = HandProfile(
     "omnihand_o10.v1",
-    SideProfile(_O10_LEFT_NAMES, _O10_LEFT_LOWER, _O10_LEFT_UPPER, _O10_VELOCITY, (0.0,) * 10, _O10_LEFT_CLOSED),
     SideProfile(
-        _O10_RIGHT_NAMES, _O10_RIGHT_LOWER, _O10_RIGHT_UPPER, _O10_VELOCITY, (0.0,) * 10, _O10_RIGHT_CLOSED
+        _O10_LEFT_NAMES,
+        _O10_LEFT_LOWER,
+        _O10_LEFT_UPPER,
+        _O10_VELOCITY,
+        _O10_LEFT_OPEN,
+        _O10_LEFT_CLOSED,
+    ),
+    SideProfile(
+        _O10_RIGHT_NAMES,
+        _O10_RIGHT_LOWER,
+        _O10_RIGHT_UPPER,
+        _O10_VELOCITY,
+        _O10_RIGHT_OPEN,
+        _O10_RIGHT_CLOSED,
     ),
 )
 
