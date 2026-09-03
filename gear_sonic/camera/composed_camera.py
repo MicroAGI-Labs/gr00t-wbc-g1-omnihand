@@ -86,6 +86,9 @@ class ComposedCameraConfig:
     zed_camera_fps: int = 60
     """ZED hardware capture rate. HD720 supports 60 FPS."""
 
+    zed_camera_rotate_180: bool = True
+    """Rotate robot-mounted ZED frames 180 degrees."""
+
     run_as_server: bool = True
     """Run as ZMQ PUB server (set False for in-process usage)."""
 
@@ -391,6 +394,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
             zed_config = ZEDConfig(
                 camera_resolution=self.config.zed_camera_resolution,
                 camera_fps=self.config.zed_camera_fps,
+                rotate_180=self.config.zed_camera_rotate_180,
             )
             print(
                 f"Initializing ZED sensor at {zed_config.camera_resolution}"
@@ -524,9 +528,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
 class ComposedCameraClientSensor(Sensor, SensorClient):
     """ZMQ client that deserializes merged camera frames from the server."""
 
-    def __init__(self, server_ip: str = "localhost", port: int = 5555):
-        self.start_client(server_ip, port)
-
+    def __init__(
+        self, server_ip: str = "localhost", port: int = 5555, *, background: bool = False
+    ):
         self._latest_message = None
         self._avg_time_per_frame: deque = deque(maxlen=20)
         self._msg_received_time = 0
@@ -536,14 +540,70 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         self._last_new_message_time = None
         self._last_staleness_warning_time = 0.0
         self._staleness_warning_interval = 2.0
+        self._background = background
+        self._background_lock = threading.Lock()
+        self._background_message = None
+        self._background_sequence = 0
+        self._consumed_sequence = 0
+        self._receiver_stop = threading.Event()
+        self._receiver_ready = threading.Event()
+        self._receiver_error: BaseException | None = None
+        self._receiver_thread: threading.Thread | None = None
+
+        if background:
+            self._receiver_thread = threading.Thread(
+                target=self._receive_loop,
+                args=(server_ip, port),
+                name="camera-receiver",
+                daemon=True,
+            )
+            self._receiver_thread.start()
+            if not self._receiver_ready.wait(timeout=2.0):
+                raise RuntimeError("timed out starting camera receiver")
+            if self._receiver_error is not None:
+                raise RuntimeError(f"could not start camera receiver: {self._receiver_error}")
+        else:
+            self.start_client(server_ip, port)
 
         print("Initialized composed camera client sensor")
+
+    def _receive_loop(self, server_ip: str, port: int) -> None:
+        try:
+            self.start_client(server_ip, port)
+        except BaseException as exc:
+            self._receiver_error = exc
+            self._receiver_ready.set()
+            return
+        self._receiver_ready.set()
+        try:
+            while not self._receiver_stop.is_set():
+                message = self.receive_message_nonblocking(timeout_ms=200)
+                if message is None:
+                    continue
+                decoded = ImageMessageSchema.deserialize(message).asdict()
+                with self._background_lock:
+                    self._background_message = decoded
+                    self._background_sequence += 1
+        except BaseException as exc:
+            self._receiver_error = exc
+        finally:
+            self.stop_client()
 
     def read(self, blocking: bool = False, **kwargs) -> dict[str, Any] | None:
         self._start_time = time.time()
         current_time = time.time()
 
-        if blocking:
+        if self._receiver_error is not None:
+            raise RuntimeError(f"camera receiver failed: {self._receiver_error}")
+        if self._background:
+            with self._background_lock:
+                sequence = self._background_sequence
+                message = self._background_message
+            if sequence == self._consumed_sequence:
+                message = None
+            else:
+                self._consumed_sequence = sequence
+        elif blocking:
             message = self.receive_message()
             if not message:
                 return None
@@ -552,7 +612,11 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
 
         if message is not None:
             self.idx += 1
-            self._latest_message = ImageMessageSchema.deserialize(message).asdict()
+            self._latest_message = (
+                message
+                if self._background
+                else ImageMessageSchema.deserialize(message).asdict()
+            )
             self._last_new_message_time = current_time
 
             if self.idx % 10 == 0:
@@ -583,7 +647,12 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         raise NotImplementedError("Client does not serialize")
 
     def close(self):
-        self.stop_client()
+        if self._background:
+            self._receiver_stop.set()
+            if self._receiver_thread is not None:
+                self._receiver_thread.join(timeout=2.0)
+        else:
+            self.stop_client()
 
     def fps(self) -> float:
         if len(self._avg_time_per_frame) == 0:

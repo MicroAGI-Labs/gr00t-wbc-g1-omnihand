@@ -62,6 +62,7 @@ struct CommandMessage {
  *   - height             : float – desired body height      (-1.0 = use default)
  *   - upper_body_position: float[17] – target upper-body joint positions  (radians)
  *   - upper_body_velocity: float[17] – target upper-body joint velocities (rad/s)
+ *   - upper_body_mask    : bool[17] – joints owned by the optional upper-body target
  *   - left_hand_joints   : float[7]  – Dex3 left-hand joint positions
  *   - right_hand_joints  : float[7]  – Dex3 right-hand joint positions
  *
@@ -105,4 +106,3 @@ struct PlannerMessage {
   /// Used to detect planner timeouts (stale data → fallback to IDLE).
   std::chrono::steady_clock::time_point timestamp{};
 };
-

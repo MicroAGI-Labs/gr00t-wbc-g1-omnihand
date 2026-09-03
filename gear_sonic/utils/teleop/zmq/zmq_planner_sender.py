@@ -69,11 +69,13 @@ def build_planner_message(
     height: float = -1.0,
     upper_body_position: Sequence[float] | None = None,
     upper_body_velocity: Sequence[float] | None = None,
+    upper_body_mask: Sequence[bool] | None = None,
     left_hand_position: Sequence[float] | None = None,
     right_hand_position: Sequence[float] | None = None,
     vr_3pt_position: Sequence[float] | None = None,
     vr_3pt_orientation: Sequence[float] | None = None,
     vr_3pt_compliance: Sequence[float] | None = None,
+    publisher_monotonic_ns: int | None = None,
 ) -> bytes:
     """
     Assemble a 'planner' topic message:
@@ -88,6 +90,10 @@ def build_planner_message(
         raise ValueError("movement must have length 3")
     if len(facing) != 3:
         raise ValueError("facing must have length 3")
+    if upper_body_position is not None and len(upper_body_position) != 17:
+        raise ValueError("upper_body_position must have length 17")
+    if upper_body_velocity is not None and len(upper_body_velocity) != 17:
+        raise ValueError("upper_body_velocity must have length 17")
 
     fields = [
         {"name": "mode", "dtype": "i32", "shape": [1]},
@@ -122,6 +128,16 @@ def build_planner_message(
         for value in upper_body_velocity:
             payload += struct.pack("<f", float(value))
 
+    if upper_body_mask is not None:
+        if upper_body_position is None:
+            raise ValueError("upper_body_mask requires upper_body_position")
+        if len(upper_body_mask) != 17:
+            raise ValueError("upper_body_mask must have length 17")
+        fields.append(
+            {"name": "upper_body_mask", "dtype": "bool", "shape": [len(upper_body_mask)]}
+        )
+        payload += bytes(bool(value) for value in upper_body_mask)
+
     if left_hand_position is not None:
         fields.append(
             {"name": "left_hand_joints", "dtype": "f32", "shape": [len(left_hand_position)]}
@@ -152,6 +168,10 @@ def build_planner_message(
         fields.append({"name": "vr_compliance", "dtype": "f32", "shape": [len(vr_3pt_compliance)]})
         for value in vr_3pt_compliance:
             payload += struct.pack("<f", float(value))
+
+    if publisher_monotonic_ns is not None:
+        fields.append({"name": "publisher_monotonic_ns", "dtype": "i64", "shape": [1]})
+        payload += struct.pack("<q", int(publisher_monotonic_ns))
 
     header = _build_header(fields, version=1, count=1)
 

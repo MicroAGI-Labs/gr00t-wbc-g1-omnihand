@@ -7,8 +7,10 @@ from collections.abc import Callable, Mapping, Sequence
 import copy
 import json
 import math
+import multiprocessing as mp
+import os
 from pathlib import Path
-import threading
+import signal
 import time
 from typing import Any
 import uuid
@@ -22,6 +24,7 @@ from .backends.omnihand import OmniHandBackend, vendor_output_to_stderr
 from .profiles import HandProfile, HandSide, get_hand_profile
 from .protocol import (
     DEFAULT_HAND_INTENT_PORT,
+    DEFAULT_HAND_STATE_PORT,
     HAND_CONFIG_SCHEMA,
     HAND_CONFIG_TOPIC,
     HAND_INTENT_TOPIC,
@@ -35,6 +38,7 @@ STARTUP_FEEDBACK_TOLERANCE_RAD = 0.01
 HOLD_ERROR_LIMIT_RAD = 0.02
 HARD_MOTOR_ERROR_MASK = 0x0F
 COMMUNICATION_ERROR_MASK = 0x10
+RECOVERABLE_DISCONNECT_EXIT_CODE = 75
 
 
 def _has_hard_motor_error(masks: Sequence[int]) -> bool:
@@ -47,11 +51,10 @@ class HandControllerError(RuntimeError):
 
 
 class FixedRateHandStatePublisher:
-    """Publish the latest controller snapshot without blocking on hand I/O.
+    """Publish the latest controller snapshot outside the hand-I/O process.
 
-    Physical feedback and health queries may wait for CAN replies.  Keeping the
-    PUB socket on its own deadline-driven thread prevents those waits from
-    turning a nominal 50 Hz hand-state stream into a bursty 10--30 Hz stream.
+    Physical feedback and health queries may hold the Python GIL while waiting
+    for CAN replies. A spawned publisher keeps its 50 Hz clock independent.
     The controller timestamp and sequence are deliberately retained so a
     consumer can distinguish a fresh control update from a held snapshot.
     """
@@ -62,10 +65,13 @@ class FixedRateHandStatePublisher:
         self.endpoint = endpoint
         self.frequency = float(frequency)
         self.period = 1.0 / self.frequency
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._ready = threading.Event()
-        self._thread: threading.Thread | None = None
+        context = mp.get_context("spawn")
+        self._stop = context.Event()
+        self._ready = context.Event()
+        self._updates_rx, self._updates_tx = context.Pipe(duplex=False)
+        self._error_rx, self._error_tx = context.Pipe(duplex=False)
+        self._parent_pid = os.getpid()
+        self._process: mp.Process | None = None
         self._state: dict[str, Any] | None = None
         self._config: dict[str, Any] | None = None
         self._startup_error: BaseException | None = None
@@ -73,42 +79,48 @@ class FixedRateHandStatePublisher:
         self._deadline_misses = 0
 
     def update_state(self, state: Mapping[str, Any]) -> None:
-        with self._lock:
-            self._state = copy.deepcopy(dict(state))
+        self._state = copy.deepcopy(dict(state))
+        if self._process is not None:
+            self._updates_tx.send(("state", self._state))
 
     def update_config(self, config: Mapping[str, Any]) -> None:
         payload = copy.deepcopy(dict(config))
         payload["state_publish_frequency_hz"] = self.frequency
-        with self._lock:
-            self._config = payload
+        self._config = payload
+        if self._process is not None:
+            self._updates_tx.send(("config", payload))
 
     def start(self) -> None:
-        if self._thread is not None:
+        if self._process is not None:
             raise RuntimeError("hand-state publisher is already started")
-        self._thread = threading.Thread(
+        process = mp.get_context("spawn").Process(
             target=self._run,
             name="hand-state-publisher",
             daemon=True,
         )
-        self._thread.start()
+        process.start()
+        self._process = process
         if not self._ready.wait(timeout=5.0):
             raise HandControllerError("timed out starting hand-state publisher")
-        if self._startup_error is not None:
+        if self._error_rx.poll():
+            self._startup_error = RuntimeError(self._error_rx.recv())
+        if self._startup_error:
             raise HandControllerError(
                 f"could not start hand-state publisher: {self._startup_error}"
             ) from self._startup_error
 
     def close(self) -> None:
         self._stop.set()
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout=2.0)
-        self._thread = None
+        process = self._process
+        if process is not None:
+            process.join(timeout=2.0)
+            if process.is_alive():
+                process.terminate()
+        self._process = None
 
     def _snapshot(self, published_at: float) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        with self._lock:
-            state = copy.deepcopy(self._state)
-            config = copy.deepcopy(self._config)
+        state = copy.deepcopy(self._state)
+        config = copy.deepcopy(self._config)
         if state is not None:
             control_ns = state.get("monotonic_ns")
             control_at = (
@@ -131,7 +143,7 @@ class FixedRateHandStatePublisher:
         try:
             socket.bind(self.endpoint)
         except BaseException as exc:
-            self._startup_error = exc
+            self._error_tx.send(str(exc))
             self._ready.set()
             socket.close(linger=0)
             context.term()
@@ -143,7 +155,13 @@ class FixedRateHandStatePublisher:
         report_started = deadline
         report_count = 0
         try:
-            while not self._stop.is_set():
+            while not self._stop.is_set() and os.getppid() == self._parent_pid:
+                while self._updates_rx.poll():
+                    kind, payload = self._updates_rx.recv()
+                    if kind == "state":
+                        self._state = payload
+                    else:
+                        self._config = payload
                 remaining = deadline - time.monotonic()
                 if remaining > 0 and self._stop.wait(remaining):
                     break
@@ -212,7 +230,7 @@ class SafeHandController:
         devices: Mapping[str, HandBackend],
         *,
         backend_name: str,
-        close_scale: float = 0.35,
+        close_scale: float = 1.0,
         target_timeout_s: float = 0.5,
         transition_duration_s: float | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -233,6 +251,8 @@ class SafeHandController:
         self.sequence = 0
         self.last_intent_sequence: int | None = None
         self.last_intent_at: float | None = None
+        self.last_intent_received_at: float | None = None
+        self.last_intent_source_monotonic_ns: int | None = None
         self.last_valid_intent_at: dict[str, float | None] = {side: None for side in self.devices}
         self.last_step_at = clock()
         self.mode = "hold"
@@ -286,6 +306,10 @@ class SafeHandController:
             return False
         accepted = False
         received_at = self.clock() if now is None else now
+        source_monotonic_ns = payload.get("monotonic_ns")
+        if isinstance(source_monotonic_ns, int) and not isinstance(source_monotonic_ns, bool):
+            self.last_intent_source_monotonic_ns = source_monotonic_ns
+        self.last_intent_received_at = received_at
         hold = bool(payload["hold"])
         for side in self.devices:
             side_intent = payload[side]
@@ -410,6 +434,12 @@ class SafeHandController:
             "explicit_hold": self.explicit_hold,
             "target_source": "pico_open_close",
             "intent_sequence": self.last_intent_sequence,
+            "intent_source_monotonic_ns": self.last_intent_source_monotonic_ns,
+            "intent_received_monotonic_ns": (
+                None
+                if self.last_intent_received_at is None
+                else int(self.last_intent_received_at * 1e9)
+            ),
             "input_stale": stale,
             "input_age_s": None if self.last_intent_at is None else max(0.0, now - self.last_intent_at),
             "sides": {
@@ -610,11 +640,16 @@ def run(args: argparse.Namespace) -> int:
     subscriber.setsockopt(zmq.SUBSCRIBE, HAND_INTENT_TOPIC)
     subscriber.connect(args.intent_endpoint)
     selected_sides = _selected_sides(args.sides)
-    session_id = uuid.uuid4().hex
+    session_id = os.environ.get("SONIC_HAND_SESSION_ID") or uuid.uuid4().hex
     controller: SafeHandController | None = None
     next_reconnect_at = 0.0
     last_error: str | None = None
     state_publisher = FixedRateHandStatePublisher(args.state_endpoint, args.frequency)
+
+    def handle_sigterm(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    previous_sigterm_handler = signal.signal(signal.SIGTERM, handle_sigterm)
 
     def disconnected_state(now: float) -> dict[str, Any]:
         return {
@@ -627,6 +662,8 @@ def run(args: argparse.Namespace) -> int:
             "mode": "disconnected",
             "target_source": "pico_open_close",
             "intent_sequence": None,
+            "intent_source_monotonic_ns": None,
+            "intent_received_monotonic_ns": None,
             "input_stale": True,
             "input_age_s": None,
             "sides": {
@@ -663,11 +700,16 @@ def run(args: argparse.Namespace) -> int:
                     while subscriber.poll(0):
                         subscriber.recv(zmq.NOBLOCK)
                     just_connected = True
+                    print(f"[Hands] Connected: {', '.join(selected_sides)}")
                 except Exception as exc:
                     for device in devices.values():
                         device.close()
                     last_error = str(exc)
                     next_reconnect_at = started + args.reconnect_interval
+                    print(
+                        f"[Hands] Connection attempt failed: {last_error}; "
+                        f"retrying in {args.reconnect_interval:.1f}s"
+                    )
 
             if controller is not None:
                 try:
@@ -683,10 +725,14 @@ def run(args: argparse.Namespace) -> int:
                     state_publisher.update_state(state)
                 except Exception as exc:
                     last_error = str(exc)
+                    print(
+                        f"[Hands] Transport failed: {last_error}; "
+                        "requesting a clean worker restart"
+                    )
                     controller.close()
                     controller = None
-                    next_reconnect_at = started + args.reconnect_interval
                     state_publisher.update_state(disconnected_state(time.monotonic()))
+                    return RECOVERABLE_DISCONNECT_EXIT_CODE
             else:
                 state_publisher.update_state(disconnected_state(started))
             remaining = period - (time.monotonic() - started)
@@ -695,6 +741,7 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
         if controller is not None:
             controller.close()
         subscriber.close(linger=0)
@@ -716,11 +763,11 @@ def build_parser() -> argparse.ArgumentParser:
     runner.add_argument(
         "--intent-endpoint", default=f"tcp://localhost:{DEFAULT_HAND_INTENT_PORT}"
     )
-    runner.add_argument("--state-endpoint", default="tcp://*:5570")
+    runner.add_argument("--state-endpoint", default=f"tcp://*:{DEFAULT_HAND_STATE_PORT}")
     runner.add_argument("--frequency", type=float, default=50.0)
     runner.add_argument("--target-timeout", type=float, default=0.5)
-    runner.add_argument("--transition-duration", type=float, default=1.0)
-    runner.add_argument("--close-scale", type=float, default=0.35)
+    runner.add_argument("--transition-duration", type=float, default=0.2)
+    runner.add_argument("--close-scale", type=float, default=1.0)
     runner.add_argument("--reconnect-interval", type=float, default=1.0)
     runner.add_argument("--sim-feedback-endpoint", default="tcp://localhost:5571")
     runner.add_argument("--sim-feedback-timeout", type=float, default=5.0)

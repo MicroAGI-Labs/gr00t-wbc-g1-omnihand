@@ -71,6 +71,8 @@ _bootstrap_venv()
 
 import tyro  # noqa: E402
 
+from gear_sonic.utils.data_collection.hub_config import DEFAULT_TASK_PROMPT  # noqa: E402
+
 
 def _get_local_ip() -> str:
     """Best-effort detection of the PC's LAN IP address."""
@@ -118,13 +120,13 @@ class DataCollectionLaunchConfig:
     hand_backend: Literal["dex3", "omnihand", "none"] = "dex3"
     """Hand owner. OmniHand uses the external controller in sim and hardware."""
 
-    omnihand_close_scale: float = 0.35
-    """Fraction of the provisional O10 closed pose admitted for hardware motion."""
+    omnihand_close_scale: float = 1.0
+    """Fraction of the calibrated O10 closing range used for hardware motion."""
 
     omnihand_sim_close_scale: float = 1.0
     """Fraction of the O10 closed pose used by the Atlas MuJoCo model."""
 
-    omnihand_transition_duration: float = 1.0
+    omnihand_transition_duration: float = 0.2
     """Seconds for OmniHand to open or close; lower values respond faster."""
 
     omnihand_left_interface: str = "can11"
@@ -136,15 +138,20 @@ class DataCollectionLaunchConfig:
     hand_intent_port: int = 5569
     """Dedicated latest-only hand-intent ZMQ port."""
 
+    hand_state_port: int = 5570
+    """External-hand state port shared by the exporter and browser UI."""
+
+    hand_control_port: int = 5572
+    """Browser UI command port used to request a clean hand-worker restart."""
+
     # Teleop streamer options
     pico_manager: bool = True
     """Run pico_manager_thread_server with --manager flag."""
 
-    pico_teleop_mode: Literal["vr3pt", "pose"] = "vr3pt"
-    """A+X teleop mode: upper-body VR 3-point or legacy full-body pose."""
-
-    pico_locomotion_mode: Literal["idle", "slow_walk", "walk", "run"] = "slow_walk"
-    """Initial joystick locomotion gait for planner and VR 3-point modes."""
+    body_control_mode: Literal[
+        "vr3pt-slow-planner", "ik-upper-slow-planner", "full-smpl"
+    ] = "vr3pt-slow-planner"
+    """PICO body tracking and locomotion ownership used by data collection."""
 
     pico_input_source: str = "xrt"
     """Teleop input source for pico_manager_thread_server.py (xrt or isaac-teleop)."""
@@ -159,7 +166,7 @@ class DataCollectionLaunchConfig:
     """Enable waist tracking on the teleop streamer."""
 
     # Data exporter options
-    task_prompt: str = "demo"
+    task_prompt: str = DEFAULT_TASK_PROMPT
     """Language task prompt for the data exporter."""
 
     dataset_name: str = ""
@@ -226,8 +233,24 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
 
     repo_root = Path(__file__).resolve().parent.parent.parent
 
+    teleop_python = repo_root / ".venv_teleop" / "bin" / "python"
     if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
         errors.append(".venv_teleop not found. Run: bash install_scripts/install_pico.sh")
+    elif config.body_control_mode == "ik-upper-slow-planner":
+        ik_import = subprocess.run(
+            [
+                str(teleop_python),
+                "-c",
+                "import pink, qpsolvers; assert qpsolvers.available_solvers",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if ik_import.returncode != 0:
+            errors.append(
+                "Upper-body IK dependencies are missing from .venv_teleop. "
+                "Run: bash install_scripts/install_pico.sh"
+            )
 
     if not (repo_root / ".venv_data_collection" / "bin" / "activate").exists():
         errors.append(".venv_data_collection not found. Run: bash install_scripts/install_data_collection.sh")
@@ -259,10 +282,17 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
         errors.append("--omnihand-sim-close-scale must be between zero and one")
     if config.omnihand_transition_duration <= 0.0:
         errors.append("--omnihand-transition-duration must be positive")
-    if not 1 <= config.hand_intent_port <= 65535:
-        errors.append("--hand-intent-port must be between 1 and 65535")
-    if config.hand_intent_port in {config.camera_port, config.remote_ui_port}:
-        errors.append("--hand-intent-port must differ from the camera and remote UI ports")
+    hand_ports = {
+        "--hand-intent-port": config.hand_intent_port,
+        "--hand-state-port": config.hand_state_port,
+        "--hand-control-port": config.hand_control_port,
+    }
+    for name, port in hand_ports.items():
+        if not 1 <= port <= 65535:
+            errors.append(f"{name} must be between 1 and 65535")
+    reserved_ports = [config.camera_port, config.remote_ui_port, *hand_ports.values()]
+    if len(reserved_ports) != len(set(reserved_ports)):
+        errors.append("camera, remote UI, and hand ZMQ ports must all be different")
 
     if config.pico_input_source not in {"xrt", "isaac-teleop"}:
         errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
@@ -427,6 +457,7 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Dataset name:    {config.dataset_name or '(auto)'}")
     print(f"  Deploy input:    {config.deploy_input_type}")
     print(f"  Teleop input:    {config.pico_input_source}")
+    print(f"  Body control:    {config.body_control_mode}")
     print(f"  Hand backend:    {config.hand_backend}")
     if config.deploy_checkpoint:
         print(f"  Checkpoint:      {config.deploy_checkpoint}")
@@ -498,12 +529,22 @@ def main(config: DataCollectionLaunchConfig):
         print("WARNING: C++ deploy pane may have failed to start.")
 
     # --- Pane 1 (top-right): Teleop Streamer ---
+    pico_teleop_mode = {
+        "vr3pt-slow-planner": "vr3pt",
+        "ik-upper-slow-planner": "ik-upper",
+        "full-smpl": "pose",
+    }[config.body_control_mode]
+    required_stream_mode = {
+        "vr3pt-slow-planner": 5,
+        "ik-upper-slow-planner": 6,
+        "full-smpl": 1,
+    }[config.body_control_mode]
     pico_process_cmd = (
         "python gear_sonic/scripts/pico_manager_thread_server.py "
         f"--input-source {config.pico_input_source} "
         f"--hand-intent-port {config.hand_intent_port} "
-        f"--teleop-mode {config.pico_teleop_mode} "
-        f"--initial-locomotion-mode {config.pico_locomotion_mode}"
+        f"--teleop-mode {pico_teleop_mode} "
+        "--initial-locomotion-mode slow_walk"
     )
     if config.pico_manager:
         pico_process_cmd += " --manager"
@@ -538,18 +579,26 @@ def main(config: DataCollectionLaunchConfig):
         hand_venv = ".venv_sim" if config.sim else ".venv_omnihand"
         hand_backend = "sim" if config.sim else "omnihand"
         close_scale = config.omnihand_sim_close_scale if config.sim else config.omnihand_close_scale
-        hand_cmd = (
-            f"cd {repo_root} && source {hand_venv}/bin/activate && "
+        hand_worker_cmd = (
             f"python -m gear_sonic.end_effectors.controller run "
             f"--backend {hand_backend} --sides both "
             f"--intent-endpoint tcp://localhost:{config.hand_intent_port} "
+            f"--state-endpoint tcp://*:{config.hand_state_port} "
             f"--left-interface {config.omnihand_left_interface} "
             f"--right-interface {config.omnihand_right_interface} "
             f"--close-scale {close_scale} "
             f"--transition-duration {config.omnihand_transition_duration}"
         )
         if not config.sim:
-            hand_cmd += " --enable-command"
+            hand_worker_cmd += " --enable-command"
+        # The supervisor owns the restart command outside the native SDK
+        # process, so the UI can recover even if a vendor call is wedged.
+        hand_cmd = (
+            f"cd {repo_root} && source {hand_venv}/bin/activate && "
+            "python -m gear_sonic.end_effectors.supervisor "
+            f"--control-endpoint tcp://localhost:{config.hand_control_port} -- "
+            f"{hand_worker_cmd}"
+        )
         print(f"Starting OmniHand controller (pane {hand_pane})...")
         _send_to_pane(hand_pane, hand_cmd)
 
@@ -571,8 +620,12 @@ def main(config: DataCollectionLaunchConfig):
             f"python gear_sonic/scripts/run_camera_web_viewer.py "
             f"--camera-host {config.camera_host} "
             f"--camera-port {config.camera_port} "
-            f"--http-port {config.remote_ui_port}"
+            f"--http-port {config.remote_ui_port} "
+            f"--hand-state-port {config.hand_state_port} "
+            f"--hand-control-port {config.hand_control_port}"
         )
+        if config.hand_backend == "omnihand":
+            viewer_cmd += " --enable-hand-controls"
         print(f"Starting browser viewer on loopback port {config.remote_ui_port} (pane 3)...")
         _send_to_pane(3, viewer_cmd, wait=2.0)
     elif config.camera_viewer:
@@ -593,13 +646,17 @@ def main(config: DataCollectionLaunchConfig):
         f"python gear_sonic/scripts/run_data_exporter.py "
         f"--task-prompt '{config.task_prompt}' "
         f"--data-collection-frequency {config.data_exporter_frequency} "
+        f"--required-stream-mode {required_stream_mode} "
         f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"--camera-port {config.camera_port} "
+        f"--hand-state-port {config.hand_state_port}"
     )
     if config.dataset_name:
         exporter_cmd += f" --dataset-name '{config.dataset_name}'"
     if config.record_wrist_cameras:
         exporter_cmd += " --record-wrist-cameras"
+    if config.remote_ui:
+        exporter_cmd += " --require-hub-upload"
     if not config.text_to_speech:
         exporter_cmd += " --no-text-to-speech"
 

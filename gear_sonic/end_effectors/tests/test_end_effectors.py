@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from types import SimpleNamespace
 
 import numpy as np
@@ -17,12 +18,16 @@ from gear_sonic.end_effectors.controller import (
 )
 from gear_sonic.end_effectors.profiles import OMNIHAND_O10, HandSide
 from gear_sonic.end_effectors.protocol import (
+    HAND_CONTROL_SCHEMA,
+    HAND_CONTROL_TOPIC,
     HAND_INTENT_SCHEMA,
     HAND_INTENT_TOPIC,
     HandProtocolError,
+    decode_control,
     decode_intent,
     encode,
 )
+from gear_sonic.end_effectors.supervisor import HandWorkerSupervisor
 
 
 def _intent(
@@ -77,6 +82,56 @@ def test_protocol_rejects_unknown_schema_and_bad_trigger():
     del missing_hold["hold"]
     with pytest.raises(HandProtocolError, match="hold"):
         decode_intent(encode(HAND_INTENT_TOPIC, missing_hold))
+
+
+def test_hand_control_protocol_only_accepts_versioned_reconnect_requests():
+    request = {
+        "schema": HAND_CONTROL_SCHEMA,
+        "sequence": 4,
+        "action": "reconnect",
+        "monotonic_ns": 123,
+        "source": "web_ui",
+    }
+    assert decode_control(encode(HAND_CONTROL_TOPIC, request))["action"] == "reconnect"
+
+    with pytest.raises(HandProtocolError, match="unsupported"):
+        decode_control(encode(HAND_CONTROL_TOPIC, dict(request, action="stop")))
+    with pytest.raises(HandProtocolError, match="sequence"):
+        decode_control(encode(HAND_CONTROL_TOPIC, dict(request, sequence=True)))
+
+
+def test_hand_supervisor_force_kills_a_wedged_worker():
+    class WedgedWorker:
+        terminated = False
+        killed = False
+        wait_count = 0
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout):
+            self.wait_count += 1
+            if self.wait_count == 1:
+                raise subprocess.TimeoutExpired("hand-worker", timeout)
+            return -9
+
+    worker = WedgedWorker()
+    supervisor = HandWorkerSupervisor(
+        ["hand-worker"],
+        control_endpoint="inproc://unused",
+        terminate_timeout_s=0.01,
+    )
+    supervisor._stop_worker(worker)
+
+    assert worker.terminated
+    assert worker.killed
+    assert worker.wait_count == 2
 
 
 def test_trigger_hysteresis_retains_state_and_ignores_invalid_input():
@@ -379,7 +434,7 @@ def test_hardware_adapter_probes_without_writing_and_uses_explicit_joint_command
         link_validator=lambda _: None,
     )
     assert hand.commands == []
-    assert hand.request_interval_ms == 20
+    assert hand.request_interval_ms == 0
     assert hand.frame_recv_timeout_ms == 50
     backend.write_positions(np.zeros(10))
     assert hand.commands == [[0.0] * 10]
@@ -423,3 +478,9 @@ def test_physical_zero_delta_hold_requires_explicit_command_enable():
     )
     assert disabled.enable_command is False
     assert enabled.enable_command is True
+
+
+def test_runtime_defaults_use_full_fast_omnihand_transition():
+    args = build_parser().parse_args(["run"])
+    assert args.close_scale == 1.0
+    assert args.transition_duration == 0.2

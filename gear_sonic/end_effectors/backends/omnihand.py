@@ -18,7 +18,7 @@ from ..profiles import HandSide, SideProfile
 SDK_VERSION = "1.1.8"
 SDK_COMMIT = "026740d9fdd8ba32b0605fa702a992b322076f1b"
 EXPECTED_DRIVER = "gs_usb"
-SOCKETCAN_REQUEST_INTERVAL_MS = 20
+SOCKETCAN_REQUEST_INTERVAL_MS = 0
 SOCKETCAN_FRAME_RECV_TIMEOUT_MS = 50
 EXPECTED_SERIAL = {
     HandSide.RIGHT: "2082395E534B50052",
@@ -194,9 +194,9 @@ class OmniHandBackend:
     def _configure_transport_timing(
         self, request_interval_ms: int, frame_recv_timeout_ms: int
     ) -> None:
-        """Configure and verify the SDK's native 50 Hz SocketCAN cadence."""
-        if not 20 <= request_interval_ms <= 100:
-            raise OmniHandHardwareError("SocketCAN request interval must be between 20 and 100 ms")
+        """Configure and verify the SDK's SocketCAN request cadence."""
+        if not 0 <= request_interval_ms <= 100:
+            raise OmniHandHardwareError("SocketCAN request interval must be between 0 and 100 ms")
         if frame_recv_timeout_ms <= 0:
             raise OmniHandHardwareError("SocketCAN frame receive timeout must be positive")
         try:

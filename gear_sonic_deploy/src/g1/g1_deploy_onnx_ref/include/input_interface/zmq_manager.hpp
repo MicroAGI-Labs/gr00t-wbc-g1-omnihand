@@ -774,6 +774,7 @@ class ZMQManager : public InputInterface {
       int mode_idx = -1, movement_idx = -1, facing_idx = -1;
       int speed_idx = -1, height_idx = -1;
       int upper_body_position_idx = -1, upper_body_velocity_idx = -1;
+      int upper_body_mask_idx = -1;
       int left_hand_joints_idx = -1, right_hand_joints_idx = -1;
       int vr_position_idx = -1, vr_orientation_idx = -1, vr_compliance_idx = -1;
 
@@ -786,6 +787,7 @@ class ZMQManager : public InputInterface {
         else if (f.name == "height") height_idx = static_cast<int>(i);
         else if (f.name == "upper_body_position") upper_body_position_idx = static_cast<int>(i);
         else if (f.name == "upper_body_velocity") upper_body_velocity_idx = static_cast<int>(i);
+        else if (f.name == "upper_body_mask") upper_body_mask_idx = static_cast<int>(i);
         else if (f.name == "left_hand_joints") left_hand_joints_idx = static_cast<int>(i);
         else if (f.name == "right_hand_joints") right_hand_joints_idx = static_cast<int>(i);
         else if (f.name == "vr_position") vr_position_idx = static_cast<int>(i);
@@ -909,8 +911,24 @@ class ZMQManager : public InputInterface {
         }
         msg.upper_body_position = upper_body_position_data;
 
-        // Push into upper-body position buffer
+        std::array<bool, 17> upper_body_mask_data{};
+        upper_body_mask_data.fill(true);
+        if (upper_body_mask_idx >= 0) {
+          const auto& mask_field = hdr.fields[upper_body_mask_idx];
+          const auto& mask_buf = bufs[upper_body_mask_idx];
+          if ((mask_field.dtype != "bool" && mask_field.dtype != "u8") ||
+              mask_field.shape.size() != 1 || mask_field.shape[0] != 17 ||
+              mask_buf.size < 17) {
+            std::cerr << "[ZMQManager] Invalid upper_body_mask; expected bool[17]" << std::endl;
+            return;
+          }
+          const auto* values = static_cast<const uint8_t*>(mask_buf.data);
+          for (int i = 0; i < 17; ++i) {
+            upper_body_mask_data[i] = values[i] != 0;
+          }
+        }
         upper_body_joint_positions_.SetData(upper_body_position_data);
+        upper_body_joint_mask_.SetData(upper_body_mask_data);
       }
 
       // Optional: upper_body_velocity (17 DOF, decode based on dtype)

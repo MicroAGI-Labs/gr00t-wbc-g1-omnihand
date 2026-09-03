@@ -377,6 +377,18 @@ public:
         return {false, {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
     }
 
+    /// @brief Select which upper-body targets replace planner-generated joints.
+    /// Messages without an explicit mask retain the legacy all-joints behavior.
+    virtual std::array<bool, 17> GetUpperBodyJointMask() const {
+        auto buffered_data = upper_body_joint_mask_.GetDataWithTime();
+        if (buffered_data.data) {
+            return *buffered_data.data;
+        }
+        std::array<bool, 17> all_joints{};
+        all_joints.fill(true);
+        return all_joints;
+    }
+
     /// @brief Get upper-body joint target velocities (17 DOF, rad/s).
     /// @return {true, velocities} if upper-body data is available; {false, zeros} otherwise.
     virtual std::pair<bool, std::array<double, 17>> GetUpperBodyJointVelocities() const {
@@ -483,6 +495,8 @@ protected:
     DataBuffer<std::array<double, 17>> upper_body_joint_positions_;
     /// Upper-body target joint velocities (17 DOF, rad/s).
     DataBuffer<std::array<double, 17>> upper_body_joint_velocities_;
+    /// True where the remote upper-body target owns the corresponding joint.
+    DataBuffer<std::array<bool, 17>> upper_body_joint_mask_;
     
     /// Left-hand Dex3 joint positions (7 DOF).
     DataBuffer<std::array<double, 7>> left_hand_joint_;

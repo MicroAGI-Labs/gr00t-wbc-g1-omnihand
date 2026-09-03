@@ -45,6 +45,8 @@
  *   --planner-fp16        | Use FP16 for planner TensorRT engine
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
+
+#include <sstream>
 #include <cmath>
 #include <cuda_runtime_api.h>
 #include <memory>
@@ -201,6 +203,7 @@ class G1Deploy {
     bool has_upper_body_data_ = false;
     std::array<double, 17> upper_body_joint_positions_buffer_;
     std::array<double, 17> upper_body_joint_velocities_buffer_;
+    std::array<bool, 17> upper_body_joint_mask_buffer_;
     std::vector<double> token_state_data_;  // Token buffer (size from config)
     
     // =========================================================================
@@ -784,7 +787,9 @@ class G1Deploy {
               current_motion_joint_pos[i] = motion_joint_pos[i];
             }
             for (size_t i = 0; i < 17; i++) {
-              current_motion_joint_pos[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_positions_buffer_[i];
+              if (upper_body_joint_mask_buffer_[i]) {
+                current_motion_joint_pos[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_positions_buffer_[i];
+              }
             }
             std::copy(
               current_motion_joint_pos.begin(),
@@ -861,7 +866,9 @@ class G1Deploy {
                 current_motion_joint_vel[i] = motion_joint_vel[i];
               }
               for (size_t i = 0; i < 17; i++) {
-                current_motion_joint_vel[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_velocities_buffer_[i];
+                if (upper_body_joint_mask_buffer_[i]) {
+                  current_motion_joint_vel[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_velocities_buffer_[i];
+                }
               }
               std::copy(
                 current_motion_joint_vel.begin(),
@@ -2430,6 +2437,16 @@ class G1Deploy {
 
       // Prepare robot configuration for data collection (after all initialization is complete)
       std::map<std::string, std::variant<std::string, int, double, bool>> robot_config;
+      const auto array_to_json = [](const auto& values) {
+        std::ostringstream stream;
+        stream << "[";
+        for (size_t index = 0; index < values.size(); ++index) {
+          if (index != 0) stream << ",";
+          stream << values[index];
+        }
+        stream << "]";
+        return stream.str();
+      };
       robot_config["model_path"] = model_path;
       robot_config["reference_motion_path"] = motion_data_path;
       robot_config["planner_path"] = planner_path.empty() ? "none" : planner_path;
@@ -2441,6 +2458,12 @@ class G1Deploy {
       robot_config["hand_control"] = hand_control_mode_;
       robot_config["policy_fp16"] = policy_fp16;
       robot_config["planner_fp16"] = planner_fp16;
+      // The config transport intentionally supports scalar values only. JSON
+      // strings preserve the exact arrays without widening the wire variant.
+      robot_config["g1_action_scale_json"] = array_to_json(g1_action_scale);
+      robot_config["default_angles_json"] = array_to_json(default_angles);
+      robot_config["isaaclab_to_mujoco_json"] = array_to_json(isaaclab_to_mujoco);
+      robot_config["mujoco_to_isaaclab_json"] = array_to_json(mujoco_to_isaaclab);
 
       // Initialize state logger with complete robot configuration
       try {
@@ -2989,6 +3012,7 @@ class G1Deploy {
       std::tie(has_right_hand_data_, right_hand_joint_buffer_) = input_interface_->GetHandPose(false);
       std::tie(has_upper_body_data_, upper_body_joint_positions_buffer_) = input_interface_->GetUpperBodyJointPositions();
       std::tie(std::ignore, upper_body_joint_velocities_buffer_) = input_interface_->GetUpperBodyJointVelocities();
+      upper_body_joint_mask_buffer_ = input_interface_->GetUpperBodyJointMask();
 
       auto last_update_time = input_interface_->GetLastUpdateTime();
       if (last_update_time.has_value()) {

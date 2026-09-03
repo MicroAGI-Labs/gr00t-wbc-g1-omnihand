@@ -317,9 +317,21 @@ class Gr00tDataExporter(LeRobotDataset):
         self.episode_buffer = self.create_episode_buffer()
         self.video_writers = self.create_video_writer()
 
-    def save_episode(self, episode_data: dict | None = None) -> None:
+    def save_episode(
+        self,
+        episode_data: dict | None = None,
+        *,
+        success: bool = True,
+        validation: dict[str, Any] | None = None,
+    ) -> None:
         if not episode_data:
             episode_buffer = self.episode_buffer
+
+        if "episode.success" in self.features:
+            episode_buffer["episode.success"] = [
+                np.asarray([int(success)], dtype=np.uint8)
+                for _ in range(episode_buffer["size"])
+            ]
 
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
@@ -360,6 +372,14 @@ class Gr00tDataExporter(LeRobotDataset):
                 episode_buffer[key] = video_paths[key]
 
         self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats)
+        quality_path = self.root / "meta" / "episode_quality.jsonl"
+        quality_record = {
+            "episode_index": int(episode_index),
+            "success": bool(success),
+            "validation": validation or {"passed": bool(success), "errors": []},
+        }
+        with open(quality_path, "a", encoding="utf-8") as quality_file:
+            quality_file.write(json.dumps(quality_record, separators=(",", ":")) + "\n")
 
         ep_data_index = get_episode_data_index(self.meta.episodes, [episode_index])
         ep_data_index_np = {k: t.numpy() for k, t in ep_data_index.items()}
@@ -404,12 +424,14 @@ class Gr00tDataExporter(LeRobotDataset):
             video_paths[key] = self.video_writers[key].stop()
         return video_paths
 
-    def save_episode_as_discarded(self) -> None:
+    def save_episode_as_discarded(
+        self, *, validation: dict[str, Any] | None = None
+    ) -> None:
         """Flag ongoing episode as discarded and save it to disk."""
         self.meta.info["discarded_episode_indices"] = self.meta.info.get(
             "discarded_episode_indices", []
         ) + [self.episode_buffer["episode_index"]]
-        self.save_episode()
+        self.save_episode(success=False, validation=validation)
 
 
 # ---------------------------------------------------------------------------

@@ -157,6 +157,20 @@ def test_zed_sensor_returns_owned_rgb_frame_and_epoch_timestamp(monkeypatch):
     )
 
 
+def test_zed_sensor_rotates_frame_180(monkeypatch):
+    bgra = np.zeros((2, 3, 4), dtype=np.uint8)
+    bgra[-1, -1] = [10, 20, 30, 255]
+    sdk = FakeSDK(image=bgra)
+    monkeypatch.setattr(zed_driver, "_load_zed_sdk", lambda: sdk)
+
+    image = zed_driver.ZEDSensor(config=zed_driver.ZEDConfig(rotate_180=True)).read()[
+        "images"
+    ]["ego_view"]
+
+    np.testing.assert_array_equal(image[0, 0], np.array([30, 20, 10]))
+    assert image.flags.c_contiguous
+
+
 @pytest.mark.parametrize("failure_stage", ["grab", "retrieve"])
 def test_zed_sensor_returns_none_on_capture_failure(fake_sdk, failure_stage):
     sensor = zed_driver.ZEDSensor()
@@ -215,4 +229,5 @@ def test_composed_camera_factory_passes_zed_options(monkeypatch):
     assert captured["config"] == zed_driver.ZEDConfig(
         camera_resolution="HD1080",
         camera_fps=30,
+        rotate_180=True,
     )

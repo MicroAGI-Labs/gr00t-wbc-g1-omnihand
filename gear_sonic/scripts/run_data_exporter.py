@@ -22,7 +22,13 @@ Usage (from repo root):
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import json
+from pathlib import Path
+import queue
+import re
+import subprocess
+import threading
 import time
 
 import numpy as np
@@ -48,6 +54,11 @@ from gear_sonic.end_effectors.protocol import (
     decode_state,
 )
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
+from gear_sonic.utils.data_collection.hub_config import (
+    DATASET_CONFIG_PREFIX,
+    DEFAULT_TASK_PROMPT,
+    decode_dataset_config,
+)
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.text_to_speech import TextToSpeech
@@ -70,7 +81,7 @@ class SonicDataExporterConfig:
     dataset_name: str | None = None
     """Dataset name (auto-generated if creating new)."""
 
-    task_prompt: str = "demo"
+    task_prompt: str = DEFAULT_TASK_PROMPT
     """Language task prompt."""
 
     root_output_dir: str = "outputs"
@@ -126,13 +137,49 @@ class SonicDataExporterConfig:
     hand_state_max_age: float = 0.2
     """Maximum external hand-state age admitted while recording."""
 
+    proprio_state_max_age: float = 0.1
+    """Maximum robot-state age admitted while recording."""
+
+    camera_max_age: float = 0.1
+    """Maximum camera-frame age admitted while recording."""
+
+    teleop_max_age: float = 0.2
+    """Maximum active planner/SMPL message age admitted while recording."""
+
+    minimum_recording_rate_hz: float = 45.0
+    """Minimum source rate required for a successful episode."""
+
+    required_stream_mode: int = 5
+    """Stream mode required for recording (1=POSE, 5=VR3PT, 6=IK upper)."""
+
+    require_hand_activity: bool = True
+    """Reject a successful episode when neither hand command changes."""
+
+    minimum_hand_motion_rad: float = 0.02
+    """Minimum requested hand-joint range required when hand activity is enforced."""
+
     recording_status_port: int = 5581
     """ZMQ PUB port for browser-visible recorder status."""
+
+    require_hub_upload: bool = False
+    """Require browser Hub setup and a completed upload between episodes."""
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+_RECORDING_STREAM_MODE_NAMES = {
+    1: "POSE",
+    5: "VR3PT",
+    6: "IK upper",
+}
+
+
+def _recording_mode_ready(current_stream_mode: int, required_stream_mode: int) -> bool:
+    """Return whether the launch-selected A+X teleop mode is active."""
+    return int(current_stream_mode) == int(required_stream_mode)
 
 
 class TimeDeltaException(Exception):
@@ -141,6 +188,234 @@ class TimeDeltaException(Exception):
         self.reset_timeout_sec = reset_timeout_sec
         self.message = f"{self.failure_count} failures in {self.reset_timeout_sec} seconds"
         super().__init__(self.message)
+
+
+class StreamRateTracker:
+    """Measure producer and collector rates over a short rolling window."""
+
+    def __init__(self, window_seconds: float = 2.0, stale_after_seconds: float = 1.0):
+        self.window_seconds = float(window_seconds)
+        self.stale_after_seconds = float(stale_after_seconds)
+        self._samples: dict[str, dict[str, deque[tuple[float, float]]]] = {}
+
+    def observe(
+        self,
+        stream: str,
+        *,
+        source_timestamp: float | None = None,
+        source_sequence: int | None = None,
+        received_timestamp: float | None = None,
+    ) -> None:
+        observed_at = time.monotonic()
+        samples = self._samples.setdefault(
+            stream,
+            {"source": deque(), "source_sequence": deque(), "received": deque()},
+        )
+        if source_timestamp is not None and np.isfinite(source_timestamp):
+            self._append(samples["source"], observed_at, float(source_timestamp))
+        if source_sequence is not None:
+            self._append(samples["source_sequence"], observed_at, float(source_sequence))
+        receiver_event = observed_at if received_timestamp is None else received_timestamp
+        if np.isfinite(receiver_event):
+            self._append(samples["received"], observed_at, float(receiver_event))
+        self._prune(samples, observed_at)
+
+    def snapshot(self, streams: tuple[str, ...]) -> dict[str, dict[str, float | bool | None]]:
+        now = time.monotonic()
+        result = {}
+        for stream in streams:
+            samples = self._samples.setdefault(
+                stream,
+                {"source": deque(), "source_sequence": deque(), "received": deque()},
+            )
+            self._prune(samples, now)
+            latest = samples["received"][-1][0] if samples["received"] else None
+            active = latest is not None and now - latest <= self.stale_after_seconds
+            result[stream] = {
+                "sent_hz": self._source_rate(samples) if active else 0.0,
+                "received_hz": self._rate(samples["received"]) if active else 0.0,
+                "active": active,
+                "age_s": round(now - latest, 3) if latest is not None else None,
+            }
+        return result
+
+    def _append(
+        self,
+        samples: deque[tuple[float, float]],
+        observed_at: float,
+        value: float,
+    ) -> None:
+        if samples and value == samples[-1][1]:
+            return
+        if samples and value < samples[-1][1]:
+            samples.clear()
+        samples.append((observed_at, value))
+
+    def _prune(self, samples_by_kind: dict[str, deque], now: float) -> None:
+        cutoff = now - self.window_seconds
+        for samples in samples_by_kind.values():
+            while samples and samples[0][0] < cutoff:
+                samples.popleft()
+
+    @staticmethod
+    def _rate(samples: deque[tuple[float, float]]) -> float | None:
+        if len(samples) < 2:
+            return None
+        elapsed = samples[-1][1] - samples[0][1]
+        if elapsed <= 0:
+            return None
+        return round((len(samples) - 1) / elapsed, 2)
+
+    @classmethod
+    def _source_rate(cls, samples_by_kind: dict[str, deque]) -> float | None:
+        samples = samples_by_kind["source_sequence"]
+        if len(samples) >= 2:
+            elapsed = samples[-1][0] - samples[0][0]
+            sequence_delta = samples[-1][1] - samples[0][1]
+            if elapsed > 0 and sequence_delta > 0:
+                return round(sequence_delta / elapsed, 2)
+
+        # Legacy publishers may provide timestamps without a sequence. Use
+        # the lower-quartile interval to recover their base cadence when a
+        # conflating receiver samples across occasional skipped frames.
+        samples = samples_by_kind["source"]
+        if len(samples) < 2:
+            return None
+        intervals = np.diff([sample[1] for sample in samples])
+        positive = intervals[intervals > 0]
+        if positive.size == 0:
+            return None
+        return round(float(1.0 / np.percentile(positive, 25)), 2)
+
+
+class EpisodeHubUploader:
+    """Upload each finalized episode while keeping recorder state observable."""
+
+    _EPISODE_FILE_RE = re.compile(r"episode_(\d+)\.(?:mp4|parquet)$")
+
+    def __init__(self, data_exporter: Gr00tDataExporter):
+        self.data_exporter = data_exporter
+        self._queue: queue.Queue[int | None] = queue.Queue()
+        self._condition = threading.Condition()
+        self._stop = threading.Event()
+        self._config: dict[str, object] | None = None
+        self._pending = 0
+        self._uploading = False
+        self._retrying = False
+        self._last_uploaded_episode: int | None = None
+        self._error: str | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="episode-hub-uploader",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def configure(self, repo_id: str, prompt: str, private: bool) -> None:
+        config = {"repo_id": repo_id, "prompt": prompt, "private": private}
+        with self._condition:
+            if self._pending or self._uploading:
+                if config != self._config:
+                    raise RuntimeError("cannot change dataset while an upload is pending")
+                return
+            self._config = config
+            self._error = None
+            self._retrying = False
+            self.data_exporter.meta.repo_id = repo_id
+            self.data_exporter.task = prompt
+            self._condition.notify_all()
+
+    def enqueue(self, episode_index: int) -> None:
+        with self._condition:
+            if self._config is None:
+                raise RuntimeError("choose a Hugging Face dataset before saving an episode")
+            self._pending += 1
+            self._condition.notify_all()
+        self._queue.put(episode_index)
+
+    def can_record(self) -> bool:
+        with self._condition:
+            return self._config is not None and self._pending == 0 and not self._uploading
+
+    def status(self) -> dict[str, object]:
+        with self._condition:
+            config = dict(self._config or {})
+            return {
+                "ready": self._config is not None,
+                "repo_id": config.get("repo_id"),
+                "prompt": config.get("prompt", self.data_exporter.task),
+                "private": config.get("private", True),
+                "pending": self._pending,
+                "uploading": self._uploading,
+                "retrying": self._retrying,
+                "last_uploaded_episode": self._last_uploaded_episode,
+                "error": self._error,
+            }
+
+    def wait_until_idle(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while self._pending or self._uploading:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+            return True
+
+    def close(self, timeout: float = 30.0) -> None:
+        self.wait_until_idle(timeout=timeout)
+        self._stop.set()
+        self._queue.put(None)
+        self._thread.join(timeout=2.0)
+
+    def _upload_patterns(self, episode_index: int) -> list[str]:
+        patterns = ["meta/**"]
+        root = Path(self.data_exporter.root)
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            match = self._EPISODE_FILE_RE.search(path.name)
+            if match and int(match.group(1)) <= episode_index:
+                patterns.append(path.relative_to(root).as_posix())
+        return patterns
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            episode_index = self._queue.get()
+            if episode_index is None:
+                return
+            retry_delay = 1.0
+            while not self._stop.is_set():
+                with self._condition:
+                    config = dict(self._config or {})
+                    self._uploading = True
+                    self._retrying = retry_delay > 1.0
+                    self._condition.notify_all()
+                try:
+                    self.data_exporter.push_to_hub(
+                        private=bool(config.get("private", True)),
+                        allow_patterns=self._upload_patterns(episode_index),
+                        upload_large_folder=True,
+                    )
+                except Exception as exc:
+                    with self._condition:
+                        self._uploading = False
+                        self._retrying = True
+                        self._error = str(exc)[-500:]
+                        self._condition.notify_all()
+                    if self._stop.wait(retry_delay):
+                        return
+                    retry_delay = min(retry_delay * 2.0, 30.0)
+                    continue
+
+                with self._condition:
+                    self._pending -= 1
+                    self._uploading = False
+                    self._retrying = False
+                    self._error = None
+                    self._last_uploaded_episode = episode_index
+                    self._condition.notify_all()
+                break
 
 
 def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
@@ -188,6 +463,133 @@ def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
         current_offset += n_bytes
 
     return result
+
+
+def _timestamp_seconds(value, *, nanoseconds: bool = False) -> float | None:
+    """Return a scalar timestamp in seconds from a Python or NumPy value."""
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return None
+        value = value.flat[0]
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+        return None
+    timestamp = float(value)
+    if not np.isfinite(timestamp) or timestamp <= 0:
+        return None
+    return timestamp / 1e9 if nanoseconds else timestamp
+
+
+def _integer_scalar(value, default: int = -1) -> int:
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return default
+        value = value.flat[0]
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        return default
+    return int(value)
+
+
+def _required_vector(data: dict, key: str, width: int) -> np.ndarray:
+    """Return one finite float32 vector or raise a recording-quality error."""
+    if key not in data:
+        raise ValueError(f"required robot field '{key}' is missing")
+    value = np.asarray(data[key], dtype=np.float32).reshape(-1)
+    if value.shape != (width,):
+        raise ValueError(f"robot field '{key}' has shape {value.shape}, expected {(width,)}")
+    if not np.all(np.isfinite(value)):
+        raise ValueError(f"robot field '{key}' contains NaN or Inf")
+    return value
+
+
+def _episode_hand_motion_range(episode_buffer: dict) -> float:
+    """Return the largest commanded hand-joint range in the buffered episode."""
+    ranges = []
+    for key in ("teleop.left_hand_joints", "teleop.right_hand_joints"):
+        values = episode_buffer.get(key, [])
+        if values:
+            stacked = np.stack(values).astype(np.float32, copy=False)
+            ranges.append(float(np.max(np.ptp(stacked, axis=0))))
+    return max(ranges, default=0.0)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _capture_reproducibility_metadata(robot_config: dict, dataset_frequency_hz: float) -> dict:
+    """Resolve immutable controller artifacts and record their identities."""
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy_root = repo_root / "gear_sonic_deploy"
+    artifacts = {}
+    for key in ("model_path", "encoder_file", "planner_path", "obs_config_path"):
+        configured = robot_config.get(key)
+        if not isinstance(configured, str) or configured in {"", "none"}:
+            continue
+        candidates = (Path(configured), deploy_root / configured)
+        resolved = next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
+        record = {"configured_path": configured}
+        if resolved is not None:
+            record.update(
+                {
+                    "path": str(resolved),
+                    "size_bytes": resolved.stat().st_size,
+                    "sha256": _sha256(resolved),
+                }
+            )
+        else:
+            record["missing_at_exporter_start"] = True
+        artifacts[key] = record
+
+    parameters = (
+        deploy_root
+        / "src/g1/g1_deploy_onnx_ref/include/policy_parameters.hpp"
+    )
+    if parameters.is_file():
+        artifacts["policy_parameters"] = {
+            "path": str(parameters.resolve()),
+            "size_bytes": parameters.stat().st_size,
+            "sha256": _sha256(parameters),
+        }
+
+    git = {"commit": None, "dirty": None}
+    try:
+        git["commit"] = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        git["dirty"] = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+    return {
+        "schema": "sonic.capture.v1",
+        "robot_type": "unitree_g1_omnihand_sonic",
+        "gr00t_embodiment_tag": "UNITREE_G1_SONIC",
+        "joint_units": "rad",
+        "angular_velocity_units": "rad_s",
+        "position_units": "m",
+        "quaternion_order": "wxyz",
+        "capture_timestamp_units": "ns",
+        "capture_monotonic_clock_scope": "single_linux_host",
+        "dataset_frequency_hz": float(dataset_frequency_hz),
+        "git": git,
+        "artifacts": artifacts,
+    }
 
 
 class TimingThresholdMonitor:
@@ -263,6 +665,17 @@ class GrootDataCollector:
       - Camera client             -> ego-view images
     """
 
+    RATE_STREAMS = (
+        "camera",
+        "robot_state",
+        "pico_pose",
+        "planner",
+        "manager_state",
+        "hand_intent",
+        "hand_control",
+        "hand_state",
+    )
+
     def __init__(
         self,
         camera_host: str,
@@ -270,7 +683,7 @@ class GrootDataCollector:
         data_exporter: Gr00tDataExporter,
         robot_model,
         text_to_speech=None,
-        frequency: int = 20,
+        frequency: int = 50,
         sonic_data_zmq_host: str = "localhost",
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
@@ -280,7 +693,15 @@ class GrootDataCollector:
         hand_state_host: str = "localhost",
         hand_state_port: int = 5570,
         hand_state_max_age: float = .2,
+        proprio_state_max_age: float = 0.1,
+        camera_max_age: float = 0.1,
+        teleop_max_age: float = 0.2,
+        minimum_recording_rate_hz: float = 45.0,
+        required_stream_mode: int = 5,
+        require_hand_activity: bool = True,
+        minimum_hand_motion_rad: float = 0.02,
         recording_status_port: int = 5581,
+        require_hub_upload: bool = False,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -290,29 +711,60 @@ class GrootDataCollector:
         self.hand_profile = hand_profile
         self.hand_config = hand_config
         self.hand_state_max_age = hand_state_max_age
+        self.proprio_state_max_age = proprio_state_max_age
+        self.camera_max_age = camera_max_age
+        self.teleop_max_age = teleop_max_age
+        self.minimum_recording_rate_hz = minimum_recording_rate_hz
+        if required_stream_mode not in _RECORDING_STREAM_MODE_NAMES:
+            raise ValueError(
+                "required_stream_mode must be 1 (POSE), 5 (VR3PT), or 6 (IK upper)"
+            )
+        self.required_stream_mode = required_stream_mode
+        self.require_hand_activity = require_hand_activity
+        self.minimum_hand_motion_rad = minimum_hand_motion_rad
+        self.require_hub_upload = require_hub_upload
         self.latest_hand_state = None
         self.latest_hand_state_received_at = None
+        self.latest_hand_state_received_monotonic_ns = None
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
-        self._recording_message = "Ready to record"
+        self.hub_uploader = EpisodeHubUploader(data_exporter)
+        self._recording_message = (
+            "Choose a Hugging Face dataset to begin"
+            if require_hub_upload
+            else "Ready to record"
+        )
         self._recording_status_ctx = zmq.Context()
         self._recording_status_socket = self._recording_status_ctx.socket(zmq.PUB)
         self._recording_status_socket.setsockopt(zmq.SNDHWM, 2)
         self._recording_status_socket.bind(f"tcp://*:{recording_status_port}")
 
-        self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
+        self._image_subscriber = ComposedCameraClientSensor(
+            server_ip=camera_host,
+            port=camera_port,
+            background=True,
+        )
 
         self.obs_act_buffer = deque(maxlen=100)
         self.latest_image_msg = None
+        self.latest_image_received_at = None
+        self.latest_image_received_monotonic_ns = None
         self.latest_proprio_msg = None
+        self.latest_proprio_received_at = None
+        self.latest_proprio_received_monotonic_ns = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
+        self.latest_manager_msg = None
+        self._episode_input_errors: set[str] = set()
+        self._last_input_block_log = 0.0
+        self.stream_rates = StreamRateTracker()
 
         self.current_stream_mode = 0
 
         self._manager_toggle_dc = False
         self._manager_toggle_da = False
+        self._manager_discard_reason: str | None = None
 
         self._state_subscriber = ZMQStateSubscriber(
             host=state_zmq_host,
@@ -371,17 +823,28 @@ class GrootDataCollector:
     def _publish_recording_status(self) -> None:
         """Publish authoritative recorder state for the loopback browser UI."""
         state = self._episode_state.get_state()
+        hub_status = self.hub_uploader.status()
+        hub_status["required"] = self.require_hub_upload
         hand_ready = True
         if self.hand_config is not None:
             hand_ready = bool(
                 self.latest_hand_state
                 and not self.latest_hand_state.get("input_stale", True)
                 and self.latest_hand_state.get("intent_sequence") is not None
+                and (
+                    self.latest_hand_state.get("state_age_s") is None
+                    or self.latest_hand_state.get("state_age_s") <= self.hand_state_max_age
+                )
                 and all(
                     side.get("valid") and side.get("connected")
                     for side in self.latest_hand_state.get("sides", {}).values()
                 )
             )
+        message = self._recording_message
+        if hub_status["uploading"]:
+            message = f"Uploading episode {self.current_episode_index - 1} to Hugging Face"
+        elif hub_status["retrying"]:
+            message = "Upload failed; retrying automatically"
         payload = {
             "state": state,
             "recording": state == self._episode_state.RECORDING,
@@ -395,7 +858,17 @@ class GrootDataCollector:
                 "camera": self.latest_image_msg is not None,
                 "hands": hand_ready,
             },
-            "message": self._recording_message,
+            "stream_mode": self.current_stream_mode,
+            "required_stream_mode": self.required_stream_mode,
+            "required_stream_mode_name": _RECORDING_STREAM_MODE_NAMES[
+                self.required_stream_mode
+            ],
+            "recording_mode_ready": _recording_mode_ready(
+                self.current_stream_mode, self.required_stream_mode
+            ),
+            "message": message,
+            "hub": hub_status,
+            "stream_rates": self.stream_rates.snapshot(self.RATE_STREAMS),
             "timestamp": time.time(),
         }
         try:
@@ -409,10 +882,25 @@ class GrootDataCollector:
         if msg is None:
             return
 
-        if msg.get("ros_timestamp", 0.0) == 0.0:
+        ros_timestamp = _timestamp_seconds(msg.get("ros_timestamp"))
+        if ros_timestamp is None:
             msg["ros_timestamp"] = time.time()
 
         self.latest_proprio_msg = msg
+        self.latest_proprio_received_at = time.monotonic()
+        self.latest_proprio_received_monotonic_ns = time.monotonic_ns()
+        self.stream_rates.observe(
+            "robot_state",
+            source_timestamp=_timestamp_seconds(
+                msg.get("publisher_monotonic_ns"), nanoseconds=True
+            ),
+            source_sequence=(
+                int(msg["index"])
+                if isinstance(msg.get("index"), (int, np.integer))
+                and not isinstance(msg.get("index"), bool)
+                else None
+            ),
+        )
 
     def _poll_hand_zmq(self) -> None:
         if self._hand_zmq_socket is None:
@@ -431,6 +919,43 @@ class GrootDataCollector:
                 continue
             self.latest_hand_state = state
             self.latest_hand_state_received_at = time.monotonic()
+            self.latest_hand_state_received_monotonic_ns = time.monotonic_ns()
+            self.stream_rates.observe(
+                "hand_state",
+                source_timestamp=_timestamp_seconds(
+                    state.get("published_monotonic_ns"), nanoseconds=True
+                ),
+                source_sequence=(
+                    int(state["publish_sequence"])
+                    if isinstance(state.get("publish_sequence"), int)
+                    and not isinstance(state.get("publish_sequence"), bool)
+                    else None
+                ),
+            )
+            self.stream_rates.observe(
+                "hand_control",
+                source_timestamp=_timestamp_seconds(
+                    state.get("monotonic_ns"), nanoseconds=True
+                ),
+                source_sequence=(
+                    int(state["sequence"])
+                    if isinstance(state.get("sequence"), int)
+                    and not isinstance(state.get("sequence"), bool)
+                    else None
+                ),
+            )
+            intent_source = _timestamp_seconds(
+                state.get("intent_source_monotonic_ns"), nanoseconds=True
+            )
+            intent_received = _timestamp_seconds(
+                state.get("intent_received_monotonic_ns"), nanoseconds=True
+            )
+            if intent_source is not None and intent_received is not None:
+                self.stream_rates.observe(
+                    "hand_intent",
+                    source_timestamp=intent_source,
+                    received_timestamp=intent_received,
+                )
 
     def _external_hand_values(
         self,
@@ -447,6 +972,11 @@ class GrootDataCollector:
         age = time.monotonic() - self.latest_hand_state_received_at
         if age > self.hand_state_max_age:
             raise RuntimeError(f"external hand state is stale ({age:.3f}s)")
+        controller_age = self.latest_hand_state.get("state_age_s")
+        if isinstance(controller_age, (int, float)) and controller_age > self.hand_state_max_age:
+            raise RuntimeError(
+                f"external hand controller snapshot is stale ({controller_age:.3f}s)"
+            )
         if self.latest_hand_state.get("mode") == "fault":
             raise RuntimeError("external hand controller is faulted")
         if self.latest_hand_state.get("input_stale") or self.latest_hand_state.get("intent_sequence") is None:
@@ -460,27 +990,184 @@ class GrootDataCollector:
                 side_state = self.latest_hand_state.get("sides", {}).get(side)
                 if not side_state or not side_state.get("valid") or not side_state.get("connected"):
                     raise RuntimeError(f"external {side} hand is invalid or disconnected")
+                if side_state.get("input_stale"):
+                    raise RuntimeError(f"external {side} hand target is stale")
                 array = np.asarray(side_state.get(field), dtype=np.float64).reshape(-1)
                 if array.shape != (self.hand_profile.width,) or not np.all(np.isfinite(array)):
                     raise RuntimeError(f"external {side} {field} has the wrong shape")
                 values.append(array)
         return tuple(values)
 
+    def _validate_recording_inputs(self) -> None:
+        """Reject stale or malformed inputs before they enter an episode."""
+        if not _recording_mode_ready(
+            self.current_stream_mode, self.required_stream_mode
+        ):
+            required_name = _RECORDING_STREAM_MODE_NAMES[self.required_stream_mode]
+            raise RuntimeError(
+                f"required A+X teleop mode {required_name} is not active "
+                f"(stream mode {self.current_stream_mode})"
+            )
+        now = time.monotonic()
+        if self.latest_proprio_msg is None or self.latest_proprio_received_at is None:
+            raise RuntimeError("robot state is unavailable")
+        proprio_age = now - self.latest_proprio_received_at
+        if proprio_age > self.proprio_state_max_age:
+            raise RuntimeError(f"robot state is stale ({proprio_age:.3f}s)")
+        for key, width in (
+            ("body_q", 29),
+            ("body_dq", 29),
+            ("base_quat", 4),
+            ("base_ang_vel", 3),
+            ("last_action", 29),
+        ):
+            _required_vector(self.latest_proprio_msg, key, width)
+        token = _required_vector(self.latest_proprio_msg, "token_state", 64)
+        if not np.any(token):
+            raise RuntimeError("SONIC motion token is all zeros")
+
+        if self.latest_image_msg is None or self.latest_image_received_at is None:
+            raise RuntimeError("camera frame is unavailable")
+        camera_age = now - self.latest_image_received_at
+        if camera_age > self.camera_max_age:
+            raise RuntimeError(f"camera frame is stale ({camera_age:.3f}s)")
+
+        if self.hand_config is not None:
+            self._external_hand_values()
+
+        if self.current_stream_mode in (5, 6):
+            if self.latest_planner_msg is None:
+                raise RuntimeError("planner command is unavailable in planner mode")
+            planner_received = self.latest_planner_msg.get("receive_monotonic")
+            if planner_received is None or now - planner_received > self.teleop_max_age:
+                raise RuntimeError("planner command is stale in planner mode")
+            if self.latest_planner_msg.get("vr_3pt_position") is None:
+                raise RuntimeError("VR 3-point position is missing in planner mode")
+            if self.latest_planner_msg.get("vr_3pt_orientation") is None:
+                raise RuntimeError("VR 3-point orientation is missing in planner mode")
+        elif self.current_stream_mode in (1, 4):
+            if self.latest_sonic_msg is None:
+                raise RuntimeError("SMPL pose is unavailable in pose mode")
+            pose_received = self.latest_sonic_msg.get("receive_monotonic")
+            if pose_received is None or now - pose_received > self.teleop_max_age:
+                raise RuntimeError("SMPL pose is stale in pose mode")
+            if self.latest_sonic_msg.get("smpl_pose") is None:
+                raise RuntimeError("SMPL pose is missing in pose mode")
+
+    def _episode_validation(self) -> dict[str, object]:
+        """Return the quality report used to accept or discard an episode."""
+        errors = sorted(self._episode_input_errors)
+        hand_motion = _episode_hand_motion_range(self.data_exporter.episode_buffer)
+        if self.hand_config is not None and self.require_hand_activity:
+            if hand_motion < self.minimum_hand_motion_rad:
+                errors.append(
+                    "hand commands did not move enough "
+                    f"({hand_motion:.4f} rad < {self.minimum_hand_motion_rad:.4f} rad)"
+                )
+
+        rates = self.stream_rates.snapshot(self.RATE_STREAMS)
+        required_streams = ["robot_state", "camera"]
+        if self.hand_config is not None:
+            required_streams.append("hand_state")
+        modes = {
+            int(np.asarray(value).reshape(-1)[0])
+            for value in self.data_exporter.episode_buffer.get("teleop.stream_mode", [])
+        }
+        unexpected_modes = sorted(
+            mode for mode in modes if mode != self.required_stream_mode
+        )
+        if unexpected_modes:
+            required_name = _RECORDING_STREAM_MODE_NAMES[self.required_stream_mode]
+            errors.append(
+                f"episode contains stream modes {unexpected_modes}; "
+                f"required {required_name} ({self.required_stream_mode}) only"
+            )
+        if modes & {5, 6}:
+            required_streams.append("planner")
+        if modes & {1, 4}:
+            required_streams.append("pico_pose")
+        for stream in required_streams:
+            sent_hz = rates.get(stream, {}).get("sent_hz")
+            if sent_hz is None or float(sent_hz) < self.minimum_recording_rate_hz:
+                errors.append(
+                    f"{stream} source rate is {sent_hz} Hz; "
+                    f"minimum is {self.minimum_recording_rate_hz:.1f} Hz"
+                )
+
+        errors = sorted(set(errors))
+        return {
+            "passed": not errors,
+            "errors": errors,
+            "hand_command_range_rad": round(hand_motion, 6),
+            "required_minimum_rate_hz": self.minimum_recording_rate_hz,
+            "stream_rates": rates,
+        }
+
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
         key = self._keyboard_listener.read_msg()
+        discard_reason = "operator_discarded"
+
+        if isinstance(key, str) and key.startswith(DATASET_CONFIG_PREFIX):
+            try:
+                config = decode_dataset_config(key)
+                if self._episode_state.get_state() != self._episode_state.IDLE:
+                    raise RuntimeError("stop or discard the active episode before changing dataset")
+                if self.data_exporter.episode_buffer.get("size", 0) > 0:
+                    raise RuntimeError("cannot change dataset after collecting frames")
+                if self.data_exporter.meta.info.get("total_episodes", 0) > 0:
+                    raise RuntimeError("cannot change dataset after saving an episode")
+                self.hub_uploader.configure(
+                    repo_id=str(config["repo_id"]),
+                    prompt=str(config["prompt"]),
+                    private=bool(config["private"]),
+                )
+                self._recording_message = f"Ready to record to {config['repo_id']}"
+                print(f"[Hub] Dataset configured: {config['repo_id']}")
+            except Exception as exc:
+                self._recording_message = f"Dataset configuration rejected: {exc}"
+                print(f"[Hub] {self._recording_message}")
+            return
 
         if self._manager_toggle_da:
             key = "x"
             self._manager_toggle_da = False
+            discard_reason = self._manager_discard_reason or discard_reason
+            self._manager_discard_reason = None
         elif self._manager_toggle_dc:
             key = "c"
             self._manager_toggle_dc = False
 
         if key == "c":
+            if (
+                self._episode_state.get_state() == self._episode_state.IDLE
+                and not _recording_mode_ready(
+                    self.current_stream_mode, self.required_stream_mode
+                )
+            ):
+                required_name = _RECORDING_STREAM_MODE_NAMES[self.required_stream_mode]
+                message = f"Enter {required_name} with A+X before recording"
+                self._recording_message = message
+                self._print_and_say(message, blocking=False)
+                return
+            if (
+                self._episode_state.get_state() == self._episode_state.IDLE
+                and self.require_hub_upload
+                and not self.hub_uploader.can_record()
+            ):
+                status = self.hub_uploader.status()
+                message = (
+                    "Wait for the Hugging Face upload to finish"
+                    if status["ready"]
+                    else "Choose a Hugging Face dataset in the browser first"
+                )
+                self._recording_message = message
+                self._print_and_say(message, blocking=False)
+                return
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
+                self._episode_input_errors.clear()
                 self._recording_message = f"Recording episode {self.current_episode_index}"
                 self._print_and_say(
                     f"Started recording {self.current_episode_index}", blocking=False
@@ -494,8 +1181,18 @@ class GrootDataCollector:
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 buffer_size = self.data_exporter.episode_buffer.get("size", 0)
                 if buffer_size > 0:
-                    self.data_exporter.save_episode_as_discarded()
-                    message = "Episode discarded"
+                    discarded_episode = self.current_episode_index
+                    self.data_exporter.save_episode_as_discarded(
+                        validation={
+                            "passed": False,
+                            "errors": [discard_reason],
+                        }
+                    )
+                    if self.hub_uploader.status()["ready"]:
+                        self.hub_uploader.enqueue(discarded_episode)
+                        message = f"Episode {discarded_episode} discarded and queued for upload"
+                    else:
+                        message = f"Episode {discarded_episode} discarded"
                 else:
                     # A discard can arrive before the first complete frame (for
                     # example while an external hand source is still starting).
@@ -531,20 +1228,59 @@ class GrootDataCollector:
             data = unpack_pose_message(raw, topic="manager_state")
         except Exception:
             return
+        received_monotonic_ns = time.monotonic_ns()
+
+        self.stream_rates.observe(
+            "manager_state",
+            source_timestamp=_timestamp_seconds(
+                data.get("publisher_monotonic_ns"), nanoseconds=True
+            ),
+        )
 
         if "stream_mode" in data:
-            self.current_stream_mode = int(data["stream_mode"].flat[0])
+            new_stream_mode = int(data["stream_mode"].flat[0])
+            if (
+                self._episode_state.get_state() == self._episode_state.RECORDING
+                and not _recording_mode_ready(
+                    new_stream_mode, self.required_stream_mode
+                )
+            ):
+                required_name = _RECORDING_STREAM_MODE_NAMES[self.required_stream_mode]
+                self._manager_toggle_da = True
+                self._manager_discard_reason = (
+                    "required_teleop_mode_exited: "
+                    f"expected {required_name} ({self.required_stream_mode}), "
+                    f"got stream mode {new_stream_mode}"
+                )
+                self._recording_message = (
+                    f"Discarding episode: exited {required_name} mode"
+                )
+            self.current_stream_mode = new_stream_mode
+        self.latest_manager_msg = {
+            "publisher_monotonic_ns": _integer_scalar(data.get("publisher_monotonic_ns")),
+            "received_monotonic_ns": received_monotonic_ns,
+        }
 
         if self._extract_bool(data, "toggle_data_collection"):
             self._manager_toggle_dc = True
         if self._extract_bool(data, "toggle_data_abort"):
             self._manager_toggle_da = True
+            if self._manager_discard_reason is None:
+                self._manager_discard_reason = "operator_discarded"
 
     def _handle_planner_message(self, raw: bytes) -> None:
         try:
             data = unpack_pose_message(raw, topic="planner")
         except Exception:
             return
+        received_monotonic_ns = time.monotonic_ns()
+
+        self.stream_rates.observe(
+            "planner",
+            source_timestamp=_timestamp_seconds(
+                data.get("publisher_monotonic_ns"), nanoseconds=True
+            ),
+        )
 
         planner_mode = int(data["mode"].flat[0]) if "mode" in data else 0
         planner_movement = (
@@ -578,6 +1314,12 @@ class GrootDataCollector:
             "left_hand_joints": self._extract_hand_joints(data, "left_hand_joints"),
             "right_hand_joints": self._extract_hand_joints(data, "right_hand_joints"),
             "receive_timestamp": time.time(),
+            "receive_monotonic": received_monotonic_ns / 1e9,
+            "received_monotonic_ns": received_monotonic_ns,
+            "publisher_monotonic_ns": int(
+                (_timestamp_seconds(data.get("publisher_monotonic_ns"), nanoseconds=True) or 0)
+                * 1e9
+            ),
         }
 
     def _handle_pose_message(self, raw: bytes) -> None:
@@ -593,6 +1335,14 @@ class GrootDataCollector:
         except Exception as e:
             print(f"[Sonic] Error unpacking pose message: {e}")
             return
+        received_monotonic_ns = time.monotonic_ns()
+
+        self.stream_rates.observe(
+            "pico_pose",
+            source_timestamp=_timestamp_seconds(
+                pose_data.get("publisher_monotonic_ns"), nanoseconds=True
+            ),
+        )
 
         try:
             if "smpl_joints" not in pose_data or len(pose_data["smpl_joints"].shape) != 3:
@@ -657,6 +1407,24 @@ class GrootDataCollector:
                 "vr_3pt_orientation": vr_3pt_orientation,
                 "frame_index": frame_index,
                 "receive_timestamp": time.time(),
+                "receive_monotonic": received_monotonic_ns / 1e9,
+                "received_monotonic_ns": received_monotonic_ns,
+                "sample_monotonic_ns": int(
+                    (
+                        _timestamp_seconds(pose_data.get("timestamp_monotonic"))
+                        or 0
+                    )
+                    * 1e9
+                ),
+                "publisher_monotonic_ns": int(
+                    (
+                        _timestamp_seconds(
+                            pose_data.get("publisher_monotonic_ns"), nanoseconds=True
+                        )
+                        or 0
+                    )
+                    * 1e9
+                ),
             }
         except Exception as e:
             if not hasattr(self, "_sonic_error_count"):
@@ -719,11 +1487,30 @@ class GrootDataCollector:
             saved_episode = self.current_episode_index
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
-                self.data_exporter.save_episode()
+                validation = self._episode_validation()
+                if validation["passed"]:
+                    self.data_exporter.save_episode(validation=validation)
+                else:
+                    self.data_exporter.save_episode_as_discarded(validation=validation)
+                if self.hub_uploader.status()["ready"]:
+                    self.hub_uploader.enqueue(saved_episode)
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
-                self._recording_message = f"Saved episode {saved_episode}"
-                self._print_and_say("Finished saving episode")
+                if not validation["passed"]:
+                    reasons = "; ".join(validation["errors"])
+                    self._recording_message = (
+                        f"Episode {saved_episode} failed validation and was discarded: {reasons}"
+                    )
+                    self._print_and_say(
+                        f"Episode failed validation and was discarded: {reasons}",
+                        blocking=False,
+                    )
+                elif self.hub_uploader.status()["ready"]:
+                    self._recording_message = f"Saved episode {saved_episode}; upload queued"
+                    self._print_and_say("Finished saving episode, upload started")
+                else:
+                    self._recording_message = f"Saved episode {saved_episode}"
+                    self._print_and_say("Finished saving episode")
             else:
                 self._recording_message = "Nothing saved: no frames collected"
                 self._print_and_say("Skipping save: no frames collected", say=False)
@@ -733,28 +1520,24 @@ class GrootDataCollector:
     def _add_data_frame(self):
         t_start = time.monotonic()
 
-        if self.latest_proprio_msg is None or self.latest_image_msg is None:
-            self._print_and_say(
-                f"Waiting for message. "
-                f"Avail msg: proprio {self.latest_proprio_msg is not None} | "
-                f"image {self.latest_image_msg is not None}",
-                say=False,
-            )
-            return False
-
         if self._episode_state.get_state() != self._episode_state.RECORDING:
             return self._finalize_frame(t_start)
 
-        if self.hand_config is not None:
-            try:
-                self._external_hand_values()
-            except RuntimeError as exc:
-                now = time.monotonic()
-                if now - getattr(self, "_last_hand_block_log", 0.0) > 1.0:
-                    print(f"[Hands] recording blocked: {exc}")
-                    self._last_hand_block_log = now
-                return False
+        try:
+            self._validate_recording_inputs()
+        except (RuntimeError, ValueError) as exc:
+            error = str(exc)
+            if self.data_exporter.episode_buffer.get("size", 0) > 0:
+                self._episode_input_errors.add(error)
+            now = time.monotonic()
+            if now - self._last_input_block_log > 1.0:
+                print(f"[Quality] recording frame blocked: {error}")
+                self._recording_message = f"Recording blocked: {error}"
+                self._last_input_block_log = now
+            return False
 
+        if self._recording_message.startswith("Recording blocked:"):
+            self._recording_message = f"Recording episode {self.current_episode_index}"
         return self._add_data_frame_sonic(t_start)
 
     def _add_data_frame_sonic(self, t_start: float) -> bool:
@@ -792,15 +1575,29 @@ class GrootDataCollector:
                 right_hand_actuated_joint_values=neutral,
             )
         else:
+            measured_left = _required_vector(
+                proprio, "left_hand_q", self.hand_profile.width
+            )
+            measured_right = _required_vector(
+                proprio, "right_hand_q", self.hand_profile.width
+            )
+            requested_left = _required_vector(
+                proprio, "last_left_hand_action", self.hand_profile.width
+            )
+            requested_right = _required_vector(
+                proprio, "last_right_hand_action", self.hand_profile.width
+            )
+            applied_left = requested_left
+            applied_right = requested_right
             whole_q = self.robot_model.get_configuration_from_actuated_joints(
                 body_actuated_joint_values=proprio["body_q"],
-                left_hand_actuated_joint_values=proprio["left_hand_q"],
-                right_hand_actuated_joint_values=proprio["right_hand_q"],
+                left_hand_actuated_joint_values=measured_left,
+                right_hand_actuated_joint_values=measured_right,
             )
             whole_action_wbc = self.robot_model.get_configuration_from_actuated_joints(
                 body_actuated_joint_values=proprio["last_action"],
-                left_hand_actuated_joint_values=proprio["last_left_hand_action"],
-                right_hand_actuated_joint_values=proprio["last_right_hand_action"],
+                left_hand_actuated_joint_values=requested_left,
+                right_hand_actuated_joint_values=requested_right,
             )
             fk_q = whole_q
 
@@ -816,9 +1613,16 @@ class GrootDataCollector:
         observation_eef_state = np.concatenate(eef_parts)
 
         frame_data: dict = {
-            "observation.state": whole_q,
-            "observation.eef_state": observation_eef_state,
-            "action.wbc": whole_action_wbc,
+            "observation.state": np.asarray(whole_q, dtype=np.float32),
+            "observation.eef_state": np.asarray(observation_eef_state, dtype=np.float32),
+            "action.wbc": np.asarray(whole_action_wbc, dtype=np.float32),
+            "observation.omnihand_left_raw": np.asarray(measured_left, dtype=np.float32),
+            "observation.omnihand_right_raw": np.asarray(measured_right, dtype=np.float32),
+            "action.omnihand_left_raw": np.asarray(requested_left, dtype=np.float32),
+            "action.omnihand_right_raw": np.asarray(requested_right, dtype=np.float32),
+            "observation.left_hand_valid": np.ones(1, dtype=np.uint8),
+            "observation.right_hand_valid": np.ones(1, dtype=np.uint8),
+            "episode.success": np.ones(1, dtype=np.uint8),
         }
 
         self._add_cpp_state_features(frame_data, proprio)
@@ -831,7 +1635,7 @@ class GrootDataCollector:
             frame_data["teleop.right_hand_joints"] = requested_right.astype(np.float32)
             frame_data["control.hand_applied_position"] = np.concatenate(
                 (applied_left, applied_right)
-            )
+            ).astype(np.float32)
             frame_data["teleop.hand_closed"] = np.asarray(
                 [side_states[side]["intent_closed"] for side in ("left", "right")],
                 dtype=bool,
@@ -839,12 +1643,13 @@ class GrootDataCollector:
         else:
             frame_data["control.hand_applied_position"] = np.concatenate(
                 (
-                    np.asarray(proprio["last_left_hand_action"], dtype=np.float64),
-                    np.asarray(proprio["last_right_hand_action"], dtype=np.float64),
+                    applied_left,
+                    applied_right,
                 )
-            )
+            ).astype(np.float32)
             frame_data["teleop.hand_closed"] = np.zeros(2, dtype=bool)
 
+        self._add_capture_features(frame_data, proprio)
         self._add_images_to_frame_data(frame_data)
 
         self._log_latency_periodic(sonic_latency_ms)
@@ -852,54 +1657,134 @@ class GrootDataCollector:
         self.data_exporter.add_frame(frame_data)
         return self._finalize_frame(t_start)
 
-    def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
-        if "base_quat" in proprio:
-            base_quat = np.asarray(proprio["base_quat"], dtype=np.float64)
-            frame_data["observation.root_orientation"] = base_quat
-            frame_data["observation.projected_gravity"] = compute_projected_gravity(
-                base_quat
-            ).astype(np.float64)
+    def _add_capture_features(self, frame_data: dict, proprio: dict) -> None:
+        """Preserve source identity/timing without exposing it to GR00T."""
+        robot_source_s = _timestamp_seconds(proprio.get("ros_timestamp"))
+        frame_data["capture.robot_state_sequence"] = np.asarray(
+            [_integer_scalar(proprio.get("index"))], dtype=np.int64
+        )
+        frame_data["capture.robot_state_source_timestamp_ns"] = np.asarray(
+            [-1 if robot_source_s is None else int(robot_source_s * 1e9)], dtype=np.int64
+        )
+        frame_data["capture.robot_state_sample_monotonic_ns"] = np.asarray(
+            [_integer_scalar(proprio.get("sample_monotonic_ns"))], dtype=np.int64
+        )
+        frame_data["capture.robot_state_publish_monotonic_ns"] = np.asarray(
+            [_integer_scalar(proprio.get("publisher_monotonic_ns"))], dtype=np.int64
+        )
+        frame_data["capture.robot_state_received_monotonic_ns"] = np.asarray(
+            [self.latest_proprio_received_monotonic_ns or -1], dtype=np.int64
+        )
 
-            if "init_ref_data_root_rot_array" in proprio:
-                frame_data["observation.cpp_rotation_offset"] = np.asarray(
-                    proprio["init_ref_data_root_rot_array"], dtype=np.float64
-                )
-            else:
-                frame_data["observation.cpp_rotation_offset"] = np.array(
-                    [1.0, 0.0, 0.0, 0.0], dtype=np.float64
-                )
+        image = self.latest_image_msg or {}
+        frame_data["capture.camera_sequence"] = np.asarray(
+            [_integer_scalar(image.get("publisher_sequence"))], dtype=np.int64
+        )
+        frame_data["capture.camera_source_monotonic_ns"] = np.asarray(
+            [_integer_scalar(image.get("publisher_monotonic_ns"))], dtype=np.int64
+        )
+        frame_data["capture.camera_sample_monotonic_ns"] = np.asarray(
+            [_integer_scalar(image.get("sample_monotonic_ns"))], dtype=np.int64
+        )
+        frame_data["capture.camera_publish_monotonic_ns"] = np.asarray(
+            [_integer_scalar(image.get("publisher_monotonic_ns"))], dtype=np.int64
+        )
+        frame_data["capture.camera_received_monotonic_ns"] = np.asarray(
+            [self.latest_image_received_monotonic_ns or -1], dtype=np.int64
+        )
+
+        hand = self.latest_hand_state or {}
+        frame_data["capture.hand_state_sequence"] = np.asarray(
+            [_integer_scalar(hand.get("sequence"))], dtype=np.int64
+        )
+        frame_data["capture.hand_state_publish_sequence"] = np.asarray(
+            [_integer_scalar(hand.get("publish_sequence"))], dtype=np.int64
+        )
+        frame_data["capture.hand_state_source_monotonic_ns"] = np.asarray(
+            [_integer_scalar(hand.get("monotonic_ns"))], dtype=np.int64
+        )
+        frame_data["capture.hand_state_publish_monotonic_ns"] = np.asarray(
+            [_integer_scalar(hand.get("published_monotonic_ns"))], dtype=np.int64
+        )
+        frame_data["capture.hand_state_received_monotonic_ns"] = np.asarray(
+            [self.latest_hand_state_received_monotonic_ns or -1], dtype=np.int64
+        )
+        frame_data["capture.hand_intent_sequence"] = np.asarray(
+            [_integer_scalar(hand.get("intent_sequence"))], dtype=np.int64
+        )
+        frame_data["capture.hand_intent_source_monotonic_ns"] = np.asarray(
+            [_integer_scalar(hand.get("intent_source_monotonic_ns"))], dtype=np.int64
+        )
+        frame_data["capture.hand_intent_received_monotonic_ns"] = np.asarray(
+            [_integer_scalar(hand.get("intent_received_monotonic_ns"))], dtype=np.int64
+        )
+
+        pose = self.latest_sonic_msg or {}
+        frame_data["capture.pico_pose_sequence"] = np.asarray(
+            [_integer_scalar(pose.get("frame_index"))], dtype=np.int64
+        )
+        for capture_field, message_field in (
+            ("sample", "sample"),
+            ("publish", "publisher"),
+            ("received", "received"),
+        ):
+            frame_data[f"capture.pico_pose_{capture_field}_monotonic_ns"] = np.asarray(
+                [_integer_scalar(pose.get(f"{message_field}_monotonic_ns"))], dtype=np.int64
+            )
+
+        planner = self.latest_planner_msg or {}
+        for capture_field, message_field in (("publish", "publisher"), ("received", "received")):
+            frame_data[f"capture.planner_{capture_field}_monotonic_ns"] = np.asarray(
+                [_integer_scalar(planner.get(f"{message_field}_monotonic_ns"))], dtype=np.int64
+            )
+
+        manager = self.latest_manager_msg or {}
+        for capture_field, message_field in (("publish", "publisher"), ("received", "received")):
+            frame_data[f"capture.manager_{capture_field}_monotonic_ns"] = np.asarray(
+                [_integer_scalar(manager.get(f"{message_field}_monotonic_ns"))], dtype=np.int64
+            )
+
+    def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
+        base_quat = _required_vector(proprio, "base_quat", 4)
+        frame_data["observation.root_orientation"] = base_quat
+        frame_data["observation.projected_gravity"] = compute_projected_gravity(
+            base_quat
+        ).astype(np.float32)
+        frame_data["observation.base_angular_velocity"] = _required_vector(
+            proprio, "base_ang_vel", 3
+        )
+        frame_data["observation.body_joint_velocity"] = _required_vector(
+            proprio, "body_dq", 29
+        )
+
+        if "init_ref_data_root_rot_array" in proprio:
+            frame_data["observation.cpp_rotation_offset"] = np.asarray(
+                proprio["init_ref_data_root_rot_array"], dtype=np.float32
+            )
         else:
-            frame_data["observation.root_orientation"] = np.array(
-                [1.0, 0.0, 0.0, 0.0], dtype=np.float64
-            )
-            frame_data["observation.projected_gravity"] = np.array(
-                [0.0, 0.0, -1.0], dtype=np.float64
-            )
             frame_data["observation.cpp_rotation_offset"] = np.array(
-                [1.0, 0.0, 0.0, 0.0], dtype=np.float64
+                [1.0, 0.0, 0.0, 0.0], dtype=np.float32
             )
 
         if "init_base_quat" in proprio:
             frame_data["observation.init_base_quat"] = np.asarray(
-                proprio["init_base_quat"], dtype=np.float64
+                proprio["init_base_quat"], dtype=np.float32
             )
         else:
             frame_data["observation.init_base_quat"] = np.array(
-                [1.0, 0.0, 0.0, 0.0], dtype=np.float64
+                [1.0, 0.0, 0.0, 0.0], dtype=np.float32
             )
 
         if "delta_heading" in proprio:
             dh = proprio["delta_heading"]
             if isinstance(dh, np.ndarray):
                 dh = dh.item() if dh.size == 1 else dh[0]
-            frame_data["teleop.delta_heading"] = np.array([float(dh)], dtype=np.float64)
+            frame_data["teleop.delta_heading"] = np.array([float(dh)], dtype=np.float32)
         else:
-            frame_data["teleop.delta_heading"] = np.zeros(1, dtype=np.float64)
+            frame_data["teleop.delta_heading"] = np.zeros(1, dtype=np.float32)
 
-        if "token_state" in proprio:
-            frame_data["action.motion_token"] = np.asarray(proprio["token_state"], dtype=np.float64)
-        else:
-            frame_data["action.motion_token"] = np.zeros(64, dtype=np.float64)
+        frame_data["action.motion_token"] = _required_vector(proprio, "token_state", 64)
+        frame_data["action.motion_token_valid"] = np.ones(1, dtype=np.uint8)
 
     def _add_sonic_pose_features(self, frame_data: dict) -> float | None:
         """Add teleop features based on current stream mode."""
@@ -927,7 +1812,7 @@ class GrootDataCollector:
 
         planner_msg = self.latest_planner_msg
         use_planner = False
-        if self.current_stream_mode == 5 and planner_msg is not None:
+        if self.current_stream_mode in (5, 6) and planner_msg is not None:
             receive_ts = planner_msg.get("receive_timestamp")
             if receive_ts is not None:
                 age_sec = time.time() - receive_ts
@@ -984,6 +1869,7 @@ class GrootDataCollector:
             if use_smpl and smpl_msg is not None and smpl_msg.get("frame_index") is not None
             else np.array([0], dtype=np.int64)
         )
+        frame_data["teleop.smpl_valid"] = np.asarray([int(use_smpl)], dtype=np.uint8)
 
         hand_msg = (
             smpl_msg if self.current_stream_mode in (1, 4) and smpl_msg is not None
@@ -1026,6 +1912,12 @@ class GrootDataCollector:
             [planner_msg["planner_height"]] if use_planner else [-1.0],
             dtype=np.float32,
         )
+        frame_data["teleop.control_mode"] = np.asarray(
+            [2 if use_planner else 0 if use_smpl else 255], dtype=np.uint8
+        )
+        frame_data["teleop.locomotion_speed_m_s"] = np.asarray(
+            [planner_msg["planner_speed"] if use_planner else -1.0], dtype=np.float32
+        )
 
         # VR 3-point pose
         frame_data["teleop.vr_3pt_position"] = (
@@ -1034,11 +1926,14 @@ class GrootDataCollector:
             else np.zeros(9, dtype=np.float32)
         )
         if use_planner and planner_msg.get("vr_3pt_orientation") is not None:
-            frame_data["teleop.vr_3pt_orientation"] = quat_to_rot6d(
-                planner_msg["vr_3pt_orientation"].astype(np.float32)
-            )
+            vr_orientation = planner_msg["vr_3pt_orientation"].astype(np.float32)
+            frame_data["teleop.vr_3pt_orientation_wxyz"] = vr_orientation
+            frame_data["teleop.vr_3pt_orientation"] = quat_to_rot6d(vr_orientation)
+            frame_data["teleop.vr_3pt_valid"] = np.ones(1, dtype=np.uint8)
         else:
+            frame_data["teleop.vr_3pt_orientation_wxyz"] = np.zeros(12, dtype=np.float32)
             frame_data["teleop.vr_3pt_orientation"] = np.zeros(18, dtype=np.float32)
+            frame_data["teleop.vr_3pt_valid"] = np.zeros(1, dtype=np.uint8)
 
         return sonic_latency_ms
 
@@ -1070,7 +1965,17 @@ class GrootDataCollector:
             self._print_and_say("saving episode done", blocking=False)
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
-                self.data_exporter.save_episode()
+                saved_episode = self.current_episode_index
+                self.data_exporter.save_episode_as_discarded(
+                    validation={
+                        "passed": False,
+                        "errors": ["collector_shutdown_before_episode_save"],
+                    }
+                )
+                if self.hub_uploader.status()["ready"]:
+                    self.hub_uploader.enqueue(saved_episode)
+            if not self.hub_uploader.wait_until_idle(timeout=30.0):
+                print("[Hub] Upload still pending after 30 seconds; local data is preserved")
             self._print_and_say(
                 f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
             )
@@ -1078,7 +1983,15 @@ class GrootDataCollector:
             self._print_and_say(f"Error saving episode: {e}", blocking=True)
 
         try:
+            self.hub_uploader.close(timeout=0.0)
+        except Exception:
+            pass
+        try:
             self._state_subscriber.close()
+        except Exception:
+            pass
+        try:
+            self._image_subscriber.close()
         except Exception:
             pass
         for sock in [self._sonic_zmq_socket, self._hand_zmq_socket]:
@@ -1116,9 +2029,34 @@ class GrootDataCollector:
                         self._poll_hand_zmq()
 
                     with self.telemetry.timer("poll_image"):
+                        previous_image_index = self._image_subscriber.idx
                         img_msg = self._image_subscriber.read()
                         if img_msg is not None:
                             self.latest_image_msg = img_msg
+                        if self._image_subscriber.idx != previous_image_index and img_msg is not None:
+                            self.latest_image_received_at = time.monotonic()
+                            self.latest_image_received_monotonic_ns = time.monotonic_ns()
+                            source_timestamps = [
+                                timestamp
+                                for value in img_msg.get("timestamps", {}).values()
+                                if (timestamp := _timestamp_seconds(value)) is not None
+                            ]
+                            self.stream_rates.observe(
+                                "camera",
+                                source_timestamp=(
+                                    _timestamp_seconds(
+                                        img_msg.get("publisher_monotonic_ns"),
+                                        nanoseconds=True,
+                                    )
+                                    or (max(source_timestamps) if source_timestamps else None)
+                                ),
+                                source_sequence=(
+                                    int(img_msg["publisher_sequence"])
+                                    if isinstance(img_msg.get("publisher_sequence"), int)
+                                    and not isinstance(img_msg.get("publisher_sequence"), bool)
+                                    else None
+                                ),
+                            )
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
@@ -1144,7 +2082,10 @@ class GrootDataCollector:
             print("Data exporter terminated by user")
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                discarded_episode = self.current_episode_index
                 self.data_exporter.save_episode_as_discarded()
+                if self.hub_uploader.status()["ready"]:
+                    self.hub_uploader.enqueue(discarded_episode)
 
         finally:
             self.save_and_cleanup()
@@ -1206,7 +2147,11 @@ def main(config: SonicDataExporterConfig):
             "record_wrist_cameras": config.record_wrist_cameras,
             "hand_profile": hand_profile.name,
             "hand_config": hand_config,
+            "capture": _capture_reproducibility_metadata(
+                robot_config, config.data_collection_frequency
+            ),
         },
+        robot_type="unitree_g1_omnihand_sonic",
     )
 
     data_collector = GrootDataCollector(
@@ -1225,7 +2170,15 @@ def main(config: SonicDataExporterConfig):
         hand_state_host=config.hand_state_host,
         hand_state_port=config.hand_state_port,
         hand_state_max_age=config.hand_state_max_age,
+        proprio_state_max_age=config.proprio_state_max_age,
+        camera_max_age=config.camera_max_age,
+        teleop_max_age=config.teleop_max_age,
+        minimum_recording_rate_hz=config.minimum_recording_rate_hz,
+        required_stream_mode=config.required_stream_mode,
+        require_hand_activity=config.require_hand_activity,
+        minimum_hand_motion_rad=config.minimum_hand_motion_rad,
         recording_status_port=config.recording_status_port,
+        require_hub_upload=config.require_hub_upload,
     )
     data_collector.run()
 

@@ -281,12 +281,17 @@ def get_features_sonic_vla(
             "names": ["height", "width", "channel"],
         },
         "observation.state": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (num_joints,),
             "names": joint_names,
         },
+        "observation.body_joint_velocity": {
+            "dtype": "float32",
+            "shape": (29,),
+            "names": [f"body_joint_velocity_{index:02d}" for index in range(29)],
+        },
         "observation.eef_state": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (14,),
             "names": [
                 "left_wrist_pos",
@@ -296,12 +301,12 @@ def get_features_sonic_vla(
             ],
         },
         "action.wbc": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (num_joints,),
             "names": joint_names,
         },
         "control.hand_applied_position": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (2 * hand_width,),
             "names": (
                 list(hand_profile.left.joint_names + hand_profile.right.joint_names)
@@ -315,34 +320,95 @@ def get_features_sonic_vla(
             "names": ["left", "right"],
         },
         "observation.root_orientation": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (4,),
             "names": ["base_qw", "base_qx", "base_qy", "base_qz"],
         },
         "observation.projected_gravity": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (3,),
             "names": ["gravity_x", "gravity_y", "gravity_z"],
         },
         "observation.cpp_rotation_offset": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (4,),
             "names": ["rot_offset_qw", "rot_offset_qx", "rot_offset_qy", "rot_offset_qz"],
         },
         "observation.init_base_quat": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (4,),
             "names": ["init_base_qw", "init_base_qx", "init_base_qy", "init_base_qz"],
         },
         "teleop.delta_heading": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (1,),
             "names": ["delta_heading"],
         },
         "action.motion_token": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (64,),
-            "names": "motion_token",
+            "names": [f"motion_token_{index:02d}" for index in range(64)],
+        },
+        "action.motion_token_valid": {
+            "dtype": "uint8",
+            "shape": (1,),
+            "names": ["motion_token_valid"],
+        },
+        "observation.base_angular_velocity": {
+            "dtype": "float32",
+            "shape": (3,),
+            "names": ["angular_velocity_x", "angular_velocity_y", "angular_velocity_z"],
+        },
+        "observation.omnihand_left_raw": {
+            "dtype": "float32",
+            "shape": (hand_width,),
+            "names": (
+                list(hand_profile.left.joint_names)
+                if hand_profile is not None
+                else [f"left_hand_{index}" for index in range(hand_width)]
+            ),
+        },
+        "observation.omnihand_right_raw": {
+            "dtype": "float32",
+            "shape": (hand_width,),
+            "names": (
+                list(hand_profile.right.joint_names)
+                if hand_profile is not None
+                else [f"right_hand_{index}" for index in range(hand_width)]
+            ),
+        },
+        "action.omnihand_left_raw": {
+            "dtype": "float32",
+            "shape": (hand_width,),
+            "names": (
+                list(hand_profile.left.joint_names)
+                if hand_profile is not None
+                else [f"left_hand_{index}" for index in range(hand_width)]
+            ),
+        },
+        "action.omnihand_right_raw": {
+            "dtype": "float32",
+            "shape": (hand_width,),
+            "names": (
+                list(hand_profile.right.joint_names)
+                if hand_profile is not None
+                else [f"right_hand_{index}" for index in range(hand_width)]
+            ),
+        },
+        "observation.left_hand_valid": {
+            "dtype": "uint8",
+            "shape": (1,),
+            "names": ["left_hand_valid"],
+        },
+        "observation.right_hand_valid": {
+            "dtype": "uint8",
+            "shape": (1,),
+            "names": ["right_hand_valid"],
+        },
+        "episode.success": {
+            "dtype": "uint8",
+            "shape": (1,),
+            "names": ["success"],
         },
         "teleop.smpl_joints": {
             "dtype": "float32",
@@ -434,6 +500,165 @@ def get_features_sonic_vla(
                 "rwrist_x", "rwrist_y", "rwrist_z",
                 "neck_x", "neck_y", "neck_z",
             ],
+        },
+        "teleop.vr_3pt_orientation_wxyz": {
+            "dtype": "float32",
+            "shape": (12,),
+            "names": [
+                f"{source}_q{component}"
+                for source in ("lwrist", "rwrist", "head")
+                for component in ("w", "x", "y", "z")
+            ],
+        },
+        "teleop.vr_3pt_valid": {
+            "dtype": "uint8",
+            "shape": (1,),
+            "names": ["vr_3pt_valid"],
+        },
+        "teleop.smpl_valid": {
+            "dtype": "uint8",
+            "shape": (1,),
+            "names": ["smpl_valid"],
+        },
+        "teleop.control_mode": {
+            "dtype": "uint8",
+            "shape": (1,),
+            "names": ["manipulation_0_locomotion_1_combined_2_unknown_255"],
+        },
+        "teleop.locomotion_speed_m_s": {
+            "dtype": "float32",
+            "shape": (1,),
+            "names": ["configured_locomotion_speed_m_s_or_minus_1"],
+        },
+        "capture.robot_state_sequence": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["robot_state_sequence"],
+        },
+        "capture.robot_state_source_timestamp_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["robot_state_source_timestamp_ns"],
+        },
+        "capture.robot_state_sample_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["robot_state_sample_monotonic_ns"],
+        },
+        "capture.robot_state_publish_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["robot_state_publish_monotonic_ns"],
+        },
+        "capture.robot_state_received_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["robot_state_received_monotonic_ns"],
+        },
+        "capture.camera_sequence": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["camera_sequence"],
+        },
+        "capture.camera_source_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["camera_source_monotonic_ns"],
+        },
+        "capture.camera_sample_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["camera_sample_monotonic_ns"],
+        },
+        "capture.camera_publish_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["camera_publish_monotonic_ns"],
+        },
+        "capture.camera_received_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["camera_received_monotonic_ns"],
+        },
+        "capture.hand_state_sequence": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["hand_controller_sequence"],
+        },
+        "capture.hand_state_publish_sequence": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["hand_state_publish_sequence"],
+        },
+        "capture.hand_state_source_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["hand_state_source_monotonic_ns"],
+        },
+        "capture.hand_state_publish_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["hand_state_publish_monotonic_ns"],
+        },
+        "capture.hand_state_received_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["hand_state_received_monotonic_ns"],
+        },
+        "capture.hand_intent_sequence": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["hand_intent_sequence"],
+        },
+        "capture.hand_intent_source_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["hand_intent_source_monotonic_ns"],
+        },
+        "capture.hand_intent_received_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["hand_intent_received_monotonic_ns"],
+        },
+        "capture.pico_pose_sequence": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["pico_pose_sequence"],
+        },
+        "capture.pico_pose_sample_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["pico_pose_sample_monotonic_ns"],
+        },
+        "capture.pico_pose_publish_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["pico_pose_publish_monotonic_ns"],
+        },
+        "capture.pico_pose_received_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["pico_pose_received_monotonic_ns"],
+        },
+        "capture.planner_publish_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["planner_publish_monotonic_ns"],
+        },
+        "capture.planner_received_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["planner_received_monotonic_ns"],
+        },
+        "capture.manager_publish_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["manager_publish_monotonic_ns"],
+        },
+        "capture.manager_received_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["manager_received_monotonic_ns"],
         },
         "teleop.vr_3pt_orientation": {
             "dtype": "float32",

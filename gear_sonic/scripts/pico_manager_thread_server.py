@@ -138,6 +138,17 @@ class StreamMode(Enum):
     PLANNER_FROZEN_UPPER_BODY = 3
     POSE_PAUSE = 4
     PLANNER_VR_3PT = 5
+    PLANNER_IK_UPPER = 6
+
+
+PLANNER_STREAM_MODES = frozenset(
+    {
+        StreamMode.PLANNER,
+        StreamMode.PLANNER_FROZEN_UPPER_BODY,
+        StreamMode.PLANNER_VR_3PT,
+        StreamMode.PLANNER_IK_UPPER,
+    }
+)
 
 
 class FaceChordTracker:
@@ -1196,6 +1207,11 @@ class ThreePointPose:
         return self._calibration_pending
 
     @property
+    def robot_model(self):
+        """Shared G1 model used by calibration and arm IK."""
+        return self._robot_model
+
+    @property
     def is_calibrated(self) -> bool:
         """Check if calibration has been captured."""
         return self._calibration_neck_quat_inv is not None
@@ -1694,6 +1710,9 @@ class PoseStreamer:
                 "timestamp_monotonic": np.array(
                     [sample.get("timestamp_monotonic", 0.0)], dtype=np.float64
                 ),
+                "publisher_monotonic_ns": np.array(
+                    [time.monotonic_ns()], dtype=np.int64
+                ),
                 "left_hand_joints": left_hand_joints.reshape(-1).astype(np.float32),
                 "right_hand_joints": right_hand_joints.reshape(-1).astype(np.float32),
                 "toggle_data_collection": np.array([toggle_data_collection], dtype=bool),
@@ -1907,6 +1926,7 @@ class FeedbackReader:
         # Full body joint configuration (29 DOFs) as measured from robot,
         # used for FK when recalibrating VR 3PT tracking against actual robot pose
         self.full_body_q_measured: np.ndarray | None = None
+        self.last_body_feedback_monotonic: float | None = None
 
     def _get_upper_body_joint_indices(self) -> list[int]:
         # TODO: get from robot model, not hardcoded
@@ -1914,15 +1934,23 @@ class FeedbackReader:
         # return robot_model.get_joint_group_indices("upper_body")
         return [12, 13, 14, 15, 22, 16, 23, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28]
 
-    def poll_feedback(self):
-        """Poll for feedback once, and update internal state."""
-        (
-            self.upper_body_position_target,
-            self.left_hand_position_target,
-            self.right_hand_position_target,
-            self.full_body_q_measured,
-        ) = self._process_upper_body_position_targets()
-        print("[PlannerLoop] Saved upper body position target:", self.upper_body_position_target)
+    def poll_feedback(self, *, retain_last: bool = False) -> bool:
+        """Poll once and report whether a complete body sample was received."""
+        upper_body, left_hand, right_hand, full_body = (
+            self._process_upper_body_position_targets()
+        )
+        if full_body is None and retain_last:
+            return False
+        self.upper_body_position_target = upper_body
+        self.left_hand_position_target = left_hand
+        self.right_hand_position_target = right_hand
+        self.full_body_q_measured = full_body
+        if full_body is None:
+            self.last_body_feedback_monotonic = None
+            return False
+        self.last_body_feedback_monotonic = time.monotonic()
+        print("[PlannerLoop] Saved upper body position target:", upper_body)
+        return True
 
     def _process_upper_body_position_targets(
         self,
@@ -1966,10 +1994,11 @@ class PlannerStreamer:
         socket,
         reader: "PicoReader | input_readers.IsaacTeleopReader",
         three_point: ThreePointPose,
-        poll_hz: int = 20,
+        poll_hz: int = 50,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
         initial_mode: LocomotionMode = LocomotionMode.IDLE,
+        ik_upper_body: bool = False,
     ):
         self.socket = socket
         self.reader = reader
@@ -1984,11 +2013,15 @@ class PlannerStreamer:
         self.mode = LocomotionMode(initial_mode)
         # Persistent facing buffer (unit vector on XY plane)
         self.yaw_accumulator = YawAccumulator()
-        self.last_send = time.time()
         self.last_xrt_timestamp = None
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        self.ik_upper_body = None
+        if ik_upper_body:
+            from gear_sonic.utils.teleop.ik_upper_body import IkUpperBodyRetargeter
+
+            self.ik_upper_body = IkUpperBodyRetargeter(three_point.robot_model)
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -2018,13 +2051,40 @@ class PlannerStreamer:
             )
             self.three_point.reset_with_measured_q(np.zeros(29, dtype=np.float64))
 
-    def run_once(self, stream_mode: StreamMode, *, face_command: str | None = None):
+    def prepare_ik_upper_body(self) -> bool:
+        """Seed calibrated arm IK from fresh measured robot feedback."""
+        if self.ik_upper_body is None:
+            raise RuntimeError("upper-body IK was not initialized")
+        deadline = time.monotonic() + 0.1
+        while (
+            not self.feedback_reader.poll_feedback(retain_last=True)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        measured_q = self.feedback_reader.full_body_q_measured
+        received_at = self.feedback_reader.last_body_feedback_monotonic
+        if (
+            measured_q is None
+            or received_at is None
+            or time.monotonic() - received_at > 0.25
+        ):
+            print(
+                "[PlannerLoop] Cannot enter upper-body IK mode without fresh "
+                "29-DOF robot feedback"
+            )
+            return False
+        self.three_point.reset_with_measured_q(measured_q)
+        self.ik_upper_body.reset(measured_q)
+        print("[PlannerLoop] Upper-body IK seeded from measured robot pose")
+        return True
+
+    def run_once(self, stream_mode: StreamMode, *, face_command: str | None = None) -> bool:
         """Execute one iteration of the planner control loop."""
         try:
             # Avoid sending old commands if XRT timestamp hasn't advanced, in case of headset disconnect
             xrt_timestamp = self.reader.get_timestamp_ns()
             if xrt_timestamp == self.last_xrt_timestamp:
-                return
+                return False
             self.last_xrt_timestamp = xrt_timestamp
 
             # Face chords are disambiguated by the manager and confirmed on
@@ -2073,10 +2133,14 @@ class PlannerStreamer:
             movement = [movement_global[0], movement_global[1], 0.0]
 
             upper_body_position = None
+            upper_body_velocity = None
+            upper_body_mask = None
             left_hand_position = None
             right_hand_position = None
             if stream_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 upper_body_position = self.feedback_reader.upper_body_position_target
+                if upper_body_position is not None:
+                    upper_body_velocity = np.zeros(17, dtype=np.float32)
                 left_hand_position = self.feedback_reader.left_hand_position_target
                 right_hand_position = self.feedback_reader.right_hand_position_target
 
@@ -2086,7 +2150,6 @@ class PlannerStreamer:
             if stream_mode == StreamMode.PLANNER_VR_3PT:
                 sample = self.reader.get_latest()
                 if sample is not None:
-                    print("[PlannerLoop] Sending VR 3-point pose as target")
                     vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
                     vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
                     vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
@@ -2111,6 +2174,17 @@ class PlannerStreamer:
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
 
+            if stream_mode == StreamMode.PLANNER_IK_UPPER:
+                if self.ik_upper_body is None:
+                    raise RuntimeError("upper-body IK was not initialized")
+                sample = self.reader.get_latest()
+                if sample is None:
+                    return False
+                vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
+                upper_body_position, upper_body_velocity, upper_body_mask = (
+                    self.ik_upper_body.update(vr_3pt_pose)
+                )
+
             msg = build_planner_message(
                 mode_to_send.value,
                 movement,
@@ -2118,26 +2192,23 @@ class PlannerStreamer:
                 speed=speed,
                 height=-1.0,
                 upper_body_position=upper_body_position,
+                upper_body_velocity=upper_body_velocity,
+                upper_body_mask=upper_body_mask,
                 left_hand_position=left_hand_position,
                 right_hand_position=right_hand_position,
                 vr_3pt_position=vr_3pt_position,
                 vr_3pt_orientation=vr_3pt_orientation,
                 vr_3pt_compliance=vr_3pt_compliance,
+                publisher_monotonic_ns=time.monotonic_ns(),
             )
             self.socket.send(msg)
+            return True
         except Exception as e:
             import traceback
 
             print(f"[PlannerLoop] error: {e}")
             traceback.print_exc()
             raise
-
-        # pacing
-        now = time.time()
-        sleep_t = self.dt - (now - self.last_send)
-        if sleep_t > 0:
-            time.sleep(sleep_t)
-        self.last_send = time.time()
 
 
 def run_pico_manager(
@@ -2162,17 +2233,17 @@ def run_pico_manager(
     recording_status_port: int = 5581,
 ):
     """
-    Manager: publishes body and latest-only hand intent on separate sockets.
+    Manager: publishes body and latest-only hand intent from one fixed-rate loop.
     Controller input:
-      A+X: Toggle between planner and pose mode
+      A+X: Toggle between planner and the launch-selected teleop mode
       A+B+X+Y: Start the policy from OFF
-      B+Y: Toggle pose/frozen-upper-body mode
+      B+Y: Freeze/unfreeze the upper body
       X+B: Start/stop-success recording
       Y+A: Discard active recording
     """
     reader = _init_input_source(input_source, buffer_size)
-    if teleop_mode not in {"pose", "vr3pt"}:
-        raise ValueError("teleop_mode must be 'pose' or 'vr3pt'")
+    if teleop_mode not in {"pose", "vr3pt", "ik-upper"}:
+        raise ValueError("teleop_mode must be 'pose', 'vr3pt', or 'ik-upper'")
     try:
         initial_mode = LocomotionMode[initial_locomotion_mode.upper()]
     except KeyError as exc:
@@ -2186,9 +2257,11 @@ def run_pico_manager(
         LocomotionMode.RUN,
     }:
         raise ValueError("initial_locomotion_mode must be idle, slow_walk, walk, or run")
-    teleop_stream_mode = (
-        StreamMode.PLANNER_VR_3PT if teleop_mode == "vr3pt" else StreamMode.POSE
-    )
+    teleop_stream_mode = {
+        "pose": StreamMode.POSE,
+        "vr3pt": StreamMode.PLANNER_VR_3PT,
+        "ik-upper": StreamMode.PLANNER_IK_UPPER,
+    }[teleop_mode]
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -2205,7 +2278,8 @@ def run_pico_manager(
     time.sleep(0.1)
     print(
         f"[Manager] Body ZMQ socket bound to port {port}; "
-        f"latest-only hand intent bound to port {hand_intent_port}"
+        f"latest-only hand intent bound to port {hand_intent_port}; "
+        f"target rate {target_fps} Hz"
     )
 
     # Print available locomotion modes
@@ -2239,10 +2313,11 @@ def run_pico_manager(
         socket=socket,
         reader=reader,
         three_point=three_point,
-        poll_hz=20,
+        poll_hz=target_fps,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
         initial_mode=initial_mode,
+        ik_upper_body=teleop_mode == "ik-upper",
     )
     hand_intent = HandIntentStream()
 
@@ -2251,6 +2326,10 @@ def run_pico_manager(
     #   With --teleop-mode vr3pt (data-collection default):
     #     OFF --(A+B+X+Y)--> PLANNER <--(A+X)--> PLANNER_VR_3PT
     #     PLANNER_VR_3PT <--(B+Y)--> PLANNER_FROZEN_UPPER_BODY
+    #
+    #   With --teleop-mode ik-upper:
+    #     OFF --(A+B+X+Y)--> PLANNER <--(A+X)--> PLANNER_IK_UPPER
+    #     PLANNER_IK_UPPER <--(B+Y)--> PLANNER_FROZEN_UPPER_BODY
     #
     #   With --teleop-mode pose, retain the legacy two chains below.
     #
@@ -2280,6 +2359,12 @@ def run_pico_manager(
     recorder_is_recording = False
     recorder_command_timestamp = 0.0
     face_chords = FaceChordTracker()
+    manager_period = 1.0 / max(target_fps, 1)
+    manager_deadline = time.monotonic()
+    rate_report_started = manager_deadline
+    manager_report_count = 0
+    planner_report_count = 0
+    manager_deadline_misses = 0
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
@@ -2307,6 +2392,9 @@ def run_pico_manager(
                                 ),
                                 "toggle_data_collection": np.array([False], dtype=bool),
                                 "toggle_data_abort": np.array([False], dtype=bool),
+                                "publisher_monotonic_ns": np.array(
+                                    [time.monotonic_ns()], dtype=np.int64
+                                ),
                             },
                             topic="manager_state",
                         )
@@ -2331,6 +2419,7 @@ def run_pico_manager(
                     "teleop remains OFF. "
                     "Use A+B+X+Y to recalibrate/start when ready."
                 )
+                manager_deadline = time.monotonic()
                 continue
 
             # Poll Pico controller for buttons/axes
@@ -2356,7 +2445,7 @@ def run_pico_manager(
             )
             start_combo = bool(a_pressed) and bool(b_pressed) and bool(x_pressed) and bool(y_pressed)
 
-            # A+X remains exclusively the POSE/PLANNER mode gesture.
+            # A+X toggles the launch-selected teleop mode against PLANNER.
             ax_pressed = face_command == "ax"
 
             # B+Y freezes both upper body and external OmniHands until toggled off.
@@ -2420,6 +2509,18 @@ def run_pico_manager(
                         else StreamMode.POSE
                     )
 
+            elif current_mode == StreamMode.PLANNER_IK_UPPER:
+                if ax_pressed and not prev_ax_pressed:
+                    new_mode = StreamMode.PLANNER
+                elif by_pressed and not prev_by_pressed:
+                    new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY
+
+            discard_for_mode_exit = (
+                recorder_is_recording
+                and current_mode == teleop_stream_mode
+                and new_mode != current_mode
+            )
+
             # Handle mode transitions before running loop
             if new_mode != current_mode:
                 if current_mode == StreamMode.POSE:
@@ -2432,43 +2533,45 @@ def run_pico_manager(
 
                 if new_mode == StreamMode.POSE:
                     pose_streamer.reset_yaw()
-                elif new_mode == StreamMode.PLANNER and current_mode != StreamMode.PLANNER_VR_3PT:
+                elif new_mode == StreamMode.PLANNER and current_mode not in {
+                    StreamMode.PLANNER_VR_3PT,
+                    StreamMode.PLANNER_IK_UPPER,
+                }:
                     # Only reset yaw when freshly entering PLANNER from POSE,
                     # not when returning from VR_3PT sub-mode
                     planner_streamer.reset_yaw()
                 elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                    if current_mode != StreamMode.PLANNER_VR_3PT:
+                    if current_mode not in {
+                        StreamMode.PLANNER_VR_3PT,
+                        StreamMode.PLANNER_IK_UPPER,
+                    }:
                         # Freshly entering from POSE: reset yaw and grab initial targets
                         planner_streamer.reset_yaw()
                     # Always re-grab the latest robot state as frozen targets,
-                    # whether entering from POSE or returning from VR_3PT
-                    # (the old targets are stale after VR_3PT moved the arms)
+                    # whether entering from POSE or returning from tracked arms
+                    # (the old targets are stale after a tracking mode moved them)
                     planner_streamer.save_upper_body_position_target()
                 elif new_mode == StreamMode.PLANNER_VR_3PT:
                     # Recalibrate VR tracking against the robot's actual current pose
                     # (read via g1_debug feedback + FK) to prevent sudden jumps
                     planner_streamer.recalibrate_for_vr3pt()
+                elif new_mode == StreamMode.PLANNER_IK_UPPER:
+                    if not planner_streamer.prepare_ik_upper_body():
+                        new_mode = current_mode
 
             # Run one iteration of the new mode
             if new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
-            elif (
-                new_mode == StreamMode.PLANNER
-                or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
-                or new_mode == StreamMode.PLANNER_VR_3PT
-            ):
-                planner_streamer.run_once(
+            elif new_mode in PLANNER_STREAM_MODES:
+                planner_sent = planner_streamer.run_once(
                     new_mode,
                     face_command=face_command,
                 )
+                planner_report_count += int(planner_sent)
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if new_mode != current_mode:
-                if (
-                    new_mode == StreamMode.PLANNER
-                    or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
-                    or new_mode == StreamMode.PLANNER_VR_3PT
-                ):
+                if new_mode in PLANNER_STREAM_MODES:
                     socket.send(build_command_message(start=True, stop=False, planner=True))
                 elif new_mode == StreamMode.POSE:
                     socket.send(build_command_message(start=True, stop=False, planner=False))
@@ -2477,8 +2580,16 @@ def run_pico_manager(
                 current_mode = new_mode
 
             # Mode-independent: send manager_state for data exporter
-            toggle_dc = face_command == "xb"
-            toggle_da = face_command == "ya"
+            toggle_dc_requested = face_command == "xb"
+            toggle_dc = toggle_dc_requested and (
+                recorder_is_recording or current_mode == teleop_stream_mode
+            )
+            toggle_da = face_command == "ya" or discard_for_mode_exit
+            if toggle_dc_requested and not toggle_dc:
+                print(
+                    "[Manager] Recorder start rejected: use A+X to enter "
+                    f"{teleop_stream_mode.name} first"
+                )
             if toggle_dc:
                 recorder_is_recording = not recorder_is_recording
                 recorder_command_timestamp = time.time()
@@ -2489,21 +2600,27 @@ def run_pico_manager(
             elif toggle_da:
                 recorder_is_recording = False
                 recorder_command_timestamp = time.time()
-                print("[Manager] Recorder Y+A -> discard")
+                if discard_for_mode_exit:
+                    print(
+                        "[Manager] Recorder auto-discard: exited required "
+                        f"{teleop_stream_mode.name} mode"
+                    )
+                else:
+                    print("[Manager] Recorder Y+A -> discard")
             socket.send(
                 pack_pose_message(
                     {
                         "stream_mode": np.array([current_mode.value], dtype=np.int32),
                         "toggle_data_collection": np.array([toggle_dc], dtype=bool),
                         "toggle_data_abort": np.array([toggle_da], dtype=bool),
+                        "publisher_monotonic_ns": np.array(
+                            [time.monotonic_ns()], dtype=np.int64
+                        ),
                     },
                     topic="manager_state",
                 )
             )
-
-            # The dedicated hand socket and conflating subscriber keep exactly
-            # the newest intent even when bilateral SDK calls are slower than
-            # the Pico stream. Stalled timestamps remain invalid, not open.
+            manager_report_count += 1
             hand_intent.publish(
                 hand_socket,
                 reader,
@@ -2515,12 +2632,32 @@ def run_pico_manager(
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
 
-            # Active pose/planner streamers pace their own loops. OFF and
-            # POSE_PAUSE do not, so pace them here to avoid flooding the shared
-            # PUB socket with repeated headset timestamps and starving the
-            # freshness-qualified hand-intent frames.
-            if new_mode in {StreamMode.OFF, StreamMode.POSE_PAUSE}:
-                time.sleep(1.0 / max(target_fps, 1))
+            # Pace every manager mode from one monotonic scheduler. Planner no
+            # longer owns a separate 20 Hz sleep, so planner and manager state
+            # share the requested (normally 50 Hz) cadence without drift.
+            manager_deadline += manager_period
+            now = time.monotonic()
+            remaining = manager_deadline - now
+            if remaining > 0:
+                time.sleep(remaining)
+            elif -remaining >= manager_period:
+                skipped = int((-remaining) / manager_period) + 1
+                manager_deadline_misses += skipped
+                manager_deadline += skipped * manager_period
+                time.sleep(max(0.0, manager_deadline - time.monotonic()))
+
+            report_now = time.monotonic()
+            report_elapsed = report_now - rate_report_started
+            if report_elapsed >= 5.0:
+                print(
+                    f"[Manager] manager_state/hand_intent: "
+                    f"{manager_report_count / report_elapsed:.2f} Hz; "
+                    f"planner: {planner_report_count / report_elapsed:.2f} Hz; "
+                    f"deadline misses: {manager_deadline_misses}"
+                )
+                rate_report_started = report_now
+                manager_report_count = 0
+                planner_report_count = 0
 
     except KeyboardInterrupt:
         print("\nStopping manager...")
@@ -2651,9 +2788,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--teleop-mode",
-        choices=["pose", "vr3pt"],
+        choices=["pose", "vr3pt", "ik-upper"],
         default="pose",
-        help="A+X teleop mode: legacy full-body pose or upper-body VR 3-point",
+        help=(
+            "A+X teleop mode: full-body pose, learned VR 3-point planner, "
+            "or deterministic arm IK with planner-owned legs/waist"
+        ),
     )
     parser.add_argument(
         "--initial-locomotion-mode",

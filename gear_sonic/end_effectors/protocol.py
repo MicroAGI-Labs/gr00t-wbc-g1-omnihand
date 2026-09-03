@@ -10,11 +10,15 @@ import msgpack
 HAND_INTENT_TOPIC = b"hand_intent"
 HAND_CONFIG_TOPIC = b"hand_config"
 HAND_STATE_TOPIC = b"hand_state"
+HAND_CONTROL_TOPIC = b"hand_control"
 HAND_SIM_FEEDBACK_TOPIC = b"hand_sim_feedback"
 DEFAULT_HAND_INTENT_PORT = 5569
+DEFAULT_HAND_STATE_PORT = 5570
+DEFAULT_HAND_CONTROL_PORT = 5572
 HAND_INTENT_SCHEMA = "sonic.hand_intent.v2"
 HAND_CONFIG_SCHEMA = "sonic.hand_config.v1"
 HAND_STATE_SCHEMA = "sonic.hand_state.v1"
+HAND_CONTROL_SCHEMA = "sonic.hand_control.v1"
 HAND_SIM_FEEDBACK_SCHEMA = "sonic.hand_sim_feedback.v1"
 
 
@@ -71,6 +75,16 @@ def decode_config(raw: bytes) -> dict[str, Any]:
 
 def decode_state(raw: bytes) -> dict[str, Any]:
     return decode(raw, HAND_STATE_TOPIC, HAND_STATE_SCHEMA)
+
+
+def decode_control(raw: bytes) -> dict[str, Any]:
+    payload = decode(raw, HAND_CONTROL_TOPIC, HAND_CONTROL_SCHEMA)
+    if payload.get("action") != "reconnect":
+        raise HandProtocolError("unsupported hand control action")
+    sequence = payload.get("sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        raise HandProtocolError("sequence must be an integer")
+    return payload
 
 
 def decode_sim_feedback(raw: bytes) -> dict[str, Any]:

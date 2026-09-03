@@ -3,6 +3,7 @@
 import base64
 from dataclasses import dataclass, field
 from enum import Enum
+import time
 from typing import Any
 
 import cv2
@@ -114,9 +115,18 @@ class ImageMessageSchema:
 
     timestamps: dict[str, float]
     images: dict[str, np.ndarray]
+    sample_monotonic_ns: int | None = None
+    publisher_sequence: int | None = None
+    publisher_monotonic_ns: int | None = None
 
     def serialize(self) -> dict[str, Any]:
-        serialized_msg: dict[str, Any] = {"timestamps": self.timestamps, "images": {}}
+        serialized_msg: dict[str, Any] = {
+            "timestamps": self.timestamps,
+            "images": {},
+            "sample_monotonic_ns": self.sample_monotonic_ns,
+            "publisher_sequence": self.publisher_sequence,
+            "publisher_monotonic_ns": self.publisher_monotonic_ns,
+        }
         for key, image in self.images.items():
             if isinstance(image, bytes | bytearray):
                 serialized_msg["images"][key] = image
@@ -140,10 +150,22 @@ class ImageMessageSchema:
                 images[key] = m.decode(value)
             else:
                 images[key] = value
-        return ImageMessageSchema(timestamps=timestamps, images=images)
+        return ImageMessageSchema(
+            timestamps=timestamps,
+            images=images,
+            sample_monotonic_ns=data.get("sample_monotonic_ns"),
+            publisher_sequence=data.get("publisher_sequence"),
+            publisher_monotonic_ns=data.get("publisher_monotonic_ns"),
+        )
 
     def asdict(self) -> dict[str, Any]:
-        return {"timestamps": self.timestamps, "images": self.images}
+        return {
+            "timestamps": self.timestamps,
+            "images": self.images,
+            "sample_monotonic_ns": self.sample_monotonic_ns,
+            "publisher_sequence": self.publisher_sequence,
+            "publisher_monotonic_ns": self.publisher_monotonic_ns,
+        }
 
 
 # =============================================================================
@@ -168,8 +190,21 @@ class SensorServer:
         self.context.term()
 
     def send_message(self, data: dict[str, Any]):
+        payload = dict(data)
+        published_wall_s = time.time()
+        published_monotonic_ns = time.monotonic_ns()
+        capture_times = [
+            float(value)
+            for value in payload.get("timestamps", {}).values()
+            if isinstance(value, (int, float, np.number)) and np.isfinite(value) and value > 0
+        ]
+        if capture_times:
+            capture_age_ns = int(max(0.0, published_wall_s - max(capture_times)) * 1e9)
+            payload["sample_monotonic_ns"] = published_monotonic_ns - capture_age_ns
+        payload["publisher_sequence"] = self.message_sent + 1
+        payload["publisher_monotonic_ns"] = published_monotonic_ns
         try:
-            packed = msgpack.packb(data, use_bin_type=True)
+            packed = msgpack.packb(payload, use_bin_type=True)
             self.socket.send(packed, flags=zmq.NOBLOCK)
         except zmq.Again:
             self.message_dropped += 1

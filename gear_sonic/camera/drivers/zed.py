@@ -41,6 +41,7 @@ class ZEDConfig:
     image_dim: tuple[int, int] = (640, 480)
     camera_resolution: str = "HD720"
     camera_fps: int = 60
+    rotate_180: bool = False
 
     def __post_init__(self):
         if len(self.image_dim) != 2 or min(self.image_dim) <= 0:
@@ -143,7 +144,9 @@ class ZEDSensor(Sensor):
 
         # VIEW.LEFT is BGRA. Reordering also makes an owned, contiguous RGB copy;
         # the SDK-owned Mat buffer may be overwritten by the next grab().
-        image_rgb = np.ascontiguousarray(image_bgra[..., 2::-1])
+        image_rgb = np.ascontiguousarray(
+            image_bgra[::-1, ::-1, 2::-1] if self.config.rotate_180 else image_bgra[..., 2::-1]
+        )
 
         timestamp_ns = self._camera.get_timestamp(self._sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
         capture_time = timestamp_ns / 1e9 if timestamp_ns > 0 else time.time()

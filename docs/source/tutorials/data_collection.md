@@ -199,6 +199,9 @@ flowchart LR
 | C++ deployment | Thor | `g1_debug` | 5557 | Joint positions, velocities, IMU quaternion |
 | C++ deployment | Thor | `robot_config` | 5557 | Robot configuration at startup |
 | PICO teleop streamer | Thor | `pose` | 5556 | SMPL body parameters |
+| PICO teleop streamer | Thor | `hand_intent` | 5569 | Latest left/right open-close intent |
+| OmniHand controller | Thor | `hand_state` | 5570 | Hand connection, feedback, and health state |
+| Browser UI | Thor | `hand_control` | 5572 | Manual clean-reconnect request |
 | Camera server | Thor | *(raw TCP)* | 5555 | JPEG-compressed camera images |
 
 ---
@@ -246,6 +249,14 @@ python gear_sonic/scripts/launch_data_collection.py \
     --record-wrist-cameras
 ```
 
+**With physical OmniHands and the browser controls:**
+
+```bash
+python gear_sonic/scripts/launch_data_collection.py \
+    --hand-backend omnihand \
+    --remote-ui
+```
+
 ```{tip}
 No need to activate a virtual environment first — the launcher automatically detects and uses `.venv_data_collection` if the required dependencies are not in the current Python.
 ```
@@ -261,7 +272,12 @@ Common options:
 | `--sim / --no-sim` | `False` | Run deploy.sh in sim mode (also starts the sim loop) |
 | `--camera-host` | `localhost` | Camera server host; set the Thor IP only for a remote client |
 | `--camera-port` | `5555` | Camera server port |
+| `--remote-ui` | `False` | Serve camera, recording, and hand recovery controls on loopback |
 | `--no-camera-viewer` | *(viewer on)* | Disable the camera viewer pane |
+| `--body-control-mode` | `vr3pt-slow-planner` | `vr3pt-slow-planner`, `ik-upper-slow-planner`, or `full-smpl` |
+| `--omnihand-close-scale` | `1.0` | Use the full calibrated OmniHand closing range |
+| `--omnihand-transition-duration` | `0.2` | Open/close transition duration in seconds |
+| `--hand-control-port` | `5572` | Manual hand reconnect command port |
 | `--data-exporter-frequency` | `50` | Recording frequency (Hz) |
 | `--deploy-checkpoint` | *(default)* | Custom checkpoint path for deploy.sh |
 | `--deploy-obs-config` | *(default)* | Custom observation config for deploy.sh |
@@ -272,9 +288,60 @@ Common options:
 
 Run `python gear_sonic/scripts/launch_data_collection.py --help` for all options.
 
+The three supported body-control configurations are selected at launch:
+
+```bash
+# Learned VR 3-point upper body + slow-walk planner (default)
+python gear_sonic/scripts/launch_data_collection.py \
+    --body-control-mode vr3pt-slow-planner
+
+# Deterministic PICO wrist-to-arm IK + slow-walk planner
+python gear_sonic/scripts/launch_data_collection.py \
+    --body-control-mode ik-upper-slow-planner
+
+# Existing learned full-body SMPL tracking; planner gait is used only in PLANNER mode
+python gear_sonic/scripts/launch_data_collection.py --body-control-mode full-smpl
+```
+
+In all three configurations, **A+B+X+Y** starts SONIC in PLANNER mode and
+**A+X** toggles the selected teleop mode. In `ik-upper`, PICO wrist targets
+are retargeted by the established arm IK solver, arm speed is limited during
+transitions, and SONIC's locomotion planner remains the sole owner of the legs
+and waist. Entering that mode requires fresh 29-DOF robot feedback; otherwise
+the manager stays in its current mode.
+
+After updating an existing checkout, rebuild the deployment and refresh the
+teleop environment once so the masked arm command and IK dependencies match:
+
+```bash
+bash install_scripts/install_pico.sh
+cmake --build gear_sonic_deploy/build --target g1_deploy_onnx_ref -j2
+```
+
 ```{tip}
 The launcher automatically enables **mouse support** in the tmux session — click to select panes, scroll with the mouse wheel, and drag to resize pane borders.
 ```
+
+#### OmniHand disconnect recovery
+
+The launcher automatically performs a clean hand-worker restart if either
+OmniHand loses feedback or its CAN transport fails. A process restart is used
+because the vendor SDK has no transport teardown API; this releases all native
+SDK state before both devices are admitted again. Reconnection begins from the
+measured hand positions, sends a zero-delta hold, discards intent queued during
+the outage, and waits for a fresh PICO hand command.
+
+When `--remote-ui` is enabled, the browser displays the current per-hand status
+and a **Reconnect Hands** button. Use the button if a hand is physically back
+online but automatic recovery has not completed. The button is handled by the
+parent supervisor, so it remains usable even when the native SDK worker is
+wedged. It requests the same clean worker restart and does not stop SONIC or
+the rest of the teleoperation stack.
+
+The browser also provides a red **Disconnect SONIC** button. It requires an
+explicit confirmation and sends Ctrl-C directly to the SONIC deployment pane,
+so it remains available during a PICO/XRT outage. The PICO face buttons remain
+start/mode controls and cannot stop a running deployment.
 
 **Session management:**
 
@@ -356,16 +423,19 @@ There are two ways to control recording: **PICO VR controllers** (recommended du
 
 | Input | Action |
 |---|---|
-| **X + B** | **Toggle on release** — starts a new episode, or stops and saves the current one |
+| **X + B** | **Toggle on release** — starts a new episode only while the A+X teleop mode is active, or stops and saves the current one |
 | **Y + A** | **Discard on release** — saves the active episode flagged for removal during post-processing |
 
-These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent of the mode-switching controls.
+Recording is locked to the launch-selected A+X teleop mode (POSE, VR3PT, or
+IK upper). Exiting that mode while recording—including toggling A+X again—
+automatically discards the active episode so generic planner or frozen frames
+cannot enter a successful take.
 
 **Keyboard over ZMQ:**
 
 | Key | Action |
 |---|---|
-| `c` | **Toggle** recording (same as X + B) |
+| `c` | **Toggle** recording (same as X + B; start requires the selected A+X mode) |
 | `x` | **Discard** episode (same as Y + A — flagged for removal) |
 
 ```{note}
@@ -446,6 +516,7 @@ outputs/2026-04-03-14-30-00-G1-robot01/
     ├── info.json                # Dataset metadata (fps, features, sizes)
     ├── modality.json            # GR00T modality configuration
     ├── episodes.jsonl           # Per-episode metadata
+    ├── episode_quality.jsonl    # Save-time validation and success status
     └── tasks.jsonl              # Task prompt definitions
 ```
 
@@ -455,16 +526,40 @@ Each frame contains:
 
 | Feature | Shape | Description |
 |---|---|---|
-| `observation.state.joint_position` | `(N,)` | Actuated joint positions (rad) |
-| `observation.state.joint_velocity` | `(N,)` | Actuated joint velocities (rad/s) |
-| `observation.state.body_rotation_6d` | `(6,)` | Base orientation (6D rotation) |
-| `observation.state.projected_gravity` | `(3,)` | Gravity vector in body frame |
+| `observation.state` | `(49,)` with OmniHand | Measured body and hand joint positions (rad) |
+| `observation.body_joint_velocity` | `(29,)` | Measured body joint velocities (rad/s) |
+| `observation.root_orientation` | `(4,)` | Base IMU quaternion (wxyz) |
+| `observation.base_angular_velocity` | `(3,)` | Base IMU angular velocity (rad/s) |
+| `observation.projected_gravity` | `(3,)` | Gravity vector in body frame |
+| `observation.omnihand_{left,right}_raw` | `(10,)` | Native measured OmniHand positions (rad) |
 | `observation.images.ego_view` | `(480, 640, 3)` | Ego camera image (saved as MP4 video) |
 | `observation.images.left_wrist` | `(480, 640, 3)` | Left wrist camera (only with `--record-wrist-cameras`) |
 | `observation.images.right_wrist` | `(480, 640, 3)` | Right wrist camera (only with `--record-wrist-cameras`) |
-| `action.joint_position` | `(N,)` | Teleop target joint positions |
-| `action.body_rotation_6d` | `(6,)` | Teleop target body rotation |
-| `annotation.human.action.task_description` | string | Task prompt for this frame |
+| `action.motion_token` | `(64,)` | SONIC universal motion token |
+| `teleop.{left,right}_hand_joints` | `(10,)` | Requested native OmniHand actions (rad) |
+| `action.omnihand_{left,right}_raw` | `(10,)` | Named copies of the requested native actions |
+| `control.hand_applied_position` | `(20,)` | Safety-limited command actually applied |
+| `episode.success` | `(1,)` | Successful save (`1`) or discarded/invalid (`0`) |
+| `capture.*` | `(1,)` | Source sequences and source/receive timestamps |
+| `task_index` | `(1,)` | Index of the language task in `tasks.jsonl` |
+
+The auxiliary velocity, raw-action, timing, and validity columns are retained
+for provenance but are not added to the default `UNITREE_G1_SONIC` modality.
+GR00T continues to train on the compact registered state/action contract.
+
+### Automatic episode quality gates
+
+While recording, stale camera, robot, active teleop, hand, malformed token,
+NaN, or wrong-shaped required samples are not admitted. A dropout after an
+episode has begun marks that episode invalid. On save, the recorder also checks
+required publisher rates and, for external-hand collection, verifies that at
+least one requested hand joint changed by `--minimum-hand-motion-rad` (default
+`0.02`). Invalid episodes are preserved with `episode.success = 0`, listed in
+`discarded_episode_indices`, and explained in `meta/episode_quality.jsonl`.
+
+Use `--no-require-hand-activity` only for a task that genuinely contains no
+hand motion. The minimum accepted source rate defaults to 45 Hz and can be
+changed with `--minimum-recording-rate-hz`.
 
 ---
 
@@ -510,10 +605,11 @@ python gear_sonic/scripts/process_dataset.py \
 ```
 
 ```{warning}
-If you collected data using **VR 3-point tracking mode** (VR_3PT), the
-`teleop.smpl_pose` column will be all zeros because VR_3PT uses raw VR
-positions/orientations instead of SMPL body parameters. In this case, you
-**must** disable SMPL cleaning to avoid dropping all frames:
+If you collected data using **VR 3-point tracking** or **upper-body IK**,
+the `teleop.smpl_pose` column will be all zeros because both planner modes use
+retargeted upper-body targets instead of sending a full-body SMPL motion to
+SONIC. In this case, you **must** disable SMPL cleaning to avoid dropping all
+frames:
 
     python gear_sonic/scripts/process_dataset.py \
         --dataset-path outputs/my_dataset \
