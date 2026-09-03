@@ -20,7 +20,7 @@ The same `zmq_manager` workflow can also drive the headset through Isaac Teleop 
 
 ```{admonition} Safety Warning
 :class: danger
-Whole-body teleoperation involves fast, agile motions. **Always** maintain a clear safety zone and keep a safety operator at the keyboard ready to trigger an emergency stop (**`O`** in the C++ terminal, or **A+B+X+Y** on the PICO controllers).
+Whole-body teleoperation involves fast, agile motions. **Always** maintain a clear safety zone and keep a safety operator ready to stop SONIC from the UI or terminate the control process (**`O`** in the C++ terminal). **A+B+X+Y is start-only and is not an emergency stop.**
 
 You **must wear tight-fitting pants or leggings** to guarantee line-of-sight for the foot trackers — loose or baggy clothing can make tracking fail unpredictably and may result in dangerous motion.
 ```
@@ -117,7 +117,7 @@ When you turn on the visualization, wait for a window to pop up showing a Unitre
 2. Press **A + B + X + Y** simultaneously to engage the control policy and run the initial full calibration (`CALIB_FULL`).
 3. Align your arms with the robot's current pose, then press **A + X** to enter full-body SMPL teleop (**POSE** mode). Move your arms and legs — the robot follows.
 4. Press **A + X** again to fall back to **PLANNER** (idle) mode.
-5. Press **A + B + X + Y** again to stop the robot.
+5. When finished, stop SONIC from the UI or terminate the control process.
 
 <figure style="margin: 1em 0;">
 <video width="100%" autoplay loop muted playsinline style="border-radius: 8px;">
@@ -158,13 +158,11 @@ The system has **4 operating modes** and **2 calibration types**.
 There are 4 modes and 2 control chains. Each chain forms a triangle: **A+X** (or **B+Y**) returns to POSE from *both* the planner node and its VR_3PT sub-mode.
 
 ```text
-  ┌──────────────────────────────────────┐
-  │  A+B+X+Y (any mode) ──► OFF          │
-  └──────────────────────────────────────┘
-
   Startup:
     OFF ──(A+B+X+Y)──► PLANNER ──(A+X)──► POSE
           CALIB_FULL
+
+  A+B+X+Y has no policy-control effect after startup.
 
   Chain 1 — G1 encoder listens to planner-generated full-body motion: PLANNER
 
@@ -252,7 +250,7 @@ Below is the **recovery procedure** — if you accidentally enter a badly calibr
 
 | Action | Button | Notes |
 |---|---|---|
-| **Start / Stop policy** | **A+B+X+Y** | First press: engage + CALIB_FULL. Again: emergency stop → OFF. |
+| **Start policy** | **A+B+X+Y** | From OFF: engage + CALIB_FULL. Ignored after startup. |
 | **Toggle POSE** | **A+X** | Switches between PLANNER ↔ POSE. OR from VR_3PT (entered via PLANNER) → POSE. |
 | **Toggle PLANNER_FROZEN_UPPER** | **B+Y** | Switches between POSE ↔ PLANNER_FROZEN_UPPER. OR from VR_3PT (entered via PLANNER_FROZEN_UPPER) → POSE. |
 | **Toggle VR_3PT** | **Left Stick Click** | From any Planner mode → VR_3PT (triggers CALIB). Click again to return. |
@@ -293,8 +291,14 @@ Active in **PLANNER**, **PLANNER_FROZEN_UPPER**, and **VR_3PT**:
 
 | Method | Action |
 |---|---|
-| **PICO controllers** | Press **A+B+X+Y** simultaneously → OFF |
+| **Operator UI** | Stop SONIC from the policy control UI |
 | **Keyboard** (C++ terminal) | Press **`O`** for immediate stop |
+| **Process control** | Terminate the SONIC control process |
+
+Loss of PICO body tracking suspends teleop input and returns the Python manager
+to **OFF**, but it does not terminate the SONIC deployment. SONIC remains active
+and the planner falls back to idle when its input times out. After tracking
+reconnects, use **A+B+X+Y** to recalibrate and re-enable teleop input.
 
 ---
 

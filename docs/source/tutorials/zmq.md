@@ -149,7 +149,7 @@ In `--input-type zmq` mode, the C++ deployment side does **not** process PICO co
 
 | PICO Button | Effect |
 |-------------|--------|
-| **A + B + X + Y** | Calibrate body tracking in the streamer. Press once to initialize; press again to stop streaming (emergency stop on the streamer side). |
+| **A + B + X + Y** | Initialize the manager streamer and calibrate body tracking from OFF. The gesture is ignored after startup and cannot stop SONIC. |
 | **A + X** | Toggle Pose mode in the streamer — starts or stops publishing pose data. When stopped, the robot holds its last pose. **Works as pause/resume.** |
 | **Menu (hold)** | Pauses pose streaming in the streamer while held. The robot holds its last pose until you release. **Works as pause.** Move back close to the robot's current pose before releasing. |
 | **Trigger** | Hand grasp — processed by the streamer and sent as `left_hand_joints` / `right_hand_joints` in the stream. |

@@ -2165,7 +2165,7 @@ def run_pico_manager(
     Manager: publishes body and latest-only hand intent on separate sockets.
     Controller input:
       A+X: Toggle between planner and pose mode
-      A+B+X+Y: Toggle policy start/stop
+      A+B+X+Y: Start the policy from OFF
       B+Y: Toggle pose/frozen-upper-body mode
       X+B: Start/stop-success recording
       Y+A: Discard active recording
@@ -2264,13 +2264,14 @@ def run_pico_manager(
     #                                                        |
     #                                                   (ax)--> POSE
     #
-    #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
+    #   A+B+X+Y is start-only. Once running, stop through the UI or terminate
+    #   the process; the headset gesture cannot transition back to OFF.
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
     print(
         f"Manager controls: A+X=toggle {teleop_mode.upper()} teleop, "
         "B+Y=frozen upper body, X+B=record/save, Y+A=discard, "
-        f"A+B+X+Y=start/stop policy; initial gait={initial_mode.name}"
+        f"A+B+X+Y=start policy (start-only); initial gait={initial_mode.name}"
     )
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
@@ -2286,14 +2287,18 @@ def run_pico_manager(
         prev_left_axis_click = False
         while True:
             if reader.disconnected:
-                print("[Manager] Teleop frames lost; forcing policy OFF")
+                print(
+                    "[Manager] Teleop frames lost; suspending teleop input. "
+                    "SONIC remains running."
+                )
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
                 current_mode = StreamMode.OFF
 
-                # Repeat the stop message because PUB/SUB delivery is best-effort.
+                # OFF is local manager state only. Never send stop=True from the
+                # headset process: SONIC lifetime is owned by the operator UI or
+                # direct process termination (for example Ctrl-C).
                 for _ in range(3):
-                    socket.send(build_command_message(start=False, stop=True, planner=True))
                     socket.send(
                         pack_pose_message(
                             {
@@ -2313,9 +2318,6 @@ def run_pico_manager(
                 else:
                     print("[Manager] Waiting for teleop input to reconnect...")
                     while reader.disconnected:
-                        socket.send(
-                            build_command_message(start=False, stop=True, planner=True)
-                        )
                         time.sleep(0.5)
 
                 hand_intent = HandIntentStream()
@@ -2325,7 +2327,8 @@ def run_pico_manager(
                 prev_left_axis_click = False
                 face_chords.reset()
                 print(
-                    "[Manager] Teleop reconnected; policy remains OFF. "
+                    "[Manager] Teleop reconnected; SONIC is still running and "
+                    "teleop remains OFF. "
                     "Use A+B+X+Y to recalibrate/start when ready."
                 )
                 continue
@@ -2374,17 +2377,13 @@ def run_pico_manager(
             elif current_mode == StreamMode.PLANNER:
                 # Data collection defaults A+X to upper-body VR_3PT while the
                 # legacy standalone manager can retain full-body POSE.
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
+                if ax_pressed and not prev_ax_pressed:
                     new_mode = teleop_stream_mode
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
+                if ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.PLANNER  # Enter chain 2
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY  # Enter chain 1
@@ -2392,17 +2391,13 @@ def run_pico_manager(
                     new_mode = StreamMode.POSE_PAUSE
 
             elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif by_pressed and not prev_by_pressed:
+                if by_pressed and not prev_by_pressed:
                     new_mode = teleop_stream_mode
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE_PAUSE:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif not left_menu_button:
+                if not left_menu_button:
                     new_mode = StreamMode.POSE
 
             elif current_mode == StreamMode.PLANNER_VR_3PT:
@@ -2410,9 +2405,7 @@ def run_pico_manager(
                 #   left_axis_click → return to parent (PLANNER or FROZEN)
                 #   ax_pressed      → POSE (chain 2 exit)
                 #   by_pressed      → POSE (chain 1 exit)
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif left_axis_click and not prev_left_axis_click:
+                if left_axis_click and not prev_left_axis_click:
                     new_mode = vr3pt_parent_mode  # Return to parent mode
                 elif ax_pressed and not prev_ax_pressed:
                     new_mode = (
@@ -2471,9 +2464,7 @@ def run_pico_manager(
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if new_mode != current_mode:
-                if new_mode == StreamMode.OFF:
-                    socket.send(build_command_message(start=False, stop=True, planner=True))
-                elif (
+                if (
                     new_mode == StreamMode.PLANNER
                     or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
                     or new_mode == StreamMode.PLANNER_VR_3PT
