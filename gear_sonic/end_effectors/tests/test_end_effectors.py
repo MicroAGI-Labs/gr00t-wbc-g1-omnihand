@@ -37,9 +37,31 @@ def test_o10_profile_has_exact_bilateral_contract():
     assert OMNIHAND_O10.width == 10
     assert OMNIHAND_O10.right.joint_names[0] == "R_thumb_roll_joint"
     assert OMNIHAND_O10.left.joint_names[-1] == "L_pinky_pip_joint"
+    expected_right_open = np.asarray(
+        (
+            0.5525805,
+            -0.7803525,
+            0.0013675,
+            -0.0759570,
+            0.0,
+            0.0,
+            0.0836715,
+            0.0004200,
+            0.0936660,
+            0.0004200,
+        )
+    )
+    mirror_sign = np.asarray((-1, -1, -1, -1, 1, 1, -1, 1, -1, 1))
+    np.testing.assert_allclose(OMNIHAND_O10.right.open_rad, expected_right_open)
+    np.testing.assert_allclose(
+        OMNIHAND_O10.left.open_rad,
+        expected_right_open * mirror_sign,
+    )
     for side in (OMNIHAND_O10.left, OMNIHAND_O10.right):
         assert np.all(np.asarray(side.closed_rad) >= np.asarray(side.lower_rad))
         assert np.all(np.asarray(side.closed_rad) <= np.asarray(side.upper_rad))
+        assert np.all(np.asarray(side.open_rad) >= np.asarray(side.lower_rad))
+        assert np.all(np.asarray(side.open_rad) <= np.asarray(side.upper_rad))
 
 
 def test_protocol_rejects_unknown_schema_and_bad_trigger():
@@ -77,10 +99,15 @@ def test_controller_holds_first_feedback_then_slews_independent_targets():
     assert controller.accept_intent(_intent(1, left_closed=True, right_closed=False), now=10.0)
     now[0] = 10.1
     state = controller.step(now=now[0])
-    np.testing.assert_allclose(state["sides"]["left"]["applied_position_rad"][0], -0.0164)
-    np.testing.assert_allclose(state["sides"]["right"]["applied_position_rad"], np.zeros(10))
+    np.testing.assert_allclose(
+        state["sides"]["left"]["applied_position_rad"][0],
+        OMNIHAND_O10.left.open_rad[0] - 0.1 * OMNIHAND_O10.left.velocity_rad_s[0],
+    )
+    np.testing.assert_allclose(
+        state["sides"]["right"]["applied_position_rad"], OMNIHAND_O10.right.open_rad
+    )
     assert state["sides"]["left"]["requested_position_rad"][0] == pytest.approx(
-        0.5 * OMNIHAND_O10.left.closed_rad[0]
+        OMNIHAND_O10.left.target(True, close_scale=0.5)[0]
     )
 
 

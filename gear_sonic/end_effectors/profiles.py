@@ -70,14 +70,53 @@ _O10_RIGHT_UPPER = (1.1213, 0.0453, 0.8412, 0.0, 1.4835, 1.4835, 0.1692, 1.4835,
 _O10_LEFT_LOWER = (-1.1213, -0.0453, -0.8412, 0.0, 0.0, 0.0, -0.1692, 0.0, -0.1850, 0.0)
 _O10_LEFT_UPPER = (0.0296, 1.6423, 0.0, 0.1640, 1.4835, 1.4835, 0.0, 1.4835, 0.0, 1.4835)
 _O10_VELOCITY = (0.164, 0.164, 0.308, 0.164, 0.308, 0.308, 0.164, 0.308, 0.164, 0.308)
+# Symmetric nominal pose derived by sign-reflecting the recorded powered base
+# poses into the right-hand convention and averaging each joint.  This removes
+# unit-specific offsets while retaining the safe thumb roll and ab/ad geometry.
+_O10_RIGHT_OPEN = (
+    0.5525805,
+    -0.7803525,
+    0.0013675,
+    -0.0759570,
+    0.0,
+    0.0,
+    0.0836715,
+    0.0004200,
+    0.0936660,
+    0.0004200,
+)
+_O10_LEFT_OPEN = (
+    -0.5525805,
+    0.7803525,
+    -0.0013675,
+    0.0759570,
+    0.0,
+    0.0,
+    -0.0836715,
+    0.0004200,
+    -0.0936660,
+    0.0004200,
+)
 _O10_RIGHT_CLOSED = (0.728845, -0.903265, 0.757080, 0.0, 1.335150, 1.335150, 0.0, 1.335150, 0.0, 1.335150)
 _O10_LEFT_CLOSED = (-0.728845, 0.903265, -0.757080, 0.0, 1.335150, 1.335150, 0.0, 1.335150, 0.0, 1.335150)
 
 OMNIHAND_O10 = HandProfile(
     "omnihand_o10.v1",
-    SideProfile(_O10_LEFT_NAMES, _O10_LEFT_LOWER, _O10_LEFT_UPPER, _O10_VELOCITY, (0.0,) * 10, _O10_LEFT_CLOSED),
     SideProfile(
-        _O10_RIGHT_NAMES, _O10_RIGHT_LOWER, _O10_RIGHT_UPPER, _O10_VELOCITY, (0.0,) * 10, _O10_RIGHT_CLOSED
+        _O10_LEFT_NAMES,
+        _O10_LEFT_LOWER,
+        _O10_LEFT_UPPER,
+        _O10_VELOCITY,
+        _O10_LEFT_OPEN,
+        _O10_LEFT_CLOSED,
+    ),
+    SideProfile(
+        _O10_RIGHT_NAMES,
+        _O10_RIGHT_LOWER,
+        _O10_RIGHT_UPPER,
+        _O10_VELOCITY,
+        _O10_RIGHT_OPEN,
+        _O10_RIGHT_CLOSED,
     ),
 )
 
