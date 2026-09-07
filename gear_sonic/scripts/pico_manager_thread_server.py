@@ -2449,6 +2449,7 @@ def run_pico_manager(
     recorder_command_timestamp = 0.0
     safe_idle_requested = False
     last_teleop_control_sequence = -1
+    policy_started = False
     face_chords = FaceChordTracker()
     ax_double_press = DoublePressTracker(window_seconds=2.0)
     manager_period = 1.0 / max(target_fps, 1)
@@ -2598,6 +2599,12 @@ def run_pico_manager(
                     StreamMode.PLANNER_IK_UPPER,
                 }:
                     requested_transition = StreamMode.PLANNER_IDLE_BASE_POSE
+                elif current_mode == StreamMode.OFF and policy_started:
+                    # A headset reconnect resets only the local FSM to OFF;
+                    # SONIC and the C++ timeout arm hold remain active. The UI
+                    # may therefore recover that hold through the normal base
+                    # pose path without restarting the policy.
+                    requested_transition = StreamMode.PLANNER_IDLE_BASE_POSE
                 elif current_mode == StreamMode.PLANNER_IDLE_BASE_POSE:
                     requested_transition = StreamMode.PLANNER
                 elif current_mode == StreamMode.PLANNER:
@@ -2612,6 +2619,7 @@ def run_pico_manager(
             elif current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.PLANNER
+                    policy_started = True
                     if planner_based_teleop:
                         print(
                             "[Manager] Planner started in IDLE; operator calibration "
