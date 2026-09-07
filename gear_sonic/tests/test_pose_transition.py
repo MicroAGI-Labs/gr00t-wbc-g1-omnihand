@@ -2,6 +2,8 @@ import numpy as np
 import pytest
 
 from gear_sonic.utils.teleop.pose_transition import (
+    IDLE_BASE_ELBOW_RAD,
+    IDLE_BASE_SHOULDER_PITCH_RAD,
     IDLE_BASE_UPPER_BODY_MASK,
     IDLE_BASE_UPPER_BODY_RAD,
     JointPoseTransition,
@@ -10,11 +12,22 @@ from gear_sonic.utils.teleop.pose_transition import (
 
 def test_idle_base_pose_has_rearward_elbows_and_neutral_wrists():
     assert IDLE_BASE_UPPER_BODY_RAD.shape == (17,)
-    # Positive shoulder pitch moves the elbows slightly behind the torso. Zero
-    # elbow is the physical 90-degree bend, and neutral wrists keep the hands
-    # parallel to their forearms with opposing palms.
-    np.testing.assert_allclose(IDLE_BASE_UPPER_BODY_RAD[3:5], 0.2)
-    np.testing.assert_allclose(IDLE_BASE_UPPER_BODY_RAD[5:], 0.0)
+    np.testing.assert_allclose(IDLE_BASE_SHOULDER_PITCH_RAD, np.deg2rad(20.0))
+    np.testing.assert_allclose(IDLE_BASE_ELBOW_RAD, np.deg2rad(20.0))
+    np.testing.assert_allclose(
+        IDLE_BASE_UPPER_BODY_RAD[3:11],
+        [
+            IDLE_BASE_SHOULDER_PITCH_RAD,
+            IDLE_BASE_SHOULDER_PITCH_RAD,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            IDLE_BASE_ELBOW_RAD,
+            IDLE_BASE_ELBOW_RAD,
+        ],
+    )
+    np.testing.assert_allclose(IDLE_BASE_UPPER_BODY_RAD[11:], 0.0)
     np.testing.assert_array_equal(
         IDLE_BASE_UPPER_BODY_MASK,
         np.asarray([False, False, False] + [True] * 14),

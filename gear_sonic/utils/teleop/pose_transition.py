@@ -5,28 +5,31 @@ from dataclasses import dataclass
 import numpy as np
 
 UPPER_BODY_WIDTH = 17
+IDLE_BASE_SHOULDER_PITCH_RAD = np.deg2rad(20.0)
+# The G1's zero elbow command is the physical 90-degree pose, so adding 20
+# degrees produces the requested physical 110-degree elbow angle.
+IDLE_BASE_ELBOW_RAD = np.deg2rad(20.0)
 
 # Upper-body order on the planner wire:
 # waist yaw/roll/pitch, interleaved left/right shoulder pitch/roll/yaw,
 # elbows, then interleaved wrist roll/pitch/yaw.
 #
-# In the G1 convention, zero elbow angle already gives a physical 90-degree
-# bend. A small positive shoulder pitch keeps the elbows slightly behind the
-# torso for balance. Neutral wrists keep both hands collinear with their
-# forearms; the mirrored palms face each other.
+# Shoulder pitch moves the complete arm behind the torso for balance. The elbow
+# offset opens the physical bend from 90 to 110 degrees. Neutral wrists keep
+# both hands collinear with their forearms; the mirrored palms face each other.
 IDLE_BASE_UPPER_BODY_RAD = np.asarray(
     [
         0.0,
         0.0,
         0.0,
-        0.2,
-        0.2,
+        IDLE_BASE_SHOULDER_PITCH_RAD,
+        IDLE_BASE_SHOULDER_PITCH_RAD,
         0.0,
         0.0,
         0.0,
         0.0,
-        0.0,
-        0.0,
+        IDLE_BASE_ELBOW_RAD,
+        IDLE_BASE_ELBOW_RAD,
         0.0,
         0.0,
         0.0,
