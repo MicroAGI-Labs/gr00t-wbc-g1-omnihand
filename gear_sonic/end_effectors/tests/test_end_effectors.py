@@ -140,33 +140,6 @@ def test_controller_completes_scaled_transition_in_one_second(close_scale):
     )
 
 
-def test_controller_does_not_queue_redundant_writes_after_reaching_target():
-    now = [0.0]
-    left = SimHandBackend(OMNIHAND_O10.left)
-    controller = SafeHandController(
-        OMNIHAND_O10,
-        {"left": left},
-        backend_name="sim",
-        close_scale=1.0,
-        target_timeout_s=2.0,
-        transition_duration_s=0.1,
-        clock=lambda: now[0],
-    )
-    controller.accept_intent(_intent(1, left_closed=True, right_closed=False), now=0.0)
-    now[0] = 0.1
-    controller.step(now=now[0])
-    writes_at_target = len(left.commands)
-
-    for sequence in range(2, 12):
-        now[0] += 0.1
-        controller.accept_intent(
-            _intent(sequence, left_closed=True, right_closed=False), now=now[0]
-        )
-        controller.step(now=now[0])
-
-    assert len(left.commands) == writes_at_target
-
-
 def test_communication_bit_is_reported_without_becoming_a_motor_fault():
     assert not _has_hard_motor_error([16] * 10)
     assert _has_hard_motor_error([0, 1])

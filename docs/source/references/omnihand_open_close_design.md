@@ -211,8 +211,6 @@ Watchdog/recovery:
 - Poll device health at about 5 Hz. Latch motor-fault bits 0-3 and leave
   tracking; report the SDK communication bit without latching it because live
   SDK read/write failures already enter the reconnect path.
-- Stop sending an all-joint command after its target is reached so the vendor
-  CAN queue cannot accumulate redundant old poses.
 - Publish temperature/current, but do not invent trip thresholds: vendor-approved
   limits remain a commissioning gate.
 

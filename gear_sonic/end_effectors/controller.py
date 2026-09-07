@@ -188,11 +188,8 @@ class SafeHandController:
                 target = np.clip(self.requested[side], side_profile.lower_rad, side_profile.upper_rad)
                 maximum = np.asarray(side_profile.velocity_rad_s) * self.velocity_scale[side] * dt
                 safe = self.applied[side] + np.clip(target - self.applied[side], -maximum, maximum)
-                # The vendor all-joint command expands into multiple CAN
-                # transactions. Do not queue the same reached pose repeatedly.
-                if not np.array_equal(safe, self.applied[side]):
-                    device.write_positions(safe)
-                    self.applied[side] = safe
+                device.write_positions(safe)
+                self.applied[side] = safe
             self.measured[side] = np.asarray(device.read_positions(), dtype=np.float64).copy()
             if self.measured[side].shape != (side_profile.width,) or not np.all(np.isfinite(self.measured[side])):
                 raise HandControllerError(f"{side} feedback became invalid")
