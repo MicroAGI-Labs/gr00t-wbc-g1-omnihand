@@ -29,6 +29,12 @@ from .protocol import (
 )
 
 STARTUP_FEEDBACK_TOLERANCE_RAD = 0.01
+HARD_MOTOR_ERROR_MASK = 0x0F
+
+
+def _has_hard_motor_error(masks: Sequence[int]) -> bool:
+    """Treat bits 0-3 as motor faults; bit 4 is communication telemetry."""
+    return any(int(mask) & HARD_MOTOR_ERROR_MASK for mask in masks)
 
 
 class HandControllerError(RuntimeError):
@@ -110,7 +116,7 @@ class SafeHandController:
             if np.any(np.abs(bounded - measured) > STARTUP_FEEDBACK_TOLERANCE_RAD):
                 raise HandControllerError(f"{side} startup feedback exceeds admitted limits")
             health = device.read_health()
-            if any(int(mask) != 0 for mask in health.get("error_masks", ())):
+            if _has_hard_motor_error(health.get("error_masks", ())):
                 raise HandControllerError(f"{side} reported a startup motor error")
             startup_positions[side] = bounded
             startup_health[side] = health
@@ -172,7 +178,7 @@ class SafeHandController:
             # before allowing a write to either hand in this cycle.
             for side, device in self.devices.items():
                 self.health[side] = device.read_health()
-                if any(int(mask) != 0 for mask in self.health[side].get("error_masks", ())):
+                if _has_hard_motor_error(self.health[side].get("error_masks", ())):
                     self.fault_latched = True
                     self.mode = "fault"
                     self.errors[side] = "non-zero motor error mask (latched)"
@@ -182,8 +188,11 @@ class SafeHandController:
                 target = np.clip(self.requested[side], side_profile.lower_rad, side_profile.upper_rad)
                 maximum = np.asarray(side_profile.velocity_rad_s) * self.velocity_scale[side] * dt
                 safe = self.applied[side] + np.clip(target - self.applied[side], -maximum, maximum)
-                device.write_positions(safe)
-                self.applied[side] = safe
+                # The vendor all-joint command expands into multiple CAN
+                # transactions. Do not queue the same reached pose repeatedly.
+                if not np.array_equal(safe, self.applied[side]):
+                    device.write_positions(safe)
+                    self.applied[side] = safe
             self.measured[side] = np.asarray(device.read_positions(), dtype=np.float64).copy()
             if self.measured[side].shape != (side_profile.width,) or not np.all(np.isfinite(self.measured[side])):
                 raise HandControllerError(f"{side} feedback became invalid")

@@ -15,6 +15,7 @@ from gear_sonic.end_effectors.controller import (
     HandControllerError,
     SafeHandController,
     TriggerHysteresis,
+    _has_hard_motor_error,
 )
 from gear_sonic.end_effectors.profiles import OMNIHAND_O10, HandSide
 from gear_sonic.end_effectors.protocol import (
@@ -137,6 +138,63 @@ def test_controller_completes_scaled_transition_in_one_second(close_scale):
         OMNIHAND_O10.left.target(True, close_scale),
         atol=1e-12,
     )
+
+
+def test_controller_does_not_queue_redundant_writes_after_reaching_target():
+    now = [0.0]
+    left = SimHandBackend(OMNIHAND_O10.left)
+    controller = SafeHandController(
+        OMNIHAND_O10,
+        {"left": left},
+        backend_name="sim",
+        close_scale=1.0,
+        target_timeout_s=2.0,
+        transition_duration_s=0.1,
+        clock=lambda: now[0],
+    )
+    controller.accept_intent(_intent(1, left_closed=True, right_closed=False), now=0.0)
+    now[0] = 0.1
+    controller.step(now=now[0])
+    writes_at_target = len(left.commands)
+
+    for sequence in range(2, 12):
+        now[0] += 0.1
+        controller.accept_intent(
+            _intent(sequence, left_closed=True, right_closed=False), now=now[0]
+        )
+        controller.step(now=now[0])
+
+    assert len(left.commands) == writes_at_target
+
+
+def test_communication_bit_is_reported_without_becoming_a_motor_fault():
+    assert not _has_hard_motor_error([16] * 10)
+    assert _has_hard_motor_error([0, 1])
+    assert _has_hard_motor_error([16, 18])
+
+    class CommunicationWarningBackend(SimHandBackend):
+        def read_health(self):
+            health = super().read_health()
+            health["error_masks"][0] = 16
+            return health
+
+    now = [0.0]
+    left = CommunicationWarningBackend(OMNIHAND_O10.left)
+    controller = SafeHandController(
+        OMNIHAND_O10,
+        {"left": left},
+        backend_name="sim",
+        target_timeout_s=1.0,
+        clock=lambda: now[0],
+    )
+    assert not controller.fault_latched
+    assert controller.accept_intent(
+        _intent(1, left_closed=True, right_closed=False), now=now[0]
+    )
+    now[0] = 0.2
+    state = controller.step(now=now[0])
+    assert state["mode"] == "tracking"
+    assert state["sides"]["left"]["error_masks"][0] == 16
 
 
 def test_controller_rejects_replayed_sequence_and_watchdog_holds():
