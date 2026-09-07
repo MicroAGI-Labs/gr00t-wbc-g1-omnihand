@@ -11,8 +11,8 @@ UPPER_BODY_WIDTH = 17
 # elbows, then interleaved wrist roll/pitch/yaw.
 #
 # In the G1 convention, zero elbow angle already puts the upper arm down and
-# forearm forward at a physical 90-degree bend. Opposite wrist-yaw angles then
-# point the OmniHand fingers toward each other.
+# forearm forward at a physical 90-degree bend. Neutral wrists keep both hands
+# collinear with their forearms; the mirrored palms face each other.
 IDLE_BASE_UPPER_BODY_RAD = np.asarray(
     [
         0.0,
@@ -30,8 +30,8 @@ IDLE_BASE_UPPER_BODY_RAD = np.asarray(
         0.0,
         0.0,
         0.0,
-        -np.pi / 2.0,
-        np.pi / 2.0,
+        0.0,
+        0.0,
     ],
     dtype=np.float64,
 )
