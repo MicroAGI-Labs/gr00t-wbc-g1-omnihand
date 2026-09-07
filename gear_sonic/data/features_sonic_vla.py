@@ -444,6 +444,37 @@ def get_features_sonic_vla(
                 "neck_r00", "neck_r10", "neck_r01", "neck_r11", "neck_r02", "neck_r12",
             ],
         },
+        "capture.sync_target_monotonic_ns": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["sync_target_monotonic_ns"],
+        },
+        "capture.camera_sequence": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["camera_sequence"],
+        },
+        "capture.camera_capture_age_ms": {
+            "dtype": "float32",
+            "shape": (3,),
+            "names": ["ego_view", "left_wrist", "right_wrist"],
+        },
+        **{
+            f"capture.{stream}_received_monotonic_ns": {
+                "dtype": "int64",
+                "shape": (1,),
+                "names": [f"{stream}_received_monotonic_ns"],
+            }
+            for stream in ("proprio", "camera", "manager", "sonic", "planner", "hand")
+        },
+        **{
+            f"capture.{stream}_age_ms": {
+                "dtype": "float32",
+                "shape": (1,),
+                "names": [f"{stream}_age_ms"],
+            }
+            for stream in ("proprio", "camera", "manager", "sonic", "planner", "hand")
+        },
     }
 
 

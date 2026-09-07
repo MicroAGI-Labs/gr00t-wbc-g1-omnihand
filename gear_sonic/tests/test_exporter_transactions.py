@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 
 from gear_sonic.data import exporter as exporter_module
@@ -169,7 +170,17 @@ def test_real_exporter_commits_parquet_metadata_and_quality_record(tmp_path):
                 "dtype": "float32",
                 "shape": (1,),
                 "names": ["joint"],
-            }
+            },
+            "capture.sync_target_monotonic_ns": {
+                "dtype": "int64",
+                "shape": (1,),
+                "names": ["sync_target_monotonic_ns"],
+            },
+            "capture.camera_age_ms": {
+                "dtype": "float32",
+                "shape": (1,),
+                "names": ["camera_age_ms"],
+            },
         },
         modality_config={
             "state": {},
@@ -179,8 +190,24 @@ def test_real_exporter_commits_parquet_metadata_and_quality_record(tmp_path):
         },
         task="smoke",
     )
-    data_exporter.add_frame({"observation.state": np.asarray([0.0], dtype=np.float32)})
-    data_exporter.add_frame({"observation.state": np.asarray([1.0], dtype=np.float32)})
+    data_exporter.add_frame(
+        {
+            "observation.state": np.asarray([0.0], dtype=np.float32),
+            "capture.sync_target_monotonic_ns": np.asarray(
+                [1_000_000_000], dtype=np.int64
+            ),
+            "capture.camera_age_ms": np.asarray([5.0], dtype=np.float32),
+        }
+    )
+    data_exporter.add_frame(
+        {
+            "observation.state": np.asarray([1.0], dtype=np.float32),
+            "capture.sync_target_monotonic_ns": np.asarray(
+                [1_020_000_000], dtype=np.int64
+            ),
+            "capture.camera_age_ms": np.asarray([8.0], dtype=np.float32),
+        }
+    )
 
     data_exporter.save_episode()
 
@@ -188,6 +215,13 @@ def test_real_exporter_commits_parquet_metadata_and_quality_record(tmp_path):
     assert data_exporter.meta.total_frames == 2
     parquet_path = tmp_path / "dataset" / data_exporter.meta.get_data_file_path(0)
     assert parquet_path.is_file()
+    table = pq.read_table(parquet_path)
+    assert table["timestamp"].to_pylist() == pytest.approx([0.0, 0.02])
+    assert table["capture.sync_target_monotonic_ns"].to_pylist() == [
+        1_000_000_000,
+        1_020_000_000,
+    ]
+    assert table["capture.camera_age_ms"].to_pylist() == [5.0, 8.0]
     quality = (tmp_path / "dataset/meta/episode_quality.jsonl").read_text()
     assert '"episode_index":0' in quality
     assert '"discarded":false' in quality
