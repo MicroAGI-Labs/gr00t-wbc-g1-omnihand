@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 from pathlib import Path
 import socket
@@ -17,6 +18,9 @@ from ..profiles import HandSide, SideProfile
 SDK_VERSION = "1.1.8"
 SDK_COMMIT = "026740d9fdd8ba32b0605fa702a992b322076f1b"
 EXPECTED_DRIVER = "gs_usb"
+SOCKETCAN_REQUEST_INTERVAL_MS = 0
+SOCKETCAN_FRAME_RECV_TIMEOUT_MS = 50
+LINK_INSPECTION_TIMEOUT_S = 1.0
 EXPECTED_SERIAL = {
     HandSide.RIGHT: "2082395E534B50052",
     HandSide.LEFT: "205B3973534B50042",
@@ -63,18 +67,62 @@ def _usb_serial(interface: str, net_class: Path) -> str:
     raise OmniHandHardwareError(f"cannot identify USB serial for {interface}")
 
 
+def _canfd_link_mismatches(document: Any) -> list[str]:
+    """Return admission failures from ``ip -details -json link`` output."""
+    if not isinstance(document, list) or len(document) != 1 or not isinstance(document[0], dict):
+        return ["valid link data"]
+
+    link = document[0]
+    link_info = link.get("linkinfo")
+    info = link_info.get("info_data") if isinstance(link_info, dict) else None
+    if not isinstance(info, dict):
+        return ["CAN link data"]
+
+    def number_matches(mapping: Any, field: str, expected: float) -> bool:
+        try:
+            return abs(float(mapping[field]) - expected) < 1e-6
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    nominal = info.get("bittiming")
+    data = info.get("data_bittiming")
+    flags = link.get("flags")
+    ctrlmode = info.get("ctrlmode")
+    missing: list[str] = []
+    if link.get("link_type") != "can":
+        missing.append("CAN link type")
+    if link.get("operstate") != "UP" or not isinstance(flags, list) or "UP" not in flags:
+        missing.append("UP interface")
+    if link.get("mtu") != 72:
+        missing.append("CAN-FD MTU 72")
+    if not isinstance(ctrlmode, list) or "FD" not in ctrlmode:
+        missing.append("FD mode")
+    if info.get("state") != "ERROR-ACTIVE":
+        missing.append("ERROR-ACTIVE CAN state")
+    if not number_matches(nominal, "bitrate", 1_000_000):
+        missing.append("bitrate 1000000")
+    if not number_matches(nominal, "sample_point", 0.800):
+        missing.append("sample-point 0.800")
+    if not number_matches(data, "bitrate", 5_000_000):
+        missing.append("dbitrate 5000000")
+    if not number_matches(data, "sample_point", 0.750):
+        missing.append("dsample-point 0.750")
+    return missing
+
+
 def _validate_canfd_link(interface: str) -> None:
     try:
-        details = subprocess.run(
-            ["ip", "-details", "link", "show", interface],
+        raw = subprocess.run(
+            ["ip", "-details", "-json", "link", "show", interface],
             check=True,
             capture_output=True,
             text=True,
+            timeout=LINK_INSPECTION_TIMEOUT_S,
         ).stdout
-    except (OSError, subprocess.CalledProcessError) as exc:
+        details = json.loads(raw)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         raise OmniHandHardwareError(f"cannot inspect CAN-FD settings for {interface}") from exc
-    required = ("bitrate 1000000", "sample-point 0.800", "dbitrate 5000000", "dsample-point 0.750", "fd on")
-    missing = [value for value in required if value not in details]
+    missing = _canfd_link_mismatches(details)
     if missing:
         raise OmniHandHardwareError(
             f"{interface} does not match the admitted 1M/5M CAN-FD link: missing {missing}"
@@ -98,6 +146,8 @@ class OmniHandBackend:
         interface_index: Callable[[str], int] = socket.if_nametoindex,
         serial_reader: Callable[[str, Path], str] = _usb_serial,
         link_validator: Callable[[str], None] = _validate_canfd_link,
+        request_interval_ms: int = SOCKETCAN_REQUEST_INTERVAL_MS,
+        frame_recv_timeout_ms: int = SOCKETCAN_FRAME_RECV_TIMEOUT_MS,
     ) -> None:
         self.side = HandSide(side)
         self.profile = profile
@@ -126,6 +176,7 @@ class OmniHandBackend:
             self._hand = self._sdk.OmniHand2025.create_hand_socketcan(hand_type, device_id, interface)
             if not self._hand.init():
                 raise OmniHandHardwareError(f"could not initialize {self.side.value} O10 on {interface}")
+            self._configure_transport_timing(request_interval_ms, frame_recv_timeout_ms)
         if int(self._hand.get_product_type()) != int(self._sdk.ProductType.OMNIHAND_2025):
             raise OmniHandHardwareError("connected device is not OMNIHAND_2025")
         if int(self._sdk.OmniHand2025.kDegreesOfActiveFreedom) != profile.width:
@@ -136,6 +187,36 @@ class OmniHandBackend:
             if actual != profile.joint_names:
                 raise OmniHandHardwareError(f"SDK joint order mismatch: {actual}")
         self.read_positions()
+
+    def _configure_transport_timing(
+        self, request_interval_ms: int, frame_recv_timeout_ms: int
+    ) -> None:
+        """Configure and verify the SDK's SocketCAN request cadence."""
+        if not 0 <= request_interval_ms <= 100:
+            raise OmniHandHardwareError("SocketCAN request interval must be between 0 and 100 ms")
+        if not 10 <= frame_recv_timeout_ms <= 1000:
+            raise OmniHandHardwareError(
+                "SocketCAN frame receive timeout must be between 10 and 1000 ms"
+            )
+        try:
+            self._hand.set_request_interval(request_interval_ms)
+            actual_interval = int(self._hand.get_request_interval())
+            self._hand.set_frame_recv_timeout(frame_recv_timeout_ms)
+            actual_timeout = int(self._hand.get_frame_recv_timeout())
+        except Exception as exc:
+            raise OmniHandHardwareError(f"could not configure SocketCAN timing: {exc}") from exc
+        if actual_interval != request_interval_ms:
+            raise OmniHandHardwareError(
+                "SocketCAN request interval readback mismatch: "
+                f"requested {request_interval_ms} ms, got {actual_interval} ms"
+            )
+        if actual_timeout != frame_recv_timeout_ms:
+            raise OmniHandHardwareError(
+                "SocketCAN receive timeout readback mismatch: "
+                f"requested {frame_recv_timeout_ms} ms, got {actual_timeout} ms"
+            )
+        self.request_interval_ms = actual_interval
+        self.frame_recv_timeout_ms = actual_timeout
 
     def read_positions(self) -> np.ndarray:
         if self._hand is None:
