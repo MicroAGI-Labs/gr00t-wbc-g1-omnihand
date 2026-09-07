@@ -149,12 +149,12 @@ class Gr00tDataExporter(LeRobotDataset):
     3. Save the episode using save_episode()
        - Flushes the episode buffer to disk
        - Closes the video writers
-       - Creates new video writer and ep buffer for the next episode
+       - Creates an empty buffer; video writers open on the next episode's first frame
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.video_writers = self.create_video_writer()
+        self.video_writers = {}
 
     @property
     def repo_id(self):
@@ -239,20 +239,28 @@ class Gr00tDataExporter(LeRobotDataset):
         obj.delta_timestamps = None
         obj.delta_indices = None
         obj.episode_data_index = None
-        obj.video_writers = obj.create_video_writer()
+        obj.video_writers = {}
         return obj
 
     def create_video_writer(self) -> dict[str, VideoWriter]:
         video_writers = {}
-        for key in self.meta.video_keys:
-            video_writers[key] = VideoWriter(
-                self.root
-                / self.meta.get_video_file_path(self.episode_buffer["episode_index"], key),
-                self.meta.shapes[key][1],
-                self.meta.shapes[key][0],
-                self.fps,
-                self.vcodec,
-            )
+        try:
+            for key in self.meta.video_keys:
+                video_writers[key] = VideoWriter(
+                    self.root
+                    / self.meta.get_video_file_path(self.episode_buffer["episode_index"], key),
+                    self.meta.shapes[key][1],
+                    self.meta.shapes[key][0],
+                    self.fps,
+                    self.vcodec,
+                )
+        except Exception:
+            for writer in video_writers.values():
+                try:
+                    writer.cancel()
+                except Exception as exc:
+                    print(f"Could not close partially initialized video writer: {exc}")
+            raise
         return video_writers
 
     def add_frame(self, frame: dict) -> None:
@@ -268,6 +276,9 @@ class Gr00tDataExporter(LeRobotDataset):
 
         if self.episode_buffer is None:
             self.episode_buffer = self.create_episode_buffer()
+
+        if self.video_keys and not self.video_writers:
+            self.video_writers = self.create_video_writer()
 
         frame_index = self.episode_buffer["size"]
         timestamp = frame.pop("timestamp") if "timestamp" in frame else frame_index / self.fps
@@ -313,17 +324,17 @@ class Gr00tDataExporter(LeRobotDataset):
         """Skip the current episode and start a new one."""
         self.stop_video_writers()
         self.episode_buffer = self.create_episode_buffer()
-        self.video_writers = self.create_video_writer()
+        self.video_writers = {}
 
     def detach_episode(self) -> tuple[dict[str, Any], dict[str, VideoWriter]]:
-        """Rotate active buffers so finalization can run in another thread."""
+        """Transfer the completed episode without opening the next video files."""
         episode_buffer = self.episode_buffer
         video_writers = self.video_writers
         next_episode_index = int(episode_buffer["episode_index"]) + 1
         self.episode_buffer = self.create_episode_buffer(
             episode_index=next_episode_index
         )
-        self.video_writers = self.create_video_writer()
+        self.video_writers = {}
         return episode_buffer, video_writers
 
     def save_episode(
@@ -460,7 +471,7 @@ class Gr00tDataExporter(LeRobotDataset):
 
         if active_episode:
             self.episode_buffer = self.create_episode_buffer()
-            self.video_writers = self.create_video_writer()
+            self.video_writers = {}
 
     def encode_episode_videos(
         self,

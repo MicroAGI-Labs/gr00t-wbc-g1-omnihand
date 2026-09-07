@@ -585,6 +585,13 @@ class GrootDataCollector:
         self.latest_proprio_msg = msg
         self._synchronizer.observe("proprio", msg, received_ns)
 
+    def _poll_images(self) -> None:
+        for message in self._image_subscriber.read_pending():
+            received_ns = message["receiver_monotonic_ns"]
+            self.latest_image_msg = message
+            self.latest_image_received_at = received_ns / 1e9
+            self._synchronizer.observe("camera", message, received_ns)
+
     def _poll_hand_zmq(self) -> None:
         if self._hand_zmq_socket is None:
             return
@@ -683,13 +690,19 @@ class GrootDataCollector:
         validation = self._episode_validation(discarded=discarded, reason=reason)
         effective_discarded = discarded or not validation["passed"]
         episode_buffer, video_writers = self.data_exporter.detach_episode()
-        self.episode_finalizer.enqueue(
-            episode_index=episode_index,
-            episode_buffer=episode_buffer,
-            video_writers=video_writers,
-            discarded=effective_discarded,
-            validation=validation,
-        )
+        try:
+            self.episode_finalizer.enqueue(
+                episode_index=episode_index,
+                episode_buffer=episode_buffer,
+                video_writers=video_writers,
+                discarded=effective_discarded,
+                validation=validation,
+            )
+        except Exception:
+            # Ownership transfers only after the finalizer accepts the job.
+            self.data_exporter.episode_buffer = episode_buffer
+            self.data_exporter.video_writers = video_writers
+            raise
         self.sonic_timing_monitor.reset()
         self._episode_state.reset_state()
         self._initial_yaw = None
@@ -1525,9 +1538,12 @@ class GrootDataCollector:
 
         for writer in self.data_exporter.video_writers.values():
             try:
-                writer.cancel(timeout_s=5.0)
+                if self.data_exporter.episode_buffer.get("size", 0):
+                    writer.stop(timeout_s=5.0)
+                else:
+                    writer.cancel(timeout_s=5.0)
             except Exception as exc:
-                print(f"[Exporter] Could not close unused video writer: {exc}")
+                print(f"[Exporter] Could not close video writer: {exc}")
 
         try:
             self._image_subscriber.close()
@@ -1574,27 +1590,7 @@ class GrootDataCollector:
                         self._poll_hand_zmq()
 
                     with self.telemetry.timer("poll_image"):
-                        previous_image_index = self._image_subscriber.idx
-                        img_msg = self._image_subscriber.read()
-                        if img_msg is not None:
-                            self.latest_image_msg = img_msg
-                        if (
-                            img_msg is not None
-                            and self._image_subscriber.idx != previous_image_index
-                        ):
-                            received_ns = img_msg.get("receiver_monotonic_ns")
-                            if not (
-                                isinstance(received_ns, int)
-                                and not isinstance(received_ns, bool)
-                                and received_ns > 0
-                            ):
-                                received_ns = time.monotonic_ns()
-                            self.latest_image_received_at = received_ns / 1e9
-                            self._synchronizer.observe(
-                                "camera",
-                                img_msg,
-                                received_ns,
-                            )
+                        self._poll_images()
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()

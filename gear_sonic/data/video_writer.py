@@ -33,12 +33,17 @@ class VideoWriter:
 
         self.queue = queue.Queue(maxsize=buffer_size)
         self.container = av.open(output_path, mode="w")
-        self.stream = self.container.add_stream(codec, rate=fps)
-        self.stream.width = width
-        self.stream.height = height
-        self.stream.codec_context.thread_count = min(2, os.cpu_count() or 1)
+        try:
+            self.stream = self.container.add_stream(codec, rate=fps)
+            self.stream.width = width
+            self.stream.height = height
+            self.stream.codec_context.thread_count = min(2, os.cpu_count() or 1)
+        except Exception:
+            self.container.close()
+            raise
         self._writer_error: Exception | None = None
         self._accepting_frames = True
+        self._cancelled = False
         self._stop_enqueued = False
         self._closed = False
         self._close_lock = threading.Lock()
@@ -71,6 +76,22 @@ class VideoWriter:
             ) from exc
 
     def _writer_worker(self) -> None:
+        try:
+            self._encode_frames()
+            if self._writer_error is None and not self._cancelled:
+                self._flush_stream()
+        except Exception as exc:
+            self._writer_error = exc
+        finally:
+            try:
+                self.container.close()
+            except Exception as exc:
+                if self._writer_error is None:
+                    self._writer_error = exc
+            finally:
+                self._closed = True
+
+    def _encode_frames(self) -> None:
         while True:
             frame = self.queue.get()
             try:
@@ -78,7 +99,7 @@ class VideoWriter:
                     return
                 # Once encoding fails, drain queued frames so shutdown remains
                 # bounded; stop() reports the original exception.
-                if self._writer_error is not None:
+                if self._writer_error is not None or self._cancelled:
                     continue
                 self._assert_dimensions(frame)
                 frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
@@ -127,48 +148,32 @@ class VideoWriter:
             raise TimeoutError(f"video writer did not stop within {timeout_s:.1f}s")
 
     def stop(self, timeout_s: float = 30.0) -> str:
-        """Drain frames and close, failing rather than waiting forever."""
-        if timeout_s <= 0:
-            raise ValueError("video writer stop timeout must be positive")
-        with self._close_lock:
-            if self._closed:
-                return self.output_path
-            self._accepting_frames = False
-            self._join_worker(timeout_s)
-            try:
-                if self._writer_error is not None:
-                    raise RuntimeError("video writer worker failed") from self._writer_error
-                self._flush_stream()
-            finally:
-                self.container.close()
-                self._closed = True
-            return self.output_path
+        """Wait up to timeout_s for draining, encoder flush, and container close.
+
+        A timeout leaves the worker owning its container; stop can be retried.
+        """
+        self._finish(timeout_s, cancel=False)
+        return self.output_path
 
     def cancel(self, timeout_s: float = 5.0) -> None:
         """Stop safely and remove the incomplete output file."""
+        self._finish(timeout_s, cancel=True)
+
+    def _finish(self, timeout_s: float, *, cancel: bool) -> None:
         if timeout_s <= 0:
-            raise ValueError("video writer cancel timeout must be positive")
-        with self._close_lock:
-            if self._closed:
+            raise ValueError("video writer shutdown timeout must be positive")
+        deadline = time.monotonic() + timeout_s
+        if not self._close_lock.acquire(timeout=timeout_s):
+            raise TimeoutError("video writer shutdown is already in progress")
+        try:
+            if cancel and self._closed and not self._cancelled:
                 return
             self._accepting_frames = False
-            while True:
-                try:
-                    queued = self.queue.get_nowait()
-                    if queued is None:
-                        self._stop_enqueued = False
-                    self.queue.task_done()
-                except queue.Empty:
-                    break
-            self._join_worker(timeout_s)
-            self.container.close()
-            self._closed = True
-            if os.path.exists(self.output_path):
+            self._cancelled = self._cancelled or cancel
+            self._join_worker(max(0.0, deadline - time.monotonic()))
+            if cancel and os.path.exists(self.output_path):
                 os.remove(self.output_path)
-
-    def __del__(self) -> None:
-        # Never close an AV container while its worker may still be using it.
-        if getattr(self, "_closed", True) or getattr(self, "_thread", None) is None:
-            return
-        if not self._thread.is_alive():
-            self.container.close()
+            if not cancel and self._writer_error is not None:
+                raise RuntimeError("video writer worker failed") from self._writer_error
+        finally:
+            self._close_lock.release()

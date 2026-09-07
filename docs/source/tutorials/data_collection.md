@@ -155,7 +155,7 @@ Pass `--camera-host <THOR_IP>` only when a client runs on another computer.
 ### Frame Rates
 
 - Existing 30 FPS cameras publish only new frames. The 50 Hz exporter deliberately reuses the cached image between arrivals, while rejecting a stalled stream or a source below `--minimum-camera-rate-hz` (25 Hz by default).
-- ZED captures and publishes at 60 FPS. A bounded FIFO absorbs short scheduling stalls before the exporter samples it at 50 Hz. Old frames are trimmed to keep latency bounded rather than allowing an unbounded backlog.
+- ZED captures and publishes at 60 FPS. The exporter drains the bounded camera FIFO into its timestamp history each tick, then selects the closest past image for each 50 Hz target. FIFO overflow drops are counted; ordinary 60-to-50 Hz sampling does not discard images before timestamp selection.
 - The dataset timeline is controlled by `--data-collection-frequency` (50 Hz by default).
 - The browser status reports camera receive/publish rates, queue depth, local overflow/latency drops, and publisher sequence gaps.
 
@@ -383,6 +383,8 @@ These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent
 | `x` | **Discard** episode (same as Y + A — flagged for removal) |
 
 Stopping first enters a short draining state so synchronized targets through the stop-command timestamp are recorded; the episode is then detached and finalized in a background worker. Discarding can detach immediately. The UI reports an episode as saved only after finalization completes, and a new recording remains disabled until then. If finalization fails, the detached episode buffer is kept under the dataset's `recovery/` directory for inspection.
+
+The next episode's video files open only on its first frame, so a failure opening them cannot prevent the previous episode from being saved. Video shutdown timeouts cover draining, encoder flushing, and container closing. A timeout leaves the video worker owning the container so it can finish safely; it does not forcibly interrupt an encoder or filesystem operation.
 
 ```{note}
 Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.

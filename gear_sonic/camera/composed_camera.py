@@ -599,6 +599,13 @@ class CameraFrameBuffer:
                 self._latency_dropped += 1
             return self._messages.popleft() if self._messages else None
 
+    def drain(self) -> list[dict[str, Any]]:
+        """Transfer every pending frame to the causal history without sampling."""
+        with self._lock:
+            messages = list(self._messages)
+            self._messages.clear()
+            return messages
+
     @staticmethod
     def _event_rate(samples: deque[tuple[float, Any]]) -> float | None:
         if len(samples) < 2:
@@ -742,6 +749,19 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             self._receiver_error = exc
         finally:
             self.stop_client()
+
+    def read_pending(self) -> list[dict[str, Any]]:
+        """Drain the background receiver for timestamp-based collection."""
+        if not self._background:
+            raise RuntimeError("read_pending requires a background camera receiver")
+        if self._receiver_error is not None:
+            raise RuntimeError(f"camera receiver failed: {self._receiver_error}")
+        messages = self._background_buffer.drain()
+        if messages:
+            self.idx += len(messages)
+            self._latest_message = messages[-1]
+            self._last_new_message_time = time.monotonic()
+        return messages
 
     def read(self, blocking: bool = False, **kwargs) -> dict[str, Any] | None:
         self._start_time = time.time()

@@ -102,7 +102,8 @@ def test_background_camera_client_receives_and_stops_cleanly():
         while received is None and time.monotonic() < deadline:
             server.send_message(payload)
             time.sleep(0.01)
-            received = client.read()
+            pending = client.read_pending()
+            received = pending[-1] if pending else None
 
         assert received is not None
         assert received["images"]["head"].shape == (2, 2, 3)

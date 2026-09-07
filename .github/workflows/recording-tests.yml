@@ -1,0 +1,45 @@
+name: Recording pipeline tests
+
+on:
+  pull_request:
+    paths:
+      - "gear_sonic/**"
+      - "pyproject.toml"
+      - ".github/workflows/recording-tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "gear_sonic/**"
+      - "pyproject.toml"
+      - ".github/workflows/recording-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  recording:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GIT_LFS_SKIP_SMUDGE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: gear_sonic/pyproject.toml
+      - name: Install data collection and test dependencies
+        run: |
+          python -m pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e 'gear_sonic[data_collection]' pytest
+      - name: Test recording without robot or camera hardware
+        run: |
+          python -m pytest -q \
+            gear_sonic/tests/test_camera_buffering.py \
+            gear_sonic/tests/test_causal_sync.py \
+            gear_sonic/tests/test_episode_finalizer.py \
+            gear_sonic/tests/test_exporter.py \
+            gear_sonic/tests/test_recording_pipeline.py \
+            gear_sonic/tests/test_video_writer.py \
+            gear_sonic/tests/test_zed_camera.py

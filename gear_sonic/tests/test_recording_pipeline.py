@@ -5,6 +5,7 @@ import time
 import numpy as np
 import pytest
 
+from gear_sonic.camera.composed_camera import CameraFrameBuffer, ComposedCameraClientSensor
 from gear_sonic.data.causal_sync import (
     CausalSelection,
     CausalSynchronizer,
@@ -221,9 +222,7 @@ def test_collector_emits_target_only_after_future_watermarks_without_using_them(
         collector._synchronizer.observe(stream, past, target - 5_000_000)
         collector._synchronizer.observe(stream, future, target + 1_000_000)
     selected = []
-    collector._add_data_frame_sonic = lambda _start, selection: selected.append(
-        selection
-    )
+    collector._add_data_frame_sonic = lambda _start, selection: selected.append(selection)
     monkeypatch.setattr(
         "gear_sonic.scripts.run_data_exporter.time.monotonic_ns",
         lambda: target + collector.synchronization_delay_ns,
@@ -262,14 +261,55 @@ def test_collector_waits_for_watermarks_then_records_a_bounded_gap(monkeypatch):
     assert collector._add_data_frame() is False
     assert collector._synchronization_errors == []
 
-    now = (
-        target
-        + collector.synchronization_delay_ns
-        + collector.synchronization_wait_timeout_ns
-        + 1
-    )
+    now = target + collector.synchronization_delay_ns + collector.synchronization_wait_timeout_ns + 1
     assert collector._add_data_frame() is False
     assert "streams did not advance" in collector._synchronization_errors[0]
     assert collector._synchronization_skipped_targets > 0
     collector._finish_recording(discarded=False, reason="")
     assert collector.episode_finalizer.jobs[0]["discarded"] is True
+
+
+@pytest.mark.parametrize("camera_hz", [30, 60])
+def test_collector_preserves_closest_past_camera_at_50hz(camera_hz):
+    collector = _recording_collector()
+    client = ComposedCameraClientSensor.__new__(ComposedCameraClientSensor)
+    client._background = True
+    client._receiver_error = None
+    client._background_buffer = CameraFrameBuffer()
+    client.idx = 0
+    collector._image_subscriber = client
+    base = 1_000_000_000
+    received = []
+    sequence = 0
+    for tick in range(31):
+        now = base + tick * collector.loop_period_ns
+        while base + round(sequence * 1e9 / camera_hz) <= now:
+            stamp = base + round(sequence * 1e9 / camera_hz)
+            client._background_buffer.put({"receiver_monotonic_ns": stamp})
+            received.append(stamp)
+            sequence += 1
+        collector._poll_images()
+        if tick < 5:
+            continue
+        target = now - collector.synchronization_delay_ns
+        selection = collector._synchronizer.select(
+            target, required_streams=("camera",), max_age_ns={"camera": 250_000_000}
+        )
+        assert selection.ready
+        assert selection.samples["camera"].timestamp_ns == max(t for t in received if t <= target)
+        collector._synchronizer.trim_through(target)
+    assert client._background_buffer.stats()["overflow_dropped"] == 0
+
+
+def test_rejected_finalizer_handoff_restores_completed_episode(monkeypatch):
+    collector = _recording_collector()
+    completed = collector.data_exporter.episode_buffer
+
+    def reject(**kwargs):
+        raise RuntimeError("finalizer unavailable")
+
+    monkeypatch.setattr(collector.episode_finalizer, "enqueue", reject)
+    with pytest.raises(RuntimeError, match="finalizer unavailable"):
+        collector._finish_recording(discarded=False, reason="")
+    assert collector.data_exporter.episode_buffer is completed
+    assert "observation.images.ego_view" in collector.data_exporter.video_writers
