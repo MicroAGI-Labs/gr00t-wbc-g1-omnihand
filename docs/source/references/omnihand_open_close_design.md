@@ -233,7 +233,32 @@ channels. Exact SDK order and admitted limits are from Atlas
 | 8 | `R_pinky_abad_joint` | 0 | .1850 | `L_pinky_abad_joint` | -.1850 | 0 | .164 |
 | 9 | `R_pinky_pip_joint` | 0 | 1.4835 | `L_pinky_pip_joint` | 0 | 1.4835 | .308 |
 
-Open is ten zeros. Initial closed fixture, derived from Atlas
+The safe-open target is derived from recorded powered base poses rather than
+the unpowered all-zero configuration. The source observations were:
+
+```text
+right [ .549773, -.757866,  .002735, -.074805, 0, 0,  .083381, .000840,  .094930, .000840]
+left  [-.555388,  .802839,  0,        .077109, 0, 0, -.083962, 0,       -.092402, 0]
+```
+
+These observations may contain small unit-specific encoder and mechanical
+offsets, so they are not used directly as model-wide commands. Joints 0, 1, 2, 3, 6,
+and 8 have opposite left/right signs; the PIP joints 4, 5, 7, and 9 have the
+same sign. Reflecting both observations into the right-hand convention,
+averaging each joint, and mirroring the result gives the symmetric nominal
+target:
+
+```text
+right [ .5525805, -.7803525,  .0013675, -.0759570, 0, 0,  .0836715, .0004200,  .0936660, .0004200]
+left  [-.5525805,  .7803525, -.0013675,  .0759570, 0, 0, -.0836715, .0004200, -.0936660, .0004200]
+```
+
+The thumb roll and ab/ad targets deliberately remain away from the fully
+extended geometry that can short this hardware revision. If a hand needs
+per-unit encoder-zero compensation, keep it in serial-specific calibration
+rather than changing this shared profile.
+
+The initial closed fixture is derived from Atlas
 [`poses.py`](https://github.com/MicroAGI-Labs/research-atlas-v0/blob/14b1406c8d3069870e298341be0cd204cee5515d/atlas/hands/omnihand/poses.py):
 
 ```text
