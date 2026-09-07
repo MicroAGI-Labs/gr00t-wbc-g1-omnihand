@@ -29,7 +29,6 @@ from gear_sonic.end_effectors.protocol import (
     HAND_STATE_TOPIC,
     decode_state,
     encode,
-    hand_state_age_s,
 )
 
 _INDEX_HTML = """<!doctype html>
@@ -105,9 +104,10 @@ _INDEX_HTML = """<!doctype html>
         const status = await (await fetch('/hands/status', {cache: 'no-store'})).json();
         handControls.hidden = !status.enabled;
         const mode = status.mode === 'fault' ? 'FAULT' : (status.connected ? 'CONNECTED' : 'OFFLINE / RECOVERING');
-        const age = status.feedback_age_s == null ? 'unknown' : `${Math.round(status.feedback_age_s * 1000)} ms`;
-        handStatus.textContent = `Hands: ${mode} · feedback age ${age}`
-          + (status.supervisor_error ? ` · ${status.supervisor_error}` : '');
+        const age = status.last_status_age_s == null
+          ? 'unknown' : `${Math.round(status.last_status_age_s * 1000)} ms`;
+        handStatus.textContent = `Hands: ${mode} · status age ${age}`
+          + (status.connection_error ? ` · ${status.connection_error}` : '');
       } catch (_) {
         handStatus.textContent = 'Hand status unavailable';
       }
@@ -247,7 +247,7 @@ class CameraWebViewerConfig:
     """ZMQ SUB port used to receive recorder status."""
 
     hand_controls: bool = False
-    """Show status and reconnect controls for supervised external hands."""
+    """Show status and reconnect controls for the external hand controller."""
 
     hand_state_endpoint: str = "tcp://localhost:5570"
     hand_control_endpoint: str = "tcp://127.0.0.1:5572"
@@ -365,14 +365,15 @@ class RecorderControlHub:
     def hands_status(self) -> dict:
         with self._lock:
             payload = dict(self._hand_status or {})
-            elapsed = time.monotonic() - self._hand_received_at
-        age = hand_state_age_s(payload, elapsed)
+            age = max(0.0, time.monotonic() - self._hand_received_at) if payload else None
         sides = payload.get("sides", {})
         payload.update(
             enabled=self.config.hand_controls,
-            connected=age is not None and age <= self.config.hand_state_max_age
-            and bool(sides) and all(side.get("valid") and side.get("connected") for side in sides.values()),
-            feedback_age_s=age if payload else None,
+            connected=age is not None
+            and age <= self.config.hand_state_max_age
+            and bool(sides)
+            and all(side.get("valid") and side.get("connected") for side in sides.values()),
+            last_status_age_s=age,
         )
         return payload
 
@@ -389,7 +390,7 @@ class RecorderControlHub:
                 request.send(encode(HAND_CONTROL_TOPIC, {"schema": HAND_CONTROL_SCHEMA, "action": "reconnect"}))
                 return request.recv_json()
             except zmq.Again:
-                return {"accepted": False, "error": "Hand supervisor did not acknowledge; check hand status"}
+                return {"accepted": False, "error": "Hand controller did not acknowledge; check hand status"}
 
     def _run(self) -> None:
         context = zmq.Context()

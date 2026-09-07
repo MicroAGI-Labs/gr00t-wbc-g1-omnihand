@@ -114,7 +114,7 @@ class OmniHandMuJoCoDriver:
             self.hand_actuators[side] = _actuator_ids_for_joints(model, names)
         self.targets = {side: data.qpos[self.hand_qpos[side]].copy() for side in ("left", "right")}
         self._session_id: str | None = None
-        self._worker_id: str | None = None
+        self._connection_id: str | None = None
         self._state_sequence: int | None = None
         self._state_received_at: float | None = None
         self._feedback_sequence = 0
@@ -136,13 +136,13 @@ class OmniHandMuJoCoDriver:
         if payload.get("mode") in {"disconnected", "fault"}:
             return
         session_id = payload.get("session_id")
-        worker_id = payload.get("worker_id")
+        connection_id = payload.get("connection_id")
         sequence = payload.get("sequence")
         if not isinstance(session_id, str) or isinstance(sequence, bool) or not isinstance(sequence, int):
             return
-        if session_id != self._session_id or worker_id != self._worker_id:
+        if session_id != self._session_id or connection_id != self._connection_id:
             self._session_id = session_id
-            self._worker_id = worker_id
+            self._connection_id = connection_id
             self._state_sequence = None
         if self._state_sequence is not None and sequence <= self._state_sequence:
             return
@@ -211,7 +211,7 @@ class OmniHandMuJoCoDriver:
     def reset_targets(self) -> None:
         self.targets = {side: self.data.qpos[self.hand_qpos[side]].copy() for side in ("left", "right")}
         self._session_id = None
-        self._worker_id = None
+        self._connection_id = None
         self._state_sequence = None
         self._state_received_at = None
 

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import socket
+import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import zmq
 
+from gear_sonic.end_effectors import controller as controller_module
 from gear_sonic.end_effectors.backends.omnihand import (
     OmniHandBackend,
     OmniHandHardwareError,
@@ -19,10 +24,14 @@ from gear_sonic.end_effectors.controller import (
 )
 from gear_sonic.end_effectors.profiles import OMNIHAND_O10, HandSide
 from gear_sonic.end_effectors.protocol import (
+    HAND_CONTROL_SCHEMA,
+    HAND_CONTROL_TOPIC,
     HAND_INTENT_SCHEMA,
     HAND_INTENT_TOPIC,
+    HAND_STATE_TOPIC,
     HandProtocolError,
     decode_intent,
+    decode_state,
     encode,
 )
 
@@ -375,3 +384,131 @@ def test_canfd_admission_uses_machine_readable_link_state():
     assert _canfd_link_mismatches([]) == ["valid link data"]
     document[0]["flags"] = None
     assert "UP interface" in _canfd_link_mismatches(document)
+
+
+def test_partial_connection_closes_opened_hand(monkeypatch):
+    left = SimHandBackend(OMNIHAND_O10.left)
+
+    def connect(args, side, profile):
+        if side == "right":
+            raise OmniHandHardwareError("right disconnected")
+        return left
+
+    monkeypatch.setattr(controller_module, "_make_hardware_device", connect)
+    with pytest.raises(OmniHandHardwareError):
+        controller_module._make_devices(SimpleNamespace(backend="omnihand", sides="both"), OMNIHAND_O10, None)
+    assert left.closed
+
+
+def test_server_reconnects_in_process_and_preserves_fault_latch(monkeypatch):
+    stop, disconnected, fault = (threading.Event() for _ in range(3))
+    devices, results = [], []
+
+    class Backend(SimHandBackend):
+        def read_positions(self):
+            if disconnected.is_set():
+                raise OmniHandHardwareError("test disconnect")
+            return super().read_positions()
+
+        def read_health(self):
+            return {"error_masks": [int(fault.is_set())] * 10}
+
+    def connect(*args):
+        backend = Backend(OMNIHAND_O10.left)
+        devices.append(backend)
+        return {"left": backend}
+
+    def sleep(seconds):
+        if stop.wait(seconds):
+            raise KeyboardInterrupt
+
+    def endpoint():
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            return f"tcp://127.0.0.1:{listener.getsockname()[1]}"
+
+    monkeypatch.setattr(controller_module, "_make_devices", connect)
+    monkeypatch.setattr(controller_module.time, "sleep", sleep)
+    state_endpoint, control_endpoint = endpoint(), endpoint()
+    with (
+        zmq.Context() as context,
+        context.socket(zmq.SUB) as state,
+        context.socket(zmq.REQ) as control,
+        context.socket(zmq.PUB) as intent,
+    ):
+        for sock in (state, control, intent):
+            sock.setsockopt(zmq.LINGER, 0)
+        intent_port = intent.bind_to_random_port("tcp://127.0.0.1")
+        state.setsockopt(zmq.SUBSCRIBE, HAND_STATE_TOPIC)
+        state.connect(state_endpoint)
+        control.setsockopt(zmq.RCVTIMEO, 1000)
+        control.connect(control_endpoint)
+        args = controller_module.build_parser().parse_args(
+            [
+                "run",
+                "--sides",
+                "left",
+                "--state-endpoint",
+                state_endpoint,
+                "--control-endpoint",
+                control_endpoint,
+                "--reconnect-interval",
+                "0.05",
+                "--intent-endpoint",
+                f"tcp://127.0.0.1:{intent_port}",
+            ]
+        )
+        server = threading.Thread(target=lambda: results.append(controller_module.run(args)), daemon=True)
+        server.start()
+
+        def receive(predicate):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if state.poll(50):
+                    payload = decode_state(state.recv())
+                    if predicate(payload):
+                        return payload
+            pytest.fail("hand server did not publish expected state")
+
+        def reconnect():
+            control.send(encode(HAND_CONTROL_TOPIC, {"schema": HAND_CONTROL_SCHEMA, "action": "reconnect"}))
+            assert control.recv_json() == {"accepted": True}
+
+        try:
+            first = receive(lambda message: message["mode"] == "hold")
+            control.send(encode(HAND_CONTROL_TOPIC, {"schema": HAND_CONTROL_SCHEMA, "action": "invalid"}))
+            assert not control.recv_json()["accepted"]
+            intent.send(HAND_INTENT_TOPIC + b" invalid")
+            unchanged = receive(lambda message: message["sequence"] > first["sequence"] + 3)
+            assert unchanged["connection_id"] == first["connection_id"]
+            intent.send(encode(HAND_INTENT_TOPIC, _intent(1, left_closed=True, right_closed=False)))
+            receive(lambda message: message["mode"] == "tracking")
+            reconnect()
+            second = receive(lambda message: message["connection_id"] != first["connection_id"])
+            assert second["session_id"] == first["session_id"]
+            assert second["mode"] == "hold" and second["intent_sequence"] is None
+            assert devices[0].closed and len(devices) == 2
+            disconnected.set()
+            receive(lambda message: message["mode"] == "disconnected")
+            disconnected.clear()
+            third = receive(lambda message: message["mode"] == "hold")
+            assert third["connection_id"] != second["connection_id"]
+            fault.set()
+            receive(lambda message: message["mode"] == "fault")
+            disconnected.set()
+            failed = receive(lambda message: message.get("connection_error") == "test disconnect")
+            attempts = len(devices)
+            disconnected.clear()
+            fault.clear()
+            receive(lambda message: message["monotonic_ns"] > failed["monotonic_ns"] + 150_000_000)
+            assert len(devices) == attempts  # Transport loss cannot clear a latched fault.
+            reconnect()
+            recovered = receive(lambda message: message["mode"] == "hold")
+            assert recovered["connection_id"] != third["connection_id"]
+            assert recovered["session_id"] == first["session_id"]
+        finally:
+            stop.set()
+            server.join(timeout=2)
+            assert not server.is_alive()
+        assert results == [0]
+        assert all(device.closed for device in devices)

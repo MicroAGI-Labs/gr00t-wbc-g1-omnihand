@@ -39,21 +39,21 @@ def _controller_state(left: list[float], right: list[float]) -> bytes:
     )
 
 
-def test_state_sequence_resets_on_worker_restart_within_same_session():
+def test_state_sequence_resets_on_reconnect_within_same_session():
     # The protocol gate needs no model assets or physics execution.
     driver = OmniHandMuJoCoDriver.__new__(OmniHandMuJoCoDriver)
-    driver._session_id, driver._worker_id, driver._state_sequence = None, None, None
+    driver._session_id, driver._connection_id, driver._state_sequence = None, None, None
     payload = decode_state(_controller_state(list(OMNIHAND_O10.left.open_rad), list(OMNIHAND_O10.right.open_rad)))
-    payload.update(worker_id="first", sequence=100)
+    payload.update(connection_id="first", sequence=100)
     driver._accept_state(encode(HAND_STATE_TOPIC, payload))
     assert driver._state_sequence == 100
     payload["sequence"] = 1
     driver._accept_state(encode(HAND_STATE_TOPIC, payload))
-    assert driver._state_sequence == 100  # Reject replay within a worker.
-    payload["worker_id"] = "second"
+    assert driver._state_sequence == 100  # Reject replay within a connection.
+    payload["connection_id"] = "second"
     driver._accept_state(encode(HAND_STATE_TOPIC, payload))
     assert driver._state_sequence == 1
-    assert driver._worker_id == "second"
+    assert driver._connection_id == "second"
 
 
 def test_atlas_combined_asset_has_body_active_passive_and_contact_contract():

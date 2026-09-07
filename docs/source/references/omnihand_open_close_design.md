@@ -24,10 +24,10 @@ were missing or ambiguous:
 - **Clock domains need an explicit rule.** Remote `monotonic_ns` values are
   provenance only; watchdog age is measured from local receive time because
   monotonic clocks are not comparable across hosts.
-- **Reconnect session semantics.** The supervisor retains its session ID across
-  worker restarts; each worker gets a new `worker_id`, discards old targets,
-  establishes a measured hold, and requires a post-connect intent. The collector
-  invalidates an episode spanning a worker restart. Restarting the supervisor
+- **Reconnect session semantics.** The hand server retains its session ID across
+  reconnects; each successful connection gets a new `connection_id`, discards old
+  targets, establishes a measured hold, and requires a post-connect intent. The
+  collector invalidates an episode spanning a reconnect. Restarting the process
   creates a new session and requires restarting the collector to relock.
 - **“Exact SDK names” assumes the Python binding exposes names.** Product and
   active-DOF identity are mandatory. Exact name/order comparison is also made
@@ -83,37 +83,31 @@ executable. Process isolation keeps the Python-only OmniHand SDK and its
 reconnect lifecycle out of the body controller. Dex3 remains in the legacy C++
 owner until a separately reviewed external backend exists.
 
-### Hand worker recovery and status
+### In-process hand reconnect and status
 
-`launch_data_collection.py --hand-backend omnihand --remote-ui` runs the hand
-controller as a child of `gear_sonic.end_effectors.supervisor`. The supervisor
-owns the public state endpoint (`5570`) and loopback reconnect endpoint (`5572`).
-It relays worker snapshots over a separate 50 Hz clock; blocking SDK calls affect
-the worker, not the browser reconnect control or state publisher.
+`launch_data_collection.py --hand-backend omnihand --remote-ui` runs one hand
+server (`controller run`). That process owns SDK connections, public state on
+port `5570`, and a loopback reconnect endpoint on `5572` (`--control-endpoint`).
+There is no child worker, process supervisor, or independent status relay.
 
-Transport failures request a fresh worker after a one-second delay. Ten seconds
-without a worker update also triggers replacement. A reconnect requests worker
-termination, escalates after two seconds, and starts a replacement only after
-the old process exits. Unexpected failures wait for manual reconnect. Known
-motor faults remain latched and never trigger automatic restart. The browser's
-**Reconnect Hands** button explicitly restarts the hand worker, including a
-faulted one; it does not restart the body controller, camera, or recorder.
+Backend-reported failures retry after `--reconnect-interval` (one second by
+default). Known motor faults, controller safety-check failures, and unexpected
+errors require an explicit reconnect. **Reconnect Hands** closes and reopens
+the SDK handles inside the same process. Its acknowledgement means the request
+was accepted, not that connection succeeded. It can reset a controller fault
+latch; startup feedback checks still apply. Body teleop, camera, and recorder
+processes are unaffected.
 
-`sequence` and `monotonic_ns` still identify the original control sample.
-`publish_sequence` identifies relay messages, and `state_age_s` measures the
-control sample's age on the supervisor's host. Receivers add their own elapsed
-time rather than comparing remote monotonic clocks. Heartbeats do not advance
-the collector's hand watermark. Feedback older than `--hand-state-max-age`
-(200 ms by default) is rejected even if relay messages keep arriving at 50 Hz.
-This does not compensate for unknown network transit time.
+State is published by the control loop; disconnected states are explicitly
+invalid. Browser status becomes stale after 200 ms without a message. The
+collector retains its receive-time causal selection and freshness rules, and
+rejects episodes spanning a change of `connection_id`. MuJoCo uses that ID to
+accept the new connection's reset sequence counter.
 
-The MuJoCo bridge also keys sequence checks by `worker_id`, so reconnecting a
-simulated hand does not leave its new commands behind the old worker's counter.
-
-Direct `controller run` remains supported without the supervisor. Physical
-workers still require `--enable-command` and the launcher's `OMNIHAND`
-acknowledgement. The existing 0.35 physical close scale and command cadence are
-unchanged. Test recovery with simulated workers before commissioning on hardware.
+This handles SDK operations that return errors, not native hangs or crashes.
+An SDK call that never returns blocks reconnect and state publication until the
+operator restarts the hand server. No physical close-scale, command-cadence,
+profile, or command-enable acknowledgement changes are introduced.
 
 ### Ownership modes in C++
 

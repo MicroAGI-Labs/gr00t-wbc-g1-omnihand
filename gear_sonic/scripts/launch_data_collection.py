@@ -501,7 +501,6 @@ def main(config: DataCollectionLaunchConfig):
         close_scale = config.omnihand_sim_close_scale if config.sim else config.omnihand_close_scale
         hand_cmd = (
             f"cd {repo_root} && source {hand_venv}/bin/activate && "
-            "python -m gear_sonic.end_effectors.supervisor -- "
             f"python -m gear_sonic.end_effectors.controller run "
             f"--backend {hand_backend} --sides both "
             f"--left-interface {config.omnihand_left_interface} "

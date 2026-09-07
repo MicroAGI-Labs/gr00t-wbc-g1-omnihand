@@ -43,6 +43,5 @@ jobs:
             gear_sonic/tests/test_recording_pipeline.py \
             gear_sonic/tests/test_video_writer.py \
             gear_sonic/tests/test_zed_camera.py \
-            gear_sonic/end_effectors/tests/test_supervisor.py \
             gear_sonic/end_effectors/tests/test_end_effectors.py \
-            gear_sonic/end_effectors/tests/test_omnihand_mujoco.py::test_state_sequence_resets_on_worker_restart_within_same_session
+            gear_sonic/end_effectors/tests/test_omnihand_mujoco.py::test_state_sequence_resets_on_reconnect_within_same_session

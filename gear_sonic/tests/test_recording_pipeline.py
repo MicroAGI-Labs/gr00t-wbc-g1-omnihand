@@ -15,6 +15,7 @@ from gear_sonic.data.causal_sync import (
 )
 from gear_sonic.end_effectors.profiles import OMNIHAND_O10
 from gear_sonic.end_effectors.protocol import HAND_STATE_SCHEMA, HAND_STATE_TOPIC, encode
+from gear_sonic.scripts.run_camera_web_viewer import CameraWebViewerConfig, RecorderControlHub
 from gear_sonic.scripts.run_data_exporter import GrootDataCollector
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 
@@ -319,7 +320,7 @@ def test_rejected_finalizer_handoff_restores_completed_episode(monkeypatch):
     assert "observation.images.ego_view" in collector.data_exporter.video_writers
 
 
-def test_hand_heartbeats_do_not_advance_watermark_and_restart_invalidates_episode():
+def test_hand_reconnect_invalidates_recording_but_not_idle_collector():
     collector = _recording_collector()
     collector.hand_config = {"session_id": "session"}
     collector.hand_profile = OMNIHAND_O10
@@ -327,27 +328,41 @@ def test_hand_heartbeats_do_not_advance_watermark_and_restart_invalidates_episod
     messages = deque()
     collector._hand_zmq_socket = SimpleNamespace(poll=lambda _: bool(messages), recv=messages.popleft)
 
-    def receive(worker, sequence, age):
-        messages.append(encode(HAND_STATE_TOPIC, dict(
-            schema=HAND_STATE_SCHEMA, session_id="session", profile=OMNIHAND_O10.name,
-            worker_id=worker, sequence=sequence, state_age_s=age, mode="tracking",
-        )))
+    def receive(connection, sequence):
+        messages.append(
+            encode(
+                HAND_STATE_TOPIC,
+                dict(
+                    schema=HAND_STATE_SCHEMA,
+                    session_id="session",
+                    profile=OMNIHAND_O10.name,
+                    connection_id=connection,
+                    sequence=sequence,
+                    mode="tracking",
+                ),
+            )
+        )
         collector._poll_hand_zmq()
 
-    receive("first", 1, 0.01)
-    watermark = collector._synchronizer.status()["hand"]["watermark_ns"]
-    receive("first", 1, 0.3)
-    assert collector._synchronizer.status()["hand"]["watermark_ns"] == watermark
-    with pytest.raises(RuntimeError, match="snapshot is stale"):
-        collector._validate_hand_freshness(collector.latest_hand_state, time.monotonic_ns())
-    receive("second", 1, 0.01)
-    assert collector._synchronizer.status()["hand"]["watermark_ns"] > watermark
-    assert collector._synchronization_errors == ["hand worker restarted during recording"]
+    receive("first", 1)
+    receive("first", 2)
+    assert collector._synchronization_errors == []
+    receive("second", 1)
+    assert collector._synchronization_errors == ["hand reconnected during recording"]
+    collector._next_target_ns = None
+    collector._synchronization_errors.clear()
+    receive("third", 1)
+    assert collector._synchronization_errors == []
 
 
-def test_causal_hand_validation_includes_relay_and_collector_age():
-    collector = _recording_collector()
-    state = {"worker_id": "worker", "state_age_s": 0.15, "received_monotonic_ns": 1_000_000_000}
-    collector._validate_hand_freshness(state, 1_040_000_000)
-    with pytest.raises(RuntimeError, match="snapshot is stale"):
-        collector._validate_hand_freshness(state, 1_060_000_000)
+def test_hand_ui_reports_stale_status_without_a_relay(monkeypatch):
+    hub = RecorderControlHub(CameraWebViewerConfig(hand_controls=True))
+    assert hub.hands_status()["last_status_age_s"] is None
+    hub._hand_received_at = 10.0
+    hub._hand_status = {"sides": {"left": {"valid": True, "connected": True}}}
+    monkeypatch.setattr(time, "monotonic", lambda: 10.1)
+    assert hub.hands_status()["connected"]
+    monkeypatch.setattr(time, "monotonic", lambda: 10.3)
+    assert not hub.hands_status()["connected"]
+    hub.config.hand_controls = False
+    assert not hub.reconnect_hands()["accepted"]

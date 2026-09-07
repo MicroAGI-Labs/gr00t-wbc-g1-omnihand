@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-import math
 from typing import Any
 
 import msgpack
@@ -18,20 +17,6 @@ HAND_STATE_SCHEMA = "sonic.hand_state.v1"
 HAND_SIM_FEEDBACK_SCHEMA = "sonic.hand_sim_feedback.v1"
 HAND_CONTROL_TOPIC = b"hand_control"
 HAND_CONTROL_SCHEMA = "sonic.hand_control.v1"
-RECOVERABLE_DISCONNECT_EXIT_CODE = 75
-
-
-def hand_state_age_s(payload: Mapping[str, Any], elapsed_s: float = 0.0) -> float | None:
-    """Age of the actual control snapshot, plus time spent at this receiver.
-
-    Clock differences are computed by the supervisor on the worker's host.
-    Legacy direct publishers have no relay delay; a supervised message must
-    explicitly supply a valid age. Never compare clocks from different hosts.
-    """
-    age = payload.get("state_age_s", None if "worker_id" in payload else 0.0)
-    if isinstance(age, bool) or not isinstance(age, (int, float)) or not math.isfinite(age) or age < 0:
-        return None
-    return float(age) + max(0.0, elapsed_s)
 
 
 class HandProtocolError(ValueError):
