@@ -372,9 +372,15 @@ def run(args: argparse.Namespace) -> int:
     publisher.bind(args.state_endpoint)
     control = context.socket(zmq.REP)
     connection_id: str | None = None
+    state_sequence = 0
 
     def publish(topic: bytes, payload: dict) -> None:
+        nonlocal state_sequence
         payload = dict(payload, connection_id=connection_id)
+        if topic == HAND_STATE_TOPIC:
+            # Wire sequences belong to the server session, not SDK connections.
+            state_sequence += 1
+            payload["sequence"] = state_sequence
         try:
             publisher.send(encode(topic, payload), flags=zmq.NOBLOCK)
         except zmq.Again:
@@ -473,7 +479,6 @@ def run(args: argparse.Namespace) -> int:
                     {
                         "schema": HAND_STATE_SCHEMA,
                         "session_id": session_id,
-                        "sequence": 0,
                         "monotonic_ns": int(started * 1e9),
                         "backend": args.backend,
                         "profile": profile.name,

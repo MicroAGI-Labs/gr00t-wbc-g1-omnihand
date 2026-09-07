@@ -101,8 +101,9 @@ processes are unaffected.
 State is published by the control loop; disconnected states are explicitly
 invalid. Browser status becomes stale after 200 ms without a message. The
 collector retains its receive-time causal selection and freshness rules, and
-rejects episodes spanning a change of `connection_id`. MuJoCo uses that ID to
-accept the new connection's reset sequence counter.
+rejects episodes spanning a change of `connection_id`. Published state sequence
+numbers increase throughout the server session, including disconnected states,
+and do not reset on reconnect. Existing consumers need no special reset handling.
 
 This handles SDK operations that return errors, not native hangs or crashes.
 An SDK call that never returns blocks reconnect and state publication until the

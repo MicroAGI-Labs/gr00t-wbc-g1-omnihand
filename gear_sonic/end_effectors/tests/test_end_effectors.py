@@ -460,12 +460,16 @@ def test_server_reconnects_in_process_and_preserves_fault_latch(monkeypatch):
         )
         server = threading.Thread(target=lambda: results.append(controller_module.run(args)), daemon=True)
         server.start()
+        last_sequence = 0
 
         def receive(predicate):
+            nonlocal last_sequence
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 if state.poll(50):
                     payload = decode_state(state.recv())
+                    assert payload["sequence"] > last_sequence
+                    last_sequence = payload["sequence"]
                     if predicate(payload):
                         return payload
             pytest.fail("hand server did not publish expected state")
