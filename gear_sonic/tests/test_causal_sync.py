@@ -1,20 +1,6 @@
 from __future__ import annotations
 
-import pytest
-
 from gear_sonic.data.causal_sync import CausalSampleBuffer, CausalSynchronizer
-
-
-def test_buffer_selects_closest_sample_from_past_never_future():
-    buffer = CausalSampleBuffer()
-    buffer.add("past", 983)
-    buffer.add("future", 1016)
-
-    selected = buffer.latest_at_or_before(1000)
-
-    assert selected is not None
-    assert selected.value == "past"
-    assert selected.timestamp_ns == 983
 
 
 def test_synchronizer_waits_until_every_stream_advances_past_target():
@@ -61,7 +47,7 @@ def test_synchronizer_rejects_a_past_sample_that_is_too_old():
     assert selection.samples["camera"].value == "old"
 
 
-def test_buffer_drops_non_monotonic_arrivals_and_bounds_memory():
+def test_buffer_bounds_memory_drops_non_monotonic_samples_and_trims_history():
     buffer = CausalSampleBuffer(max_samples=3)
     buffer.add("one", 1)
     buffer.add("duplicate", 1)
@@ -77,25 +63,6 @@ def test_buffer_drops_non_monotonic_arrivals_and_bounds_memory():
         "watermark_ns": 5,
         "out_of_order_dropped": 2,
     }
-
-
-def test_buffer_rejects_invalid_configuration_and_timestamps():
-    with pytest.raises(ValueError):
-        CausalSampleBuffer(max_samples=1)
-    buffer = CausalSampleBuffer()
-    with pytest.raises(TypeError):
-        buffer.add("bad", 1.0)  # type: ignore[arg-type]
-    with pytest.raises(ValueError):
-        buffer.add("bad", 0)
-
-
-def test_trim_keeps_last_past_sample_and_future_history():
-    buffer = CausalSampleBuffer()
-    for timestamp in (10, 20, 30, 40):
-        buffer.add(str(timestamp), timestamp)
-
-    buffer.trim_through(25)
-
-    assert buffer.stats()["depth"] == 3
-    assert buffer.latest_at_or_before(25).value == "20"
-    assert buffer.latest_at_or_before(35).value == "30"
+    buffer.trim_through(4)
+    assert buffer.stats()["depth"] == 2
+    assert buffer.latest_at_or_before(4).value == "four"

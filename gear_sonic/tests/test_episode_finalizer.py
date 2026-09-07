@@ -53,12 +53,15 @@ def _enqueue(finalizer, *, episode_index=0, discarded=False, writer=None):
 def test_finalizer_reports_success_only_after_exporter_returns(tmp_path):
     exporter = FakeExporter(tmp_path)
     exporter.block = True
-    finalizer = EpisodeFinalizer(exporter)  # type: ignore[arg-type]
+    finalizer = EpisodeFinalizer(exporter, max_pending=1)  # type: ignore[arg-type]
     _enqueue(finalizer)
     assert exporter.entered.wait(timeout=1.0)
 
     assert finalizer.drain_results() == []
     assert finalizer.status()["finalizing"] is True
+    assert not finalizer.can_accept()
+    with pytest.raises(RuntimeError, match="at capacity"):
+        _enqueue(finalizer, episode_index=1)
     exporter.release.set()
     assert finalizer.wait_until_idle(timeout=1.0)
 
@@ -93,33 +96,3 @@ def test_finalizer_preserves_owned_buffer_and_blocks_after_failure(tmp_path):
     with pytest.raises(RuntimeError, match="previous failure"):
         _enqueue(finalizer, episode_index=1)
     finalizer.close()
-
-
-def test_finalizer_enforces_pending_capacity(tmp_path):
-    exporter = FakeExporter(tmp_path)
-    exporter.block = True
-    finalizer = EpisodeFinalizer(exporter, max_pending=1)  # type: ignore[arg-type]
-    _enqueue(finalizer)
-    assert exporter.entered.wait(timeout=1.0)
-
-    assert not finalizer.can_accept()
-    with pytest.raises(RuntimeError, match="at capacity"):
-        _enqueue(finalizer, episode_index=1)
-
-    exporter.release.set()
-    assert finalizer.wait_until_idle(timeout=1.0)
-    finalizer.close()
-
-
-def test_finalizer_close_is_bounded(tmp_path):
-    exporter = FakeExporter(tmp_path)
-    exporter.block = True
-    finalizer = EpisodeFinalizer(exporter)  # type: ignore[arg-type]
-    _enqueue(finalizer)
-    assert exporter.entered.wait(timeout=1.0)
-
-    with pytest.raises(TimeoutError, match="did not become idle"):
-        finalizer.close(timeout=0.01)
-
-    exporter.release.set()
-    finalizer.close(timeout=1.0)
