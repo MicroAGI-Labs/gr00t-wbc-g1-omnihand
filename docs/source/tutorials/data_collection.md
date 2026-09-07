@@ -154,9 +154,10 @@ Pass `--camera-host <THOR_IP>` only when a client runs on another computer.
 
 ### Frame Rates
 
-- Existing 30 FPS cameras publish only new frames. The 50 Hz exporter reuses its cached latest image when no new image arrived.
-- ZED captures and publishes at 60 FPS. The exporter samples the latest message at 50 Hz; ZMQ discards superseded messages rather than interpolating frames.
+- Existing 30 FPS cameras publish only new frames. The 50 Hz exporter deliberately reuses the cached image between arrivals, while rejecting a stalled stream or a source below `--minimum-camera-rate-hz` (25 Hz by default).
+- ZED captures and publishes at 60 FPS. A bounded FIFO absorbs short scheduling stalls before the exporter samples it at 50 Hz. Old frames are trimmed to keep latency bounded rather than allowing an unbounded backlog.
 - The dataset timeline is controlled by `--data-collection-frequency` (50 Hz by default).
+- The browser status reports camera receive/publish rates, queue depth, local overflow/latency drops, and publisher sequence gaps.
 
 The tmux launcher accepts the same host setting:
 
@@ -173,11 +174,14 @@ The camera server publishes a single msgpack-encoded payload per frame cycle con
 ```python
 {
     "timestamps": {"ego_view": 1712345678.123, "left_wrist": 1712345678.125},
+    "capture_monotonic_ns": {"ego_view": 99800123, "left_wrist": 99802125},
+    "publisher_sequence": 42,
+    "publisher_monotonic_ns": 99810000,
     "images": {"ego_view": "<base64-jpeg>", "left_wrist": "<base64-jpeg>"}
 }
 ```
 
-Images are JPEG-compressed (quality 80) and either base64-encoded strings or raw JPEG bytes (when MJPEG on-device encoding is enabled). The data exporter's `ComposedCameraClientSensor` handles both formats automatically.
+Capture times are retained independently for every camera, so one fresh camera cannot hide a stale wrist or head camera. Monotonic intervals are calculated within each host's clock domain, so a remote camera server does not require matching boot-time clock origins. Images are JPEG-compressed (quality 80) and either base64-encoded strings or raw JPEG bytes (when MJPEG on-device encoding is enabled). The data exporter's `ComposedCameraClientSensor` handles both formats automatically.
 
 ---
 
@@ -368,6 +372,8 @@ These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent
 | `c` | **Toggle** recording (same as X + B) |
 | `x` | **Discard** episode (same as Y + A — flagged for removal) |
 
+Stopping or discarding detaches the active episode immediately and finalizes its videos and metadata in a background worker. The UI says that the episode is queued while this work is in progress and reports it as saved only after the durable commit succeeds. A new recording remains disabled until that commit completes. If finalization fails, the previous metadata is restored and recoverable episode files are kept under the dataset's `recovery/` directory.
+
 ```{note}
 Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.
 ```
@@ -418,6 +424,9 @@ Key options:
 | `--data-collection-frequency` | `50` | Recording frequency in Hz |
 | `--camera-host` | `localhost` | Camera server hostname |
 | `--camera-port` | `5555` | Camera server port |
+| `--camera-max-age` | `0.25` | Maximum age of every required camera frame while recording |
+| `--minimum-camera-rate-hz` | `25.0` | Minimum live camera publish rate admitted while recording |
+| `--finalizer-shutdown-timeout` | `30.0` | Maximum shutdown wait for a pending episode commit |
 | `--sonic-zmq-host` | `localhost` | SMPL pose publisher host |
 | `--sonic-zmq-port` | `5556` | SMPL pose publisher port |
 | `--state-zmq-host` | `localhost` | Robot state publisher host |

@@ -30,7 +30,14 @@ from scipy.spatial.transform import Rotation as R
 import tyro
 import zmq
 
-from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+from gear_sonic.camera.composed_camera import (
+    ComposedCameraClientSensor,
+    estimate_camera_age_s,
+)
+from gear_sonic.data.episode_finalizer import (
+    EpisodeFinalizationResult,
+    EpisodeFinalizer,
+)
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.features_sonic_vla import (
     assemble_dataset_configuration,
@@ -86,6 +93,15 @@ class SonicDataExporterConfig:
 
     camera_port: int = 5555
     """Camera server port."""
+
+    camera_max_age: float = 0.25
+    """Maximum age of every required camera frame while recording."""
+
+    minimum_camera_rate_hz: float = 25.0
+    """Minimum live camera publish rate admitted while recording."""
+
+    finalizer_shutdown_timeout: float = 30.0
+    """Maximum shutdown wait for an episode commit."""
 
     # ZMQ: Sonic / SMPL pose (from pico_manager_thread_server)
     sonic_zmq_host: str = "localhost"
@@ -281,6 +297,9 @@ class GrootDataCollector:
         hand_state_port: int = 5570,
         hand_state_max_age: float = .2,
         recording_status_port: int = 5581,
+        camera_max_age: float = 0.25,
+        minimum_camera_rate_hz: float = 25.0,
+        finalizer_shutdown_timeout: float = 30.0,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -290,21 +309,38 @@ class GrootDataCollector:
         self.hand_profile = hand_profile
         self.hand_config = hand_config
         self.hand_state_max_age = hand_state_max_age
+        if camera_max_age <= 0:
+            raise ValueError("camera_max_age must be positive")
+        if finalizer_shutdown_timeout <= 0:
+            raise ValueError("finalizer_shutdown_timeout must be positive")
+        if minimum_camera_rate_hz <= 0:
+            raise ValueError("minimum_camera_rate_hz must be positive")
+        self.camera_max_age = camera_max_age
+        self.minimum_camera_rate_hz = minimum_camera_rate_hz
+        self.finalizer_shutdown_timeout = finalizer_shutdown_timeout
         self.latest_hand_state = None
         self.latest_hand_state_received_at = None
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
+        self.episode_finalizer = EpisodeFinalizer(data_exporter, max_pending=1)
+        self._last_finalization: EpisodeFinalizationResult | None = None
         self._recording_message = "Ready to record"
         self._recording_status_ctx = zmq.Context()
         self._recording_status_socket = self._recording_status_ctx.socket(zmq.PUB)
         self._recording_status_socket.setsockopt(zmq.SNDHWM, 2)
         self._recording_status_socket.bind(f"tcp://*:{recording_status_port}")
 
-        self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
+        self._image_subscriber = ComposedCameraClientSensor(
+            server_ip=camera_host,
+            port=camera_port,
+            background=True,
+        )
 
         self.obs_act_buffer = deque(maxlen=100)
         self.latest_image_msg = None
+        self.latest_image_received_at = None
+        self._episode_camera_stats_start: dict[str, object] = {}
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
@@ -368,9 +404,81 @@ class GrootDataCollector:
         else:
             print(message)
 
+    def _required_camera_names(self) -> set[str]:
+        return {
+            feature_name.rsplit(".", 1)[-1]
+            for feature_name, feature in self.data_exporter.features.items()
+            if feature.get("dtype") in {"image", "video"}
+        }
+
+    def _camera_health(self) -> dict[str, object]:
+        now = time.monotonic()
+        receiver_age = (
+            None
+            if self.latest_image_received_at is None
+            else max(0.0, now - self.latest_image_received_at)
+        )
+        images = (self.latest_image_msg or {}).get("images", {})
+        camera_ages = {}
+        missing = []
+        stale = []
+        for camera_name in sorted(self._required_camera_names()):
+            if images.get(camera_name) is None:
+                missing.append(camera_name)
+                continue
+            age = estimate_camera_age_s(self.latest_image_msg, camera_name)
+            if age is None:
+                age = receiver_age
+            camera_ages[camera_name] = None if age is None else round(age, 4)
+            if age is None or age > self.camera_max_age:
+                stale.append(camera_name)
+        buffer = self._image_subscriber.buffer_stats()
+        measured_rate = buffer.get("publisher_hz") or buffer.get("received_hz")
+        rate_ready = (
+            isinstance(measured_rate, (int, float))
+            and measured_rate >= self.minimum_camera_rate_hz
+        )
+        ready = (
+            receiver_age is not None
+            and receiver_age <= self.camera_max_age
+            and not missing
+            and not stale
+            and rate_ready
+        )
+        return {
+            "ready": ready,
+            "receiver_age_s": (
+                None if receiver_age is None else round(receiver_age, 4)
+            ),
+            "camera_age_s": camera_ages,
+            "missing": missing,
+            "stale": stale,
+            "buffer": buffer,
+            "minimum_rate_hz": self.minimum_camera_rate_hz,
+            "rate_ready": rate_ready,
+        }
+
+    def _consume_finalizer_results(self) -> None:
+        for result in self.episode_finalizer.drain_results():
+            self._last_finalization = result
+            if result.succeeded:
+                outcome = "discarded" if result.discarded else "saved"
+                message = f"Episode {result.episode_index} {outcome}"
+                self._print_and_say(message, blocking=False)
+            else:
+                message = f"Episode {result.episode_index} save failed: {result.error}"
+                if result.recovery_path:
+                    message += f"; recovery: {result.recovery_path}"
+                self._print_and_say(message, say=False)
+            if self._episode_state.get_state() == self._episode_state.IDLE:
+                self._recording_message = message
+
     def _publish_recording_status(self) -> None:
         """Publish authoritative recorder state for the loopback browser UI."""
+        self._consume_finalizer_results()
         state = self._episode_state.get_state()
+        finalizer = self.episode_finalizer.status()
+        camera = self._camera_health()
         hand_ready = True
         if self.hand_config is not None:
             hand_ready = bool(
@@ -385,16 +493,29 @@ class GrootDataCollector:
         payload = {
             "state": state,
             "recording": state == self._episode_state.RECORDING,
-            "saving": state == self._episode_state.NEED_TO_SAVE,
+            "saving": bool(finalizer["pending"]),
             "episode_index": self.current_episode_index,
             "frame_count": self.data_exporter.episode_buffer.get("size", 0),
             "total_episodes": self.data_exporter.meta.info.get("total_episodes", 0),
             "dataset_root": str(self.data_exporter.meta.root),
             "sources": {
                 "proprio": self.latest_proprio_msg is not None,
-                "camera": self.latest_image_msg is not None,
+                "camera": camera["ready"],
                 "hands": hand_ready,
             },
+            "camera": camera,
+            "finalizer": finalizer,
+            "last_finalization": (
+                None
+                if self._last_finalization is None
+                else {
+                    "episode_index": self._last_finalization.episode_index,
+                    "discarded": self._last_finalization.discarded,
+                    "succeeded": self._last_finalization.succeeded,
+                    "error": self._last_finalization.error,
+                    "recovery_path": self._last_finalization.recovery_path,
+                }
+            ),
             "message": self._recording_message,
             "timestamp": time.time(),
         }
@@ -466,6 +587,57 @@ class GrootDataCollector:
                 values.append(array)
         return tuple(values)
 
+    def _episode_validation(self, *, discarded: bool, reason: str) -> dict[str, object]:
+        current_stats = self._image_subscriber.buffer_stats()
+        drop_deltas = {
+            key: int(current_stats.get(key, 0))
+            - int(self._episode_camera_stats_start.get(key, 0))
+            for key in (
+                "received",
+                "overflow_dropped",
+                "latency_dropped",
+                "publisher_gap_dropped",
+                "publisher_resets",
+            )
+        }
+        return {
+            "passed": not discarded,
+            "errors": [reason] if discarded else [],
+            "camera_buffer": {
+                **current_stats,
+                "episode_deltas": drop_deltas,
+            },
+            "camera_health_at_stop": self._camera_health(),
+        }
+
+    def _finish_recording(self, *, discarded: bool, reason: str) -> None:
+        episode_index = self.current_episode_index
+        buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+        if buffer_size <= 0:
+            self._episode_state.reset_state()
+            self._initial_yaw = None
+            self._recording_message = "Nothing saved: no frames collected"
+            self._print_and_say("Skipping empty recording", say=False)
+            return
+
+        episode_buffer, video_writers = self.data_exporter.detach_episode()
+        validation = self._episode_validation(discarded=discarded, reason=reason)
+        self.episode_finalizer.enqueue(
+            episode_index=episode_index,
+            episode_buffer=episode_buffer,
+            video_writers=video_writers,
+            discarded=discarded,
+            validation=validation,
+        )
+        self.sonic_timing_monitor.reset()
+        self._episode_state.reset_state()
+        self._initial_yaw = None
+        outcome = "discard" if discarded else "save"
+        self._recording_message = (
+            f"Episode {episode_index} queued for background {outcome}"
+        )
+        self._print_and_say(self._recording_message, say=False)
+
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
         key = self._keyboard_listener.read_msg()
@@ -477,35 +649,31 @@ class GrootDataCollector:
             key = "c"
             self._manager_toggle_dc = False
 
+        state = self._episode_state.get_state()
         if key == "c":
-            self._episode_state.change_state()
-            if self._episode_state.get_state() == self._episode_state.RECORDING:
+            if state == self._episode_state.IDLE:
+                if not self.episode_finalizer.can_accept():
+                    self._recording_message = (
+                        "Cannot start: previous episode is still finalizing or failed"
+                    )
+                    self._print_and_say(self._recording_message, say=False)
+                    return
+                self._episode_state.change_state()
                 self._initial_yaw = None
+                self._episode_camera_stats_start = (
+                    self._image_subscriber.buffer_stats()
+                )
                 self._recording_message = f"Recording episode {self.current_episode_index}"
                 self._print_and_say(
                     f"Started recording {self.current_episode_index}", blocking=False
                 )
-            elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
-                self._recording_message = f"Saving episode {self.current_episode_index}"
-                self._print_and_say("Stopping recording, preparing to save", blocking=False)
-            elif self._episode_state.get_state() == self._episode_state.IDLE:
-                self._print_and_say("Saved episode and back to idle state", blocking=False)
-        elif key == "x":
-            if self._episode_state.get_state() == self._episode_state.RECORDING:
-                buffer_size = self.data_exporter.episode_buffer.get("size", 0)
-                if buffer_size > 0:
-                    self.data_exporter.save_episode_as_discarded()
-                    message = "Episode discarded"
-                else:
-                    # A discard can arrive before the first complete frame (for
-                    # example while an external hand source is still starting).
-                    # LeRobot rejects zero-frame episodes, so just return the
-                    # recorder to idle in that case.
-                    message = "Nothing discarded: no frames collected"
-                self._episode_state.reset_state()
-                self._initial_yaw = None
-                self._recording_message = message
-                self._print_and_say(message, blocking=False)
+            elif state == self._episode_state.RECORDING:
+                self._finish_recording(discarded=False, reason="")
+        elif key == "x" and state == self._episode_state.RECORDING:
+            self._finish_recording(
+                discarded=True,
+                reason="operator requested discard",
+            )
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
@@ -714,20 +882,6 @@ class GrootDataCollector:
         t_end = time.monotonic()
         if t_end - t_start > (1 / self.frequency):
             print(f"DataExporter Missed: {t_end - t_start} sec")
-
-        if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
-            saved_episode = self.current_episode_index
-            buffer_size = self.data_exporter.episode_buffer.get("size", 0)
-            if buffer_size > 0:
-                self.data_exporter.save_episode()
-                self.sonic_timing_monitor.reset()
-                self._initial_yaw = None
-                self._recording_message = f"Saved episode {saved_episode}"
-                self._print_and_say("Finished saving episode")
-            else:
-                self._recording_message = "Nothing saved: no frames collected"
-                self._print_and_say("Skipping save: no frames collected", say=False)
-            self._episode_state.change_state()
         return True
 
     def _add_data_frame(self):
@@ -745,6 +899,18 @@ class GrootDataCollector:
         if self._episode_state.get_state() != self._episode_state.RECORDING:
             return self._finalize_frame(t_start)
 
+        camera_health = self._camera_health()
+        if not camera_health["ready"]:
+            now = time.monotonic()
+            if now - getattr(self, "_last_camera_block_log", 0.0) > 1.0:
+                print(
+                    "[Camera] recording blocked: "
+                    f"missing={camera_health['missing']} stale={camera_health['stale']} "
+                    f"receiver_age_s={camera_health['receiver_age_s']}"
+                )
+                self._last_camera_block_log = now
+            return False
+
         if self.hand_config is not None:
             try:
                 self._external_hand_values()
@@ -755,7 +921,8 @@ class GrootDataCollector:
                     self._last_hand_block_log = now
                 return False
 
-        return self._add_data_frame_sonic(t_start)
+        added = self._add_data_frame_sonic(t_start)
+        return added
 
     def _add_data_frame_sonic(self, t_start: float) -> bool:
         """Build one data frame in Sonic CPP + SMPL mode."""
@@ -1067,15 +1234,32 @@ class GrootDataCollector:
 
     def save_and_cleanup(self):
         try:
-            self._print_and_say("saving episode done", blocking=False)
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
-                self.data_exporter.save_episode()
+                self._finish_recording(
+                    discarded=True,
+                    reason="collector shut down before an explicit save",
+                )
+            self.episode_finalizer.close(
+                timeout=self.finalizer_shutdown_timeout
+            )
+            self._consume_finalizer_results()
             self._print_and_say(
                 f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
             )
         except Exception as e:
-            self._print_and_say(f"Error saving episode: {e}", blocking=True)
+            self._print_and_say(f"Error finalizing episode: {e}", blocking=True)
+
+        for writer in self.data_exporter.video_writers.values():
+            try:
+                writer.cancel(timeout_s=5.0)
+            except Exception as exc:
+                print(f"[Exporter] Could not close unused video writer: {exc}")
+
+        try:
+            self._image_subscriber.close()
+        except Exception as exc:
+            print(f"[Camera] Could not close receiver cleanly: {exc}")
 
         try:
             self._state_subscriber.close()
@@ -1102,6 +1286,7 @@ class GrootDataCollector:
         self._print_and_say("Shutting down data exporter...", say=False)
 
     def run(self):
+        next_tick = time.monotonic()
         try:
             while True:
                 t_start = time.monotonic()
@@ -1116,9 +1301,22 @@ class GrootDataCollector:
                         self._poll_hand_zmq()
 
                     with self.telemetry.timer("poll_image"):
+                        previous_image_index = self._image_subscriber.idx
                         img_msg = self._image_subscriber.read()
                         if img_msg is not None:
                             self.latest_image_msg = img_msg
+                        if (
+                            img_msg is not None
+                            and self._image_subscriber.idx != previous_image_index
+                        ):
+                            received_ns = img_msg.get("receiver_monotonic_ns")
+                            if not (
+                                isinstance(received_ns, int)
+                                and not isinstance(received_ns, bool)
+                                and received_ns > 0
+                            ):
+                                received_ns = time.monotonic_ns()
+                            self.latest_image_received_at = received_ns / 1e9
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
@@ -1130,8 +1328,13 @@ class GrootDataCollector:
 
                     end_time = time.monotonic()
 
-                elapsed = time.monotonic() - t_start
-                sleep_time = self.loop_period - elapsed
+                # Absolute pacing avoids accumulating time.sleep wake-up drift.
+                next_tick += self.loop_period
+                now = time.monotonic()
+                if next_tick < now - self.loop_period:
+                    skipped_ticks = int((now - next_tick) / self.loop_period) + 1
+                    next_tick += skipped_ticks * self.loop_period
+                sleep_time = next_tick - now
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
@@ -1142,9 +1345,6 @@ class GrootDataCollector:
 
         except KeyboardInterrupt:
             print("Data exporter terminated by user")
-            buffer_size = self.data_exporter.episode_buffer.get("size", 0)
-            if buffer_size > 0:
-                self.data_exporter.save_episode_as_discarded()
 
         finally:
             self.save_and_cleanup()
@@ -1215,6 +1415,9 @@ def main(config: SonicDataExporterConfig):
         robot_model=g1_rm,
         camera_host=config.camera_host,
         camera_port=config.camera_port,
+        camera_max_age=config.camera_max_age,
+        minimum_camera_rate_hz=config.minimum_camera_rate_hz,
+        finalizer_shutdown_timeout=config.finalizer_shutdown_timeout,
         text_to_speech=text_to_speech,
         sonic_data_zmq_host=config.sonic_zmq_host,
         sonic_data_zmq_port=config.sonic_zmq_port,

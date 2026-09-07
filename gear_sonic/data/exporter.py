@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Optional
+from typing import Any
 
 import datasets
 from datasets import load_dataset
@@ -22,7 +22,6 @@ from lerobot.common.datasets.lerobot_dataset import (
 )
 from lerobot.common.datasets.utils import (
     check_timestamps_sync,
-    get_episode_data_index,
     validate_episode_buffer,
     validate_frame,
 )
@@ -34,6 +33,147 @@ from torchvision import transforms
 from gear_sonic.data.video_writer import VideoWriter
 
 disable_progress_bars()
+
+
+_TRANSACTION_METADATA_FILES = (
+    "info.json",
+    "tasks.jsonl",
+    "episodes.jsonl",
+    "episodes_stats.jsonl",
+    "stats.json",
+    "episode_quality.jsonl",
+)
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with open(temporary, "wb") as output:
+        output.write(payload)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, path)
+
+
+class _EpisodeCommitTransaction:
+    """Recover a partially written episode metadata commit."""
+
+    ROOT = Path("meta/.transactions")
+
+    def __init__(self, exporter: "Gr00tDataExporter", episode_index: int):
+        self.exporter = exporter
+        self.root = Path(exporter.root)
+        self.episode_index = episode_index
+        self.path = self.root / self.ROOT / f"episode_{episode_index:06d}"
+        self._metadata_state: dict[str, Any] = {}
+
+    @staticmethod
+    def _episode_files(exporter: "Gr00tDataExporter", episode_index: int) -> list[Path]:
+        paths = [Path(exporter.meta.get_data_file_path(episode_index))]
+        paths.extend(
+            Path(exporter.meta.get_video_file_path(episode_index, key))
+            for key in exporter.meta.video_keys
+        )
+        return paths
+
+    @classmethod
+    def recover_pending(cls, root: str | Path) -> None:
+        dataset_root = Path(root)
+        transactions_root = dataset_root / cls.ROOT
+        if not transactions_root.is_dir():
+            return
+        for transaction_path in sorted(transactions_root.iterdir()):
+            if not transaction_path.is_dir():
+                continue
+            if (transaction_path / "COMMITTED").is_file():
+                shutil.rmtree(transaction_path, ignore_errors=True)
+                continue
+            manifest_path = transaction_path / "manifest.json"
+            if not manifest_path.is_file():
+                raise RuntimeError(f"incomplete episode journal: {transaction_path}")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for name, existed in manifest["metadata"].items():
+                if Path(name).name != name:
+                    raise RuntimeError(
+                        f"unsafe metadata path in episode journal: {name!r}"
+                    )
+                target = dataset_root / "meta" / name
+                backup = transaction_path / "metadata" / name
+                if existed:
+                    _atomic_write(target, backup.read_bytes())
+                else:
+                    target.unlink(missing_ok=True)
+            recovery_root = (
+                dataset_root
+                / "recovery"
+                / f"episode_{int(manifest['episode_index']):06d}"
+                / "files"
+            )
+            for relative_value in manifest["episode_files"]:
+                relative_path = Path(relative_value)
+                if relative_path.is_absolute() or ".." in relative_path.parts:
+                    raise RuntimeError(
+                        f"unsafe path in episode journal: {relative_value!r}"
+                    )
+                source = dataset_root / relative_path
+                if source.is_file():
+                    target = recovery_root / relative_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(source, target)
+            shutil.rmtree(transaction_path)
+
+    def begin(self) -> None:
+        self.recover_pending(self.root)
+        self.path.mkdir(parents=True, exist_ok=False)
+        try:
+            metadata_manifest: dict[str, bool] = {}
+            for name in _TRANSACTION_METADATA_FILES:
+                source = self.root / "meta" / name
+                metadata_manifest[name] = source.is_file()
+                if source.is_file():
+                    backup = self.path / "metadata" / name
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, backup)
+            episode_files = []
+            for path in self._episode_files(self.exporter, self.episode_index):
+                if path.is_absolute() or ".." in path.parts:
+                    raise RuntimeError(f"unsafe episode output path: {path}")
+                episode_files.append(str(path))
+            manifest = {
+                "episode_index": self.episode_index,
+                "metadata": metadata_manifest,
+                "episode_files": episode_files,
+            }
+            _atomic_write(
+                self.path / "manifest.json",
+                json.dumps(manifest, sort_keys=True).encode("utf-8"),
+            )
+            for attribute in (
+                "info",
+                "episodes",
+                "episodes_stats",
+                "stats",
+                "tasks",
+                "task_to_task_index",
+            ):
+                if hasattr(self.exporter.meta, attribute):
+                    self._metadata_state[attribute] = copy.deepcopy(
+                        getattr(self.exporter.meta, attribute)
+                    )
+        except Exception:
+            shutil.rmtree(self.path, ignore_errors=True)
+            raise
+
+    def rollback(self) -> None:
+        self.recover_pending(self.root)
+        for attribute, value in self._metadata_state.items():
+            setattr(self.exporter.meta, attribute, value)
+
+    def commit(self) -> None:
+        _atomic_write(self.path / "COMMITTED", b"committed\n")
+        # Once the marker is durable, journal cleanup is housekeeping and must
+        # not turn an already committed episode into a reported failure.
+        shutil.rmtree(self.path, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +342,7 @@ class Gr00tDataExporter(LeRobotDataset):
             shutil.rmtree(save_root)
 
         if (Path(save_root)).exists():
+            _EpisodeCommitTransaction.recover_pending(save_root)
             try:
                 obj.meta = Gr00tDatasetMetadata(
                     repo_id=repo_id,
@@ -317,99 +458,177 @@ class Gr00tDataExporter(LeRobotDataset):
         self.episode_buffer = self.create_episode_buffer()
         self.video_writers = self.create_video_writer()
 
-    def save_episode(self, episode_data: dict | None = None) -> None:
-        if not episode_data:
-            episode_buffer = self.episode_buffer
+    def detach_episode(self) -> tuple[dict[str, Any], dict[str, VideoWriter]]:
+        """Rotate active buffers so finalization can run in another thread."""
+        episode_buffer = self.episode_buffer
+        video_writers = self.video_writers
+        next_episode_index = int(episode_buffer["episode_index"]) + 1
+        self.episode_buffer = self.create_episode_buffer(
+            episode_index=next_episode_index
+        )
+        self.video_writers = self.create_video_writer()
+        return episode_buffer, video_writers
+
+    def save_episode(
+        self,
+        episode_data: dict | None = None,
+        *,
+        video_writers: dict[str, VideoWriter] | None = None,
+        discarded: bool = False,
+        validation: dict[str, Any] | None = None,
+    ) -> None:
+        active_episode = episode_data is None
+        source_buffer = self.episode_buffer if active_episode else episode_data
+        # Finalization pops and stacks fields. Retain a detached source buffer
+        # unchanged so a failed background job can persist it for recovery.
+        episode_buffer = copy.deepcopy(source_buffer)
+        writers = self.video_writers if video_writers is None else video_writers
 
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
         episode_length = episode_buffer.pop("size")
         tasks = episode_buffer.pop("task")
-        episode_tasks = list(set(tasks))
-        episode_index = episode_buffer["episode_index"]
+        episode_tasks = list(dict.fromkeys(tasks))
+        episode_index = int(episode_buffer["episode_index"])
 
         episode_buffer["index"] = np.arange(
             self.meta.total_frames, self.meta.total_frames + episode_length
         )
         episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
 
-        for task in episode_tasks:
-            task_index = self.meta.get_task_index(task)
-            if task_index is None:
-                self.meta.add_task(task)
-
-        episode_buffer["task_index"] = np.array([self.meta.get_task_index(task) for task in tasks])
-
         for key, ft in self.features.items():
             if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
                 continue
             episode_buffer[key] = np.stack(episode_buffer[key])
 
-        self._wait_image_writer()
-        self._save_episode_table(episode_buffer, episode_index)
-
-        non_video_features = {k: v for k, v in self.features.items() if v["dtype"] not in ["video"]}
-        non_vid_ep_buffer = {
-            k: v for k, v in episode_buffer.items() if k in non_video_features.keys()
-        }
-        ep_stats = compute_episode_stats(non_vid_ep_buffer, non_video_features)
-
-        if len(self.meta.video_keys) > 0:
-            video_paths = self.encode_episode_videos(episode_index)
-            for key in self.meta.video_keys:
-                episode_buffer[key] = video_paths[key]
-
-        self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats)
-
-        ep_data_index = get_episode_data_index(self.meta.episodes, [episode_index])
-        ep_data_index_np = {k: t.numpy() for k, t in ep_data_index.items()}
+        # Reject timestamp problems before creating data, videos, or metadata.
         check_timestamps_sync(
-            episode_buffer["timestamp"],
+            np.asarray(episode_buffer["timestamp"], dtype=np.float64),
             episode_buffer["episode_index"],
-            ep_data_index_np,
+            {"to": np.asarray([episode_length], dtype=np.int64)},
             self.fps,
             self.tolerance_s,
         )
 
-        video_files = list(self.root.rglob("*.mp4"))
-        assert len(video_files) == self.num_episodes * len(self.meta.video_keys)
+        transaction = _EpisodeCommitTransaction(self, episode_index)
+        transaction.begin()
+        try:
+            for task in episode_tasks:
+                task_index = self.meta.get_task_index(task)
+                if task_index is None:
+                    self.meta.add_task(task)
 
-        parquet_files = list(self.root.rglob("*.parquet"))
-        assert len(parquet_files) == self.num_episodes
+            episode_buffer["task_index"] = np.array(
+                [self.meta.get_task_index(task) for task in tasks]
+            )
 
-        img_dir = self.root / "images"
-        if img_dir.is_dir():
-            shutil.rmtree(self.root / "images")
+            non_video_features = {
+                key: value
+                for key, value in self.features.items()
+                if value["dtype"] not in ["video"]
+            }
+            non_vid_ep_buffer = {
+                key: value
+                for key, value in episode_buffer.items()
+                if key in non_video_features
+            }
+            ep_stats = compute_episode_stats(
+                non_vid_ep_buffer,
+                non_video_features,
+            )
 
-        if not episode_data:
+            self._wait_image_writer()
+            self._save_episode_table(episode_buffer, episode_index)
+
+            if self.meta.video_keys:
+                video_paths = self.encode_episode_videos(
+                    episode_index,
+                    video_writers=writers,
+                )
+                for key in self.meta.video_keys:
+                    episode_buffer[key] = video_paths[key]
+
+            for key in self.meta.video_keys:
+                video_path = self.root / self.meta.get_video_file_path(
+                    episode_index,
+                    key,
+                )
+                if not video_path.is_file():
+                    raise FileNotFoundError(
+                        f"Video path: {video_path} does not exist for episode {episode_index}"
+                    )
+            parquet_path = self.root / self.meta.get_data_file_path(episode_index)
+            if not parquet_path.is_file():
+                raise FileNotFoundError(
+                    f"Parquet path: {parquet_path} does not exist for episode {episode_index}"
+                )
+
+            if discarded:
+                previous_discarded = self.meta.info.get(
+                    "discarded_episode_indices", []
+                )
+                if episode_index not in previous_discarded:
+                    self.meta.info["discarded_episode_indices"] = [
+                        *previous_discarded,
+                        episode_index,
+                    ]
+
+            self.meta.save_episode(
+                episode_index,
+                episode_length,
+                episode_tasks,
+                ep_stats,
+            )
+
+            quality_record = {
+                "episode_index": episode_index,
+                "discarded": bool(discarded),
+                "validation": validation
+                or {"passed": not discarded, "errors": []},
+            }
+            quality_path = self.root / "meta" / "episode_quality.jsonl"
+            with open(quality_path, "a", encoding="utf-8") as quality_file:
+                quality_file.write(
+                    json.dumps(quality_record, separators=(",", ":")) + "\n"
+                )
+                quality_file.flush()
+                os.fsync(quality_file.fileno())
+
+            transaction.commit()
+        except Exception:
+            transaction.rollback()
+            raise
+
+        if active_episode:
             self.episode_buffer = self.create_episode_buffer()
             self.video_writers = self.create_video_writer()
 
-        for key in self.meta.video_keys:
-            video_path = os.path.join(self.root, self.meta.get_video_file_path(episode_index, key))
-            if not os.path.exists(video_path):
-                raise FileNotFoundError(
-                    f"Video path: {video_path} does not exist for episode {episode_index}"
-                )
-
-        parquet_path = os.path.join(self.root, self.meta.get_data_file_path(episode_index))
-        if not os.path.exists(parquet_path):
-            raise FileNotFoundError(
-                f"Parquet path: {parquet_path} does not exist for episode {episode_index}"
-            )
-
-    def encode_episode_videos(self, episode_index: int) -> dict:
+    def encode_episode_videos(
+        self,
+        episode_index: int,
+        *,
+        video_writers: dict[str, VideoWriter] | None = None,
+    ) -> dict:
+        writers = self.video_writers if video_writers is None else video_writers
         video_paths = {}
         for key in self.meta.video_keys:
-            video_paths[key] = self.video_writers[key].stop()
+            video_paths[key] = writers[key].stop()
         return video_paths
 
-    def save_episode_as_discarded(self) -> None:
+    def save_episode_as_discarded(
+        self,
+        episode_data: dict | None = None,
+        *,
+        video_writers: dict[str, VideoWriter] | None = None,
+        validation: dict[str, Any] | None = None,
+    ) -> None:
         """Flag ongoing episode as discarded and save it to disk."""
-        self.meta.info["discarded_episode_indices"] = self.meta.info.get(
-            "discarded_episode_indices", []
-        ) + [self.episode_buffer["episode_index"]]
-        self.save_episode()
+        self.save_episode(
+            episode_data,
+            video_writers=video_writers,
+            discarded=True,
+            validation=validation,
+        )
 
 
 # ---------------------------------------------------------------------------

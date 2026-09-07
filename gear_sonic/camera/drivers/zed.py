@@ -126,6 +126,11 @@ class ZEDSensor(Sensor):
             print(f"[{self.mount_position}] ZED grab failed: {grab_status}")
             return None
 
+        # Timestamp the successful blocking grab with both host clocks. The
+        # monotonic value remains valid if NTP adjusts CLOCK_REALTIME later.
+        capture_time = time.time()
+        capture_monotonic_ns = time.monotonic_ns()
+
         retrieve_status = self._camera.retrieve_image(
             self._image,
             self._sl.VIEW.LEFT,
@@ -145,12 +150,12 @@ class ZEDSensor(Sensor):
         # the SDK-owned Mat buffer may be overwritten by the next grab().
         image_rgb = np.ascontiguousarray(image_bgra[..., 2::-1])
 
-        timestamp_ns = self._camera.get_timestamp(self._sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
-        capture_time = timestamp_ns / 1e9 if timestamp_ns > 0 else time.time()
-
         return {
             "timestamps": {self.mount_position: capture_time},
             "images": {self.mount_position: image_rgb},
+            "capture_monotonic_ns": {
+                self.mount_position: capture_monotonic_ns,
+            },
         }
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -159,6 +164,7 @@ class ZEDSensor(Sensor):
         return ImageMessageSchema(
             timestamps=data["timestamps"],
             images=data["images"],
+            capture_monotonic_ns=data.get("capture_monotonic_ns", {}),
         ).serialize()
 
     def observation_space(self):

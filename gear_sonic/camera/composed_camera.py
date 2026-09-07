@@ -475,10 +475,18 @@ class ComposedCameraSensor(Sensor, SensorServer):
         """Merge per-camera data into a single ImageMessageSchema."""
         all_timestamps = {}
         all_images = {}
+        all_capture_monotonic_ns = {}
         for _mount, camera_data in message.items():
             all_timestamps.update(camera_data.get("timestamps", {}))
             all_images.update(camera_data.get("images", {}))
-        img_schema = ImageMessageSchema(timestamps=all_timestamps, images=all_images)
+            all_capture_monotonic_ns.update(
+                camera_data.get("capture_monotonic_ns", {})
+            )
+        img_schema = ImageMessageSchema(
+            timestamps=all_timestamps,
+            images=all_images,
+            capture_monotonic_ns=all_capture_monotonic_ns,
+        )
         return img_schema.serialize()
 
     def run_server(self):
@@ -521,12 +529,158 @@ class ComposedCameraSensor(Sensor, SensorServer):
             return None
 
 
+class CameraFrameBuffer:
+    """Thread-safe bounded FIFO with explicit drop accounting."""
+
+    def __init__(self, capacity: int = 5, reserve: int = 1):
+        if capacity <= 0:
+            raise ValueError("camera buffer capacity must be positive")
+        if reserve < 0 or reserve >= capacity:
+            raise ValueError("camera buffer reserve must be smaller than capacity")
+        self.capacity = capacity
+        self.reserve = reserve
+        self._messages: deque[dict[str, Any]] = deque()
+        self._lock = threading.Lock()
+        self._received = 0
+        self._overflow_dropped = 0
+        self._latency_dropped = 0
+        self._publisher_gap_dropped = 0
+        self._publisher_resets = 0
+        self._last_publisher_sequence: int | None = None
+        self._arrivals: deque[tuple[float, int]] = deque()
+        self._publisher_samples: deque[tuple[float, int]] = deque()
+
+    @staticmethod
+    def _prune(samples: deque, cutoff: float) -> None:
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
+
+    def put(self, message: dict[str, Any]) -> None:
+        with self._lock:
+            received_ns = message.get("receiver_monotonic_ns")
+            arrived_at = (
+                int(received_ns) / 1e9
+                if isinstance(received_ns, int)
+                and not isinstance(received_ns, bool)
+                and received_ns > 0
+                else time.monotonic()
+            )
+            self._arrivals.append((arrived_at, 0))
+            sequence = message.get("publisher_sequence")
+            if (
+                isinstance(sequence, int)
+                and not isinstance(sequence, bool)
+                and sequence >= 0
+            ):
+                if self._last_publisher_sequence is not None:
+                    if sequence > self._last_publisher_sequence:
+                        self._publisher_gap_dropped += max(
+                            0,
+                            sequence - self._last_publisher_sequence - 1,
+                        )
+                    else:
+                        self._publisher_resets += 1
+                        self._publisher_samples.clear()
+                self._last_publisher_sequence = sequence
+                self._publisher_samples.append((arrived_at, sequence))
+            cutoff = arrived_at - 2.0
+            self._prune(self._arrivals, cutoff)
+            self._prune(self._publisher_samples, cutoff)
+            self._received += 1
+            if len(self._messages) == self.capacity:
+                self._messages.popleft()
+                self._overflow_dropped += 1
+            self._messages.append(message)
+
+    def pop_for_collection(self) -> dict[str, Any] | None:
+        with self._lock:
+            while len(self._messages) > self.reserve + 1:
+                self._messages.popleft()
+                self._latency_dropped += 1
+            return self._messages.popleft() if self._messages else None
+
+    @staticmethod
+    def _event_rate(samples: deque[tuple[float, Any]]) -> float | None:
+        if len(samples) < 2:
+            return None
+        elapsed = samples[-1][0] - samples[0][0]
+        if elapsed <= 0:
+            return None
+        return round((len(samples) - 1) / elapsed, 2)
+
+    @staticmethod
+    def _publisher_rate(samples: deque[tuple[float, int]]) -> float | None:
+        if len(samples) < 2:
+            return None
+        elapsed = samples[-1][0] - samples[0][0]
+        sequence_delta = samples[-1][1] - samples[0][1]
+        if elapsed <= 0 or sequence_delta <= 0:
+            return None
+        return round(sequence_delta / elapsed, 2)
+
+    def stats(self) -> dict[str, int | float | None]:
+        with self._lock:
+            cutoff = time.monotonic() - 2.0
+            self._prune(self._arrivals, cutoff)
+            self._prune(self._publisher_samples, cutoff)
+            return {
+                "capacity": self.capacity,
+                "depth": len(self._messages),
+                "received": self._received,
+                "overflow_dropped": self._overflow_dropped,
+                "latency_dropped": self._latency_dropped,
+                "publisher_gap_dropped": self._publisher_gap_dropped,
+                "publisher_resets": self._publisher_resets,
+                "received_hz": self._event_rate(self._arrivals),
+                "publisher_hz": self._publisher_rate(self._publisher_samples),
+            }
+
+
+def estimate_camera_age_s(
+    message: dict[str, Any],
+    camera_name: str,
+    *,
+    now_monotonic_ns: int | None = None,
+) -> float | None:
+    """Estimate age without comparing monotonic clocks from different hosts."""
+    received_ns = message.get("receiver_monotonic_ns")
+    if (
+        not isinstance(received_ns, int)
+        or isinstance(received_ns, bool)
+        or received_ns <= 0
+    ):
+        return None
+
+    now_ns = time.monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
+    age_ns = max(0, now_ns - received_ns)
+    captured_ns = message.get("capture_monotonic_ns", {}).get(camera_name)
+    published_ns = message.get("publisher_monotonic_ns")
+    if (
+        isinstance(captured_ns, int)
+        and not isinstance(captured_ns, bool)
+        and captured_ns > 0
+        and isinstance(published_ns, int)
+        and not isinstance(published_ns, bool)
+        and published_ns >= captured_ns
+    ):
+        # Both values originate on the publisher, so this interval remains
+        # valid even when the receiver has a different boot-time clock origin.
+        age_ns += published_ns - captured_ns
+    return age_ns / 1e9
+
+
 class ComposedCameraClientSensor(Sensor, SensorClient):
     """ZMQ client that deserializes merged camera frames from the server."""
 
-    def __init__(self, server_ip: str = "localhost", port: int = 5555):
-        self.start_client(server_ip, port)
-
+    def __init__(
+        self,
+        server_ip: str = "localhost",
+        port: int = 5555,
+        *,
+        background: bool = False,
+        background_queue_size: int = 5,
+        background_reserve: int = 1,
+    ):
         self._latest_message = None
         self._avg_time_per_frame: deque = deque(maxlen=20)
         self._msg_received_time = 0
@@ -536,14 +690,68 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         self._last_new_message_time = None
         self._last_staleness_warning_time = 0.0
         self._staleness_warning_interval = 2.0
+        self._background = background
+        self._background_buffer = CameraFrameBuffer(
+            capacity=background_queue_size,
+            reserve=background_reserve,
+        )
+        self._receiver_stop = threading.Event()
+        self._receiver_ready = threading.Event()
+        self._receiver_error: Exception | None = None
+        self._receiver_thread: threading.Thread | None = None
+
+        if background:
+            self._receiver_thread = threading.Thread(
+                target=self._receive_loop,
+                args=(server_ip, port),
+                name="camera-receiver",
+                daemon=True,
+            )
+            self._receiver_thread.start()
+            if not self._receiver_ready.wait(timeout=2.0):
+                raise RuntimeError("timed out starting camera receiver")
+            if self._receiver_error is not None:
+                raise RuntimeError(f"could not start camera receiver: {self._receiver_error}")
+        else:
+            self.start_client(server_ip, port)
 
         print("Initialized composed camera client sensor")
 
+    def _receive_loop(self, server_ip: str, port: int) -> None:
+        try:
+            self.start_client(
+                server_ip,
+                port,
+                conflate=False,
+                receive_hwm=self._background_buffer.capacity,
+            )
+        except Exception as exc:
+            self._receiver_error = exc
+            self._receiver_ready.set()
+            return
+        self._receiver_ready.set()
+        try:
+            while not self._receiver_stop.is_set():
+                message = self.receive_message_nonblocking(timeout_ms=200)
+                if message is None:
+                    continue
+                decoded = ImageMessageSchema.deserialize(message).asdict()
+                decoded["receiver_monotonic_ns"] = time.monotonic_ns()
+                self._background_buffer.put(decoded)
+        except Exception as exc:
+            self._receiver_error = exc
+        finally:
+            self.stop_client()
+
     def read(self, blocking: bool = False, **kwargs) -> dict[str, Any] | None:
         self._start_time = time.time()
-        current_time = time.time()
+        current_monotonic = time.monotonic()
 
-        if blocking:
+        if self._receiver_error is not None:
+            raise RuntimeError(f"camera receiver failed: {self._receiver_error}")
+        if self._background:
+            message = self._background_buffer.pop_for_collection()
+        elif blocking:
             message = self.receive_message()
             if not message:
                 return None
@@ -552,22 +760,34 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
 
         if message is not None:
             self.idx += 1
-            self._latest_message = ImageMessageSchema.deserialize(message).asdict()
-            self._last_new_message_time = current_time
+            self._latest_message = message if self._background else (
+                ImageMessageSchema.deserialize(message).asdict()
+            )
+            self._latest_message.setdefault(
+                "receiver_monotonic_ns", time.monotonic_ns()
+            )
+            self._last_new_message_time = current_monotonic
 
             if self.idx % 10 == 0:
                 for image_key, image_time in self._latest_message["timestamps"].items():
-                    image_latency = (time.time() - image_time) * 1000
+                    image_age = estimate_camera_age_s(
+                        self._latest_message,
+                        image_key,
+                    )
+                    if image_age is not None:
+                        image_latency = image_age * 1000
+                    else:
+                        image_latency = (time.time() - image_time) * 1000
                     print(f"Image latency for {image_key}: {image_latency:.2f} ms")
 
             self._msg_received_time = time.time()
             self._avg_time_per_frame.append(self._msg_received_time - self._start_time)
         elif not blocking and self._latest_message is not None:
             if self._last_new_message_time is not None:
-                time_since_last_message = current_time - self._last_new_message_time
+                time_since_last_message = current_monotonic - self._last_new_message_time
                 if time_since_last_message > 0.1:
                     if (
-                        current_time - self._last_staleness_warning_time
+                        current_monotonic - self._last_staleness_warning_time
                         >= self._staleness_warning_interval
                     ):
                         print(
@@ -575,7 +795,7 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
                             f"{time_since_last_message*1000:.1f}ms. "
                             f"Reusing stale image. Check camera server connection."
                         )
-                        self._last_staleness_warning_time = current_time
+                        self._last_staleness_warning_time = current_monotonic
 
         return self._latest_message
 
@@ -583,7 +803,17 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         raise NotImplementedError("Client does not serialize")
 
     def close(self):
-        self.stop_client()
+        if self._background:
+            self._receiver_stop.set()
+            if self._receiver_thread is not None:
+                self._receiver_thread.join(timeout=2.0)
+                if self._receiver_thread.is_alive():
+                    raise RuntimeError("camera receiver did not stop within 2 seconds")
+        else:
+            self.stop_client()
+
+    def buffer_stats(self) -> dict[str, int | float | None]:
+        return self._background_buffer.stats()
 
     def fps(self) -> float:
         if len(self._avg_time_per_frame) == 0:
