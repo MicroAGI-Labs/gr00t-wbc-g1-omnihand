@@ -144,6 +144,9 @@ class DataCollectionLaunchConfig:
     hand_control_port: int = 5572
     """Browser UI command port used to request a clean hand-worker restart."""
 
+    teleop_control_port: int = 5573
+    """Browser UI command port used to request a smooth return to idle."""
+
     # Teleop streamer options
     pico_manager: bool = True
     """Run pico_manager_thread_server with --manager flag."""
@@ -289,13 +292,14 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
         "--hand-intent-port": config.hand_intent_port,
         "--hand-state-port": config.hand_state_port,
         "--hand-control-port": config.hand_control_port,
+        "--teleop-control-port": config.teleop_control_port,
     }
     for name, port in hand_ports.items():
         if not 1 <= port <= 65535:
             errors.append(f"{name} must be between 1 and 65535")
     reserved_ports = [config.camera_port, config.remote_ui_port, *hand_ports.values()]
     if len(reserved_ports) != len(set(reserved_ports)):
-        errors.append("camera, remote UI, and hand ZMQ ports must all be different")
+        errors.append("camera, remote UI, hand, and teleop ZMQ ports must all be different")
 
     if config.pico_input_source not in {"xrt", "isaac-teleop"}:
         errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
@@ -548,6 +552,7 @@ def main(config: DataCollectionLaunchConfig):
         "python gear_sonic/scripts/pico_manager_thread_server.py "
         f"--input-source {config.pico_input_source} "
         f"--hand-intent-port {config.hand_intent_port} "
+        f"--teleop-control-port {config.teleop_control_port} "
         f"--teleop-mode {pico_teleop_mode} "
         f"--idle-base-transition-duration {config.idle_base_transition_duration} "
         "--initial-locomotion-mode slow_walk"
@@ -628,7 +633,8 @@ def main(config: DataCollectionLaunchConfig):
             f"--camera-port {config.camera_port} "
             f"--http-port {config.remote_ui_port} "
             f"--hand-state-port {config.hand_state_port} "
-            f"--hand-control-port {config.hand_control_port}"
+            f"--hand-control-port {config.hand_control_port} "
+            f"--teleop-control-port {config.teleop_control_port}"
         )
         if config.hand_backend == "omnihand":
             viewer_cmd += " --enable-hand-controls"

@@ -162,6 +162,8 @@ PLANNER_STREAM_MODES = frozenset(
     }
 )
 
+DEFAULT_TELEOP_CONTROL_PORT = 5573
+
 
 class FaceChordTracker:
     """Confirm a two-button face chord only after the whole gesture is released.
@@ -2314,6 +2316,8 @@ def run_pico_manager(
     initial_locomotion_mode: str = "idle",
     recording_status_host: str = "localhost",
     recording_status_port: int = 5581,
+    teleop_control_host: str = "localhost",
+    teleop_control_port: int = DEFAULT_TELEOP_CONTROL_PORT,
     idle_base_transition_duration: float = 2.0,
 ):
     """
@@ -2360,6 +2364,12 @@ def run_pico_manager(
     recording_status_socket.setsockopt(zmq.CONFLATE, 1)
     recording_status_socket.connect(
         f"tcp://{recording_status_host}:{recording_status_port}"
+    )
+    teleop_control_socket = context.socket(zmq.SUB)
+    teleop_control_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+    teleop_control_socket.setsockopt(zmq.CONFLATE, 1)
+    teleop_control_socket.connect(
+        f"tcp://{teleop_control_host}:{teleop_control_port}"
     )
     time.sleep(0.1)
     print(
@@ -2437,6 +2447,8 @@ def run_pico_manager(
     transition_destination: StreamMode | None = None
     recorder_is_recording = False
     recorder_command_timestamp = 0.0
+    safe_idle_requested = False
+    last_teleop_control_sequence = -1
     face_chords = FaceChordTracker()
     ax_double_press = DoublePressTracker(window_seconds=2.0)
     manager_period = 1.0 / max(target_fps, 1)
@@ -2516,6 +2528,33 @@ def run_pico_manager(
                 if float(recorder_status.get("timestamp", 0.0)) >= recorder_command_timestamp:
                     recorder_is_recording = bool(recorder_status.get("recording", False))
 
+            safe_idle_abort_requested = False
+            while teleop_control_socket.poll(0):
+                command = teleop_control_socket.recv_json()
+                if not isinstance(command, dict):
+                    print("[Manager] Ignoring malformed teleop-control command")
+                    continue
+                try:
+                    sequence = int(command.get("sequence", -1))
+                except (TypeError, ValueError):
+                    print("[Manager] Ignoring teleop-control command without a sequence")
+                    continue
+                if (
+                    command.get("action") == "safe_idle"
+                    and sequence > last_teleop_control_sequence
+                ):
+                    last_teleop_control_sequence = sequence
+                    safe_idle_requested = True
+                    if recorder_is_recording:
+                        recorder_is_recording = False
+                        recorder_command_timestamp = time.time()
+                        safe_idle_abort_requested = True
+                        print("[Manager] Safe-idle request aborting active recording")
+                    print(
+                        "[Manager] UI requested smooth return through "
+                        "IDLE_BASE_POSE to IDLE"
+                    )
+
             left_menu_button, _, _, _, _ = get_controller_inputs(reader)
             left_axis_click, _ = get_axis_clicks(reader)
 
@@ -2553,6 +2592,23 @@ def run_pico_manager(
             # been sent. Do not accept another mode gesture halfway through it.
             if upper_body_transition is not None:
                 pass
+            elif safe_idle_requested:
+                if current_mode in {
+                    StreamMode.PLANNER_VR_3PT,
+                    StreamMode.PLANNER_IK_UPPER,
+                }:
+                    requested_transition = StreamMode.PLANNER_IDLE_BASE_POSE
+                elif current_mode == StreamMode.PLANNER_IDLE_BASE_POSE:
+                    requested_transition = StreamMode.PLANNER
+                elif current_mode == StreamMode.PLANNER:
+                    safe_idle_requested = False
+                    print("[Manager] Safe-idle return complete")
+                else:
+                    safe_idle_requested = False
+                    print(
+                        f"[Manager] Safe-idle request unavailable from {current_mode.name}; "
+                        "planner-based teleop must be running"
+                    )
             elif current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.PLANNER
@@ -2743,7 +2799,7 @@ def run_pico_manager(
             )
             toggle_dc_requested = face_command == "xb"
             toggle_dc = recording_action in {"start", "save"}
-            toggle_da = recording_action == "discard"
+            toggle_da = recording_action == "discard" or safe_idle_abort_requested
             if toggle_dc_requested and not toggle_dc:
                 print(
                     "[Manager] Recorder start rejected: use A+X twice within 2s to enter "
@@ -2761,7 +2817,10 @@ def run_pico_manager(
             elif toggle_da:
                 recorder_is_recording = False
                 recorder_command_timestamp = time.time()
-                print("[Manager] Recorder Y+A -> discard")
+                if safe_idle_abort_requested:
+                    print("[Manager] Recorder UI safe-idle -> discard")
+                else:
+                    print("[Manager] Recorder Y+A -> discard")
             socket.send(
                 pack_pose_message(
                     {
@@ -2835,6 +2894,7 @@ def run_pico_manager(
             _close_xrt()
         three_point.close()
         recording_status_socket.close()
+        teleop_control_socket.close()
         socket.close()
         hand_socket.close()
         context.term()
@@ -2901,6 +2961,18 @@ if __name__ == "__main__":
         type=int,
         default=5581,
         help="Recorder status publisher port (default: 5581)",
+    )
+    parser.add_argument(
+        "--teleop-control-host",
+        type=str,
+        default="localhost",
+        help="Browser teleop-control publisher host (default: localhost)",
+    )
+    parser.add_argument(
+        "--teleop-control-port",
+        type=int,
+        default=DEFAULT_TELEOP_CONTROL_PORT,
+        help=f"Browser teleop-control publisher port (default: {DEFAULT_TELEOP_CONTROL_PORT})",
     )
     parser.add_argument(
         "--vr3pt_test",
@@ -3020,6 +3092,8 @@ if __name__ == "__main__":
             initial_locomotion_mode=args.initial_locomotion_mode,
             recording_status_host=args.recording_status_host,
             recording_status_port=args.recording_status_port,
+            teleop_control_host=args.teleop_control_host,
+            teleop_control_port=args.teleop_control_port,
             idle_base_transition_duration=args.idle_base_transition_duration,
         )
     else:

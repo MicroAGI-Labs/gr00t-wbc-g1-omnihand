@@ -171,8 +171,9 @@ _INDEX_HTML = """<!doctype html>
       <span id="sonic-state">SONIC</span>
       <div class="recorder-info">
         <div id="sonic-message">Policy process control</div>
-        <div id="sonic-detail">Disconnect stops SONIC and cannot be triggered from ABXY.</div>
+        <div id="sonic-detail">Safe idle uses the smooth base-pose path. Disconnect stops SONIC.</div>
       </div>
+      <button id="sonic-safe-idle">Return Safely to Idle</button>
       <button id="sonic-disconnect" class="danger">Disconnect SONIC</button>
     </section>
   </main>
@@ -199,6 +200,7 @@ _INDEX_HTML = """<!doctype html>
     const handReconnect = document.getElementById('hand-reconnect');
     const sonicState = document.getElementById('sonic-state');
     const sonicMessage = document.getElementById('sonic-message');
+    const sonicSafeIdle = document.getElementById('sonic-safe-idle');
     const sonicDisconnect = document.getElementById('sonic-disconnect');
     let commandPending = false;
     let configurationPending = false;
@@ -475,6 +477,24 @@ _INDEX_HTML = """<!doctype html>
       }
     }
 
+    async function returnSonicToIdle() {
+      sonicSafeIdle.disabled = true;
+      try {
+        const response = await fetch('/teleop/safe-idle', {method: 'POST'});
+        if (!response.ok) throw new Error('request rejected');
+        sonicState.textContent = 'RETURNING';
+        sonicMessage.textContent = 'Smooth return through the base pose requested…';
+        setTimeout(() => {
+          sonicState.textContent = 'SONIC';
+          sonicMessage.textContent = 'Policy process control';
+          sonicSafeIdle.disabled = false;
+        }, 4500);
+      } catch (_) {
+        sonicMessage.textContent = 'Safe-idle request failed';
+        sonicSafeIdle.disabled = false;
+      }
+    }
+
     recordToggle.addEventListener('click', () => sendRecorderCommand('/recording/toggle'));
     recordDiscard.addEventListener('click', () => sendRecorderCommand('/recording/discard'));
     datasetConfigure.addEventListener('click', configureDataset);
@@ -482,6 +502,7 @@ _INDEX_HTML = """<!doctype html>
       field.addEventListener('input', () => { datasetSetupError = null; });
     }
     handReconnect.addEventListener('click', reconnectHands);
+    sonicSafeIdle.addEventListener('click', returnSonicToIdle);
     sonicDisconnect.addEventListener('click', disconnectSonic);
     loadDatasetRepos(); updateCameraStatus(); updateRecorderStatus(); updateHandStatus();
     setInterval(updateCameraStatus, 1500);
@@ -535,6 +556,9 @@ class CameraWebViewerConfig:
 
     hand_control_port: int = DEFAULT_HAND_CONTROL_PORT
     """ZMQ PUB port used to request a clean hand-worker reconnect."""
+
+    teleop_control_port: int = 5573
+    """ZMQ PUB port used for safety commands to the teleop manager."""
 
     enable_hand_controls: bool = False
     """Display and enable external-hand status and reconnect controls."""
@@ -845,6 +869,58 @@ class HandControlHub:
             context.term()
 
 
+class TeleopControlHub:
+    """Serialize browser safety commands onto the manager's local ZMQ channel."""
+
+    def __init__(self, config: CameraWebViewerConfig):
+        self.config = config
+        self._commands: queue.Queue[dict[str, object]] = queue.Queue()
+        self._running = True
+        self._ready = threading.Event()
+        self._sequence = 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+        self._ready.wait(timeout=2.0)
+
+    def close(self) -> None:
+        self._running = False
+        self._thread.join(timeout=2.0)
+
+    def safe_idle(self) -> None:
+        self._sequence = max(self._sequence + 1, time.monotonic_ns())
+        self._commands.put(
+            {
+                "sequence": self._sequence,
+                "action": "safe_idle",
+                "monotonic_ns": time.monotonic_ns(),
+                "source": "web_ui",
+            }
+        )
+
+    def _run(self) -> None:
+        context = zmq.Context()
+        command_socket = context.socket(zmq.PUB)
+        command_socket.setsockopt(zmq.SNDHWM, 10)
+        command_socket.bind(f"tcp://*:{self.config.teleop_control_port}")
+        self._ready.set()
+        try:
+            while self._running:
+                try:
+                    command = self._commands.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                # Repeat briefly so a newly connected SUB cannot miss a
+                # safety command during PUB/SUB subscription propagation.
+                for _ in range(3):
+                    command_socket.send_json(command)
+                    time.sleep(0.05)
+        finally:
+            command_socket.close(linger=0)
+            context.term()
+
+
 def compose_camera_jpeg(images: dict[str, np.ndarray], max_tile_width: int, jpeg_quality: int) -> bytes | None:
     """Label and horizontally tile camera frames into one browser-ready JPEG."""
     tiles: list[np.ndarray] = []
@@ -911,6 +987,7 @@ def make_handler(
     frame_hub: CameraFrameHub,
     recorder_hub: RecorderControlHub,
     hand_hub: HandControlHub,
+    teleop_hub: TeleopControlHub,
 ) -> type[BaseHTTPRequestHandler]:
     class CameraWebHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -973,6 +1050,8 @@ def make_handler(
                 return
             elif path == "/hands/reconnect":
                 hand_hub.reconnect()
+            elif path == "/teleop/safe-idle":
+                teleop_hub.safe_idle()
             elif path == "/sonic/disconnect":
                 if self.headers.get("X-Sonic-Confirmation") != "disconnect":
                     self.send_error(HTTPStatus.BAD_REQUEST, "Explicit confirmation required")
@@ -1053,9 +1132,10 @@ def main(config: CameraWebViewerConfig) -> None:
     frame_hub = CameraFrameHub(config)
     recorder_hub = RecorderControlHub(config)
     hand_hub = HandControlHub(config)
+    teleop_hub = TeleopControlHub(config)
     server = ThreadingHTTPServer(
         (config.http_host, config.http_port),
-        make_handler(frame_hub, recorder_hub, hand_hub),
+        make_handler(frame_hub, recorder_hub, hand_hub, teleop_hub),
     )
     server.daemon_threads = True
 
@@ -1067,6 +1147,7 @@ def main(config: CameraWebViewerConfig) -> None:
     frame_hub.start()
     recorder_hub.start()
     hand_hub.start()
+    teleop_hub.start()
     print(
         f"SONIC browser viewer listening on http://{config.http_host}:{config.http_port}\n"
         "Use an SSH local port forward when viewing from another computer."
@@ -1078,6 +1159,7 @@ def main(config: CameraWebViewerConfig) -> None:
         frame_hub.close()
         recorder_hub.close()
         hand_hub.close()
+        teleop_hub.close()
 
 
 if __name__ == "__main__":

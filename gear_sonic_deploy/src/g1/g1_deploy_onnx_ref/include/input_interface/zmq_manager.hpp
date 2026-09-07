@@ -26,8 +26,9 @@
  * ## Planner Timeout
  *
  * If no planner message arrives within 1 second (PLANNER_TIMEOUT), the manager
- * automatically resets the locomotion to IDLE and clears upper-body / hand-joint
- * control flags.
+ * automatically resets locomotion to IDLE and holds the most recent arm target.
+ * The hold remains latched until an explicit upper-body target arrives, so a
+ * reconnect cannot hand the arms abruptly back to the planner's idle pose.
  *
  * ## Keyboard Shortcuts (via stdin)
  *
@@ -256,7 +257,12 @@ class ZMQManager : public InputInterface {
                 if (time_since_last_planner < PLANNER_MESSAGE_TIMEOUT) {
                   // Valid planner message within timeout - use it
                   // Update upper body control state based on this message
-                  has_upper_body_control_ = latest_planner_message_.upper_body_position.has_value();
+                  if (latest_planner_message_.upper_body_position.has_value()) {
+                    has_upper_body_control_ = true;
+                    planner_timeout_hold_active_ = false;
+                  } else if (!planner_timeout_hold_active_) {
+                    has_upper_body_control_ = false;
+                  }
 
                   // Update hand joints control state based on this message
                   has_hand_joints_ = latest_planner_message_.left_hand_joints.has_value() || 
@@ -276,6 +282,7 @@ class ZMQManager : public InputInterface {
                 switch_from_teleop_to_planner_ = true;
               }
               std::cout << "[ZMQManager] Cleared planner buffer" << std::endl;
+              planner_timeout_hold_active_ = false;
             }
           }
 
@@ -332,6 +339,7 @@ class ZMQManager : public InputInterface {
         }
         // Clear upper body control state
         has_upper_body_control_ = false;
+        planner_timeout_hold_active_ = false;
         
         // Clear hand joints control state
         has_hand_joints_ = false;
@@ -355,6 +363,7 @@ class ZMQManager : public InputInterface {
         }
         // Clear upper body control state
         has_upper_body_control_ = false;
+        planner_timeout_hold_active_ = false;
         
         // Clear hand joints control state
         has_hand_joints_ = false;
@@ -576,7 +585,9 @@ class ZMQManager : public InputInterface {
 
       // Apply planner commands if planner is ready
       if (planner_state.enabled && planner_state.initialized) {
-        std::lock_guard<std::mutex> lock(planner_mutex_);
+        bool planner_timed_out = false;
+        std::chrono::milliseconds planner_timeout_age{0};
+        std::unique_lock<std::mutex> lock(planner_mutex_);
         
         // Check for planner timeout (1 second)
         constexpr auto PLANNER_TIMEOUT = std::chrono::milliseconds(1000);
@@ -585,7 +596,12 @@ class ZMQManager : public InputInterface {
         if (latest_planner_message_.valid) {
           // Valid planner message within timeout - use it
           // Update upper body control state based on this message
-          has_upper_body_control_ = latest_planner_message_.upper_body_position.has_value();
+          if (latest_planner_message_.upper_body_position.has_value()) {
+            has_upper_body_control_ = true;
+            planner_timeout_hold_active_ = false;
+          } else if (!planner_timeout_hold_active_) {
+            has_upper_body_control_ = false;
+          }
 
           // Update hand joints control state based on this message
           has_hand_joints_ = latest_planner_message_.left_hand_joints.has_value() || 
@@ -621,9 +637,9 @@ class ZMQManager : public InputInterface {
           latest_planner_message_.valid = false;
 
         } else if (!latest_planner_message_.valid && time_since_last_planner >= PLANNER_TIMEOUT) {
-          // Planner timeout - reset to IDLE and clear buffer
-          has_upper_body_control_ = false;
-
+          // Stop locomotion immediately. Arm ownership is latched below after
+          // releasing planner_mutex_, so taking current_motion_mutex cannot
+          // invert the lock order used by the planner/control loop.
           has_hand_joints_ = false;
 
           auto current_facing = movement_state_buffer.GetDataWithTime().data->facing_direction;
@@ -637,15 +653,25 @@ class ZMQManager : public InputInterface {
           movement_state_buffer.SetData(idle_state);
           
           if (latest_planner_message_.timestamp != std::chrono::steady_clock::time_point{}) {
-            std::cout << "[ZMQManager] Planner timeout (" 
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(time_since_last_planner).count()
-                      << "ms) - reset to IDLE and cleared buffer" << std::endl;
-
+            planner_timed_out = true;
+            planner_timeout_age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                time_since_last_planner);
             // Clear planner buffer to avoid using stale data
             latest_planner_message_.valid = false;
             latest_planner_message_.timestamp = {};
           }
           
+        }
+
+        if (planner_timed_out) {
+          lock.unlock();
+          const bool arms_held = latchPlannerTimeoutArmHold(
+              current_motion, current_frame, current_motion_mutex);
+          std::cout << "[ZMQManager] Planner timeout (" << planner_timeout_age.count()
+                    << "ms) - locomotion IDLE; "
+                    << (arms_held ? "holding last arm target"
+                                  : "no arm target available")
+                    << std::endl;
         }
       }
 
@@ -1220,6 +1246,61 @@ class ZMQManager : public InputInterface {
     
 
   private:
+    /// Keep arm ownership on a planner publisher failure instead of snapping to
+    /// the planner motion's resting arms. Existing explicit targets are retained;
+    /// VR-only control falls back to the current planner-motion arm target.
+    bool latchPlannerTimeoutArmHold(
+        const std::shared_ptr<const MotionSequence>& current_motion,
+        int current_frame,
+        std::mutex& current_motion_mutex) {
+      std::array<double, 17> held_position{};
+      bool have_target = has_upper_body_control_;
+
+      if (have_target) {
+        auto buffered = upper_body_joint_positions_.GetDataWithTime();
+        if (buffered.data) {
+          held_position = *buffered.data;
+        } else {
+          have_target = false;
+        }
+      }
+
+      if (!have_target) {
+        std::lock_guard<std::mutex> motion_lock(current_motion_mutex);
+        if (current_motion && current_frame >= 0 &&
+            current_frame < current_motion->timesteps &&
+            current_motion->GetNumJoints() >= G1_NUM_MOTOR) {
+          const double* planner_target = current_motion->JointPositions(current_frame);
+          for (std::size_t i = 0;
+               i < upper_body_joint_isaaclab_order_in_isaaclab_index.size(); ++i) {
+            held_position[i] =
+                planner_target[upper_body_joint_isaaclab_order_in_isaaclab_index[i]];
+          }
+          have_target = true;
+        }
+      }
+
+      has_vr_3point_control_ = false;
+      planner_timeout_hold_active_ = have_target;
+      has_upper_body_control_ = have_target;
+      if (!have_target) {
+        std::cerr << "[ZMQManager] WARNING: No arm target available for planner "
+                     "timeout hold" << std::endl;
+        return false;
+      }
+
+      std::array<double, 17> zero_velocity{};
+      std::array<bool, 17> arms_only_mask{};
+      arms_only_mask.fill(true);
+      arms_only_mask[0] = false;
+      arms_only_mask[1] = false;
+      arms_only_mask[2] = false;
+      upper_body_joint_positions_.SetData(held_position);
+      upper_body_joint_velocities_.SetData(zero_velocity);
+      upper_body_joint_mask_.SetData(arms_only_mask);
+      return true;
+    }
+
     // ------------------------------------------------------------------
     // Configuration (set once in constructor)
     // ------------------------------------------------------------------
@@ -1270,6 +1351,9 @@ class ZMQManager : public InputInterface {
     /// Tracks the previous frame's VR-3-point state to detect enable/disable transitions
     /// and automatically toggle encoder mode accordingly.
     bool last_has_vr_3point_control_ = false;
+    /// Arm hold installed after planner-message timeout. Only an explicit
+    /// upper-body target releases it; ordinary locomotion heartbeats do not.
+    bool planner_timeout_hold_active_ = false;
 };
 
 #endif // ZMQ_MANAGER_HPP
