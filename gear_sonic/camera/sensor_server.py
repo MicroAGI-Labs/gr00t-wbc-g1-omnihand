@@ -1,8 +1,10 @@
 """ZMQ PUB/SUB transport and image serialisation for the camera server."""
 
 import base64
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+import time
 from typing import Any
 
 import cv2
@@ -114,9 +116,18 @@ class ImageMessageSchema:
 
     timestamps: dict[str, float]
     images: dict[str, np.ndarray]
+    capture_monotonic_ns: dict[str, int] = field(default_factory=dict)
+    publisher_sequence: int | None = None
+    publisher_monotonic_ns: int | None = None
 
     def serialize(self) -> dict[str, Any]:
-        serialized_msg: dict[str, Any] = {"timestamps": self.timestamps, "images": {}}
+        serialized_msg: dict[str, Any] = {
+            "timestamps": self.timestamps,
+            "images": {},
+            "capture_monotonic_ns": self.capture_monotonic_ns,
+            "publisher_sequence": self.publisher_sequence,
+            "publisher_monotonic_ns": self.publisher_monotonic_ns,
+        }
         for key, image in self.images.items():
             if isinstance(image, bytes | bytearray):
                 serialized_msg["images"][key] = image
@@ -126,9 +137,13 @@ class ImageMessageSchema:
 
     @staticmethod
     def deserialize(data: dict[str, Any]) -> "ImageMessageSchema":
-        timestamps = data.get("timestamps", {})
+        timestamps_value = data.get("timestamps", {})
+        timestamps = timestamps_value if isinstance(timestamps_value, Mapping) else {}
+        images_value = data.get("images", {})
+        if not isinstance(images_value, Mapping):
+            images_value = {}
         images = {}
-        for key, value in data.get("images", {}).items():
+        for key, value in images_value.items():
             if isinstance(value, bytes | bytearray):
                 mat = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
                 images[key] = mat[..., ::-1]  # BGR -> RGB
@@ -140,10 +155,31 @@ class ImageMessageSchema:
                 images[key] = m.decode(value)
             else:
                 images[key] = value
-        return ImageMessageSchema(timestamps=timestamps, images=images)
+        capture_values = data.get("capture_monotonic_ns", {})
+        if not isinstance(capture_values, Mapping):
+            capture_values = {}
+        return ImageMessageSchema(
+            timestamps=timestamps,
+            images=images,
+            capture_monotonic_ns={
+                str(key): int(value)
+                for key, value in capture_values.items()
+                if isinstance(value, (int, np.integer))
+                and not isinstance(value, (bool, np.bool_))
+                and int(value) > 0
+            },
+            publisher_sequence=data.get("publisher_sequence"),
+            publisher_monotonic_ns=data.get("publisher_monotonic_ns"),
+        )
 
     def asdict(self) -> dict[str, Any]:
-        return {"timestamps": self.timestamps, "images": self.images}
+        return {
+            "timestamps": self.timestamps,
+            "images": self.images,
+            "capture_monotonic_ns": self.capture_monotonic_ns,
+            "publisher_sequence": self.publisher_sequence,
+            "publisher_monotonic_ns": self.publisher_monotonic_ns,
+        }
 
 
 # =============================================================================
@@ -168,8 +204,44 @@ class SensorServer:
         self.context.term()
 
     def send_message(self, data: dict[str, Any]):
+        payload = dict(data)
+        published_wall_s = time.time()
+        published_monotonic_ns = time.monotonic_ns()
+        supplied_capture_times = payload.get("capture_monotonic_ns", {})
+        capture_monotonic_ns = (
+            dict(supplied_capture_times)
+            if isinstance(supplied_capture_times, Mapping)
+            else {}
+        )
+        timestamps = payload.get("timestamps", {})
+        if not isinstance(timestamps, Mapping):
+            timestamps = {}
+        for camera_name, captured_wall_s in timestamps.items():
+            supplied = capture_monotonic_ns.get(camera_name)
+            if (
+                isinstance(supplied, (int, np.integer))
+                and not isinstance(supplied, (bool, np.bool_))
+                and int(supplied) > 0
+            ):
+                capture_monotonic_ns[camera_name] = int(supplied)
+                continue
+            if (
+                isinstance(captured_wall_s, (int, float, np.number))
+                and not isinstance(captured_wall_s, (bool, np.bool_))
+                and np.isfinite(captured_wall_s)
+                and float(captured_wall_s) > 0
+            ):
+                capture_age_ns = int(
+                    max(0.0, published_wall_s - float(captured_wall_s)) * 1e9
+                )
+                capture_monotonic_ns[camera_name] = (
+                    published_monotonic_ns - capture_age_ns
+                )
+        payload["capture_monotonic_ns"] = capture_monotonic_ns
+        payload["publisher_sequence"] = self.message_sent + 1
+        payload["publisher_monotonic_ns"] = published_monotonic_ns
         try:
-            packed = msgpack.packb(data, use_bin_type=True)
+            packed = msgpack.packb(payload, use_bin_type=True)
             self.socket.send(packed, flags=zmq.NOBLOCK)
         except zmq.Again:
             self.message_dropped += 1
@@ -186,12 +258,22 @@ class SensorServer:
 class SensorClient:
     """ZMQ SUB client that receives msgpack-encoded sensor payloads."""
 
-    def start_client(self, server_ip: str, port: int):
+    def start_client(
+        self,
+        server_ip: str,
+        port: int,
+        *,
+        conflate: bool = True,
+        receive_hwm: int = 3,
+    ):
+        if receive_hwm <= 0:
+            raise ValueError(f"receive_hwm must be positive, got {receive_hwm}")
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        self.socket.setsockopt(zmq.CONFLATE, True)
-        self.socket.setsockopt(zmq.RCVHWM, 3)
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.setsockopt(zmq.CONFLATE, conflate)
+        self.socket.setsockopt(zmq.RCVHWM, receive_hwm)
         self.socket.connect(f"tcp://{server_ip}:{port}")
 
     def stop_client(self):

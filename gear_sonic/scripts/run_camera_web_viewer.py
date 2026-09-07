@@ -117,11 +117,27 @@ _INDEX_HTML = """<!doctype html>
         recordMessage.textContent = status.message || state;
         const sources = status.sources || {};
         const ready = sources.proprio && sources.camera && sources.hands;
-        recordDetail.textContent = `episode ${status.episode_index} · ${status.frame_count} frames · ${status.dataset_root} · ${ready ? 'sources ready' : 'source missing'} · headset: release X+B to record/save, release Y+A to discard`;
-        recordToggle.textContent = status.recording ? 'Stop & Save' : 'Start Recording';
+        const cameraBuffer = (status.camera || {}).buffer || {};
+        const cameraDrops = (cameraBuffer.overflow_dropped || 0)
+          + (cameraBuffer.latency_dropped || 0)
+          + (cameraBuffer.publisher_gap_dropped || 0);
+        const cameraDetail = `camera ${cameraBuffer.received_hz || 0} Hz, `
+          + `queue ${cameraBuffer.depth || 0}/${cameraBuffer.capacity || 0}, `
+          + `${cameraDrops} drops`;
+        const synchronization = status.synchronization || {};
+        const syncDetail = `sync ${synchronization.delay_ms || 0} ms, `
+          + `${synchronization.skipped_targets || 0} skipped`;
+        recordDetail.textContent = `episode ${status.episode_index} · `
+          + `${status.frame_count} frames · ${cameraDetail} · ${syncDetail} · `
+          + `${status.dataset_root} · `
+          + `${ready ? 'sources ready' : 'source missing'} · `
+          + 'headset: release X+B to record/save, release Y+A to discard';
+        recordToggle.textContent = status.draining
+          ? 'Draining…'
+          : (status.recording ? 'Stop & Save' : 'Start Recording');
         recordToggle.className = status.recording ? 'stop' : '';
         recordToggle.disabled = commandPending || status.saving || (!status.recording && !ready);
-        recordDiscard.disabled = commandPending || !status.recording;
+        recordDiscard.disabled = commandPending || (!status.recording && !status.draining);
       } catch (_) {
         recordMessage.textContent = 'Recorder status request failed';
       }

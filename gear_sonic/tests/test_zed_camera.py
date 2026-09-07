@@ -134,11 +134,13 @@ def test_zed_sensor_configures_hd720_60fps_without_depth(fake_sdk):
     assert (sensor._output_resolution.width, sensor._output_resolution.height) == (640, 480)
 
 
-def test_zed_sensor_returns_owned_rgb_frame_and_epoch_timestamp(monkeypatch):
+def test_zed_sensor_returns_owned_rgb_frame_and_host_timestamps(monkeypatch):
     bgra = np.zeros((480, 640, 4), dtype=np.uint8)
     bgra[0, 0] = [10, 20, 30, 255]
     sdk = FakeSDK(image=bgra)
     monkeypatch.setattr(zed_driver, "_load_zed_sdk", lambda: sdk)
+    monkeypatch.setattr(zed_driver.time, "time", lambda: 2_000_000_000.0)
+    monkeypatch.setattr(zed_driver.time, "monotonic_ns", lambda: 123_456_789)
     sensor = zed_driver.ZEDSensor(mount_position="ego_view")
 
     sample = sensor.read()
@@ -149,12 +151,28 @@ def test_zed_sensor_returns_owned_rgb_frame_and_epoch_timestamp(monkeypatch):
     assert image.shape == (480, 640, 3)
     assert image.flags.c_contiguous
     assert not np.shares_memory(image, bgra)
-    assert sample["timestamps"]["ego_view"] == pytest.approx(1_700_000_000.25)
+    assert sample["timestamps"]["ego_view"] == 2_000_000_000.0
+    assert sample["capture_monotonic_ns"]["ego_view"] == 123_456_789
+    serialized = sensor.serialize(sample)
+    assert serialized["capture_monotonic_ns"]["ego_view"] == 123_456_789
     assert sdk.camera.retrieve_args[1:] == (
         sdk.VIEW.LEFT,
         sdk.MEM.CPU,
         sensor._output_resolution,
     )
+
+
+def test_zed_sensor_does_not_depend_on_sdk_epoch_after_clock_adjustment(monkeypatch):
+    sdk = FakeSDK()
+    monkeypatch.setattr(zed_driver, "_load_zed_sdk", lambda: sdk)
+    monkeypatch.setattr(zed_driver.time, "time", lambda: 2_000_000_000.0)
+    monkeypatch.setattr(zed_driver.time, "monotonic_ns", lambda: 987_654_321)
+
+    sample = zed_driver.ZEDSensor().read()
+
+    assert sample["timestamps"]["ego_view"] == 2_000_000_000.0
+    assert sample["capture_monotonic_ns"]["ego_view"] == 987_654_321
+    assert not hasattr(sdk.camera, "time_reference")
 
 
 @pytest.mark.parametrize("failure_stage", ["grab", "retrieve"])

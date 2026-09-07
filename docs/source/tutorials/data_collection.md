@@ -154,9 +154,20 @@ Pass `--camera-host <THOR_IP>` only when a client runs on another computer.
 
 ### Frame Rates
 
-- Existing 30 FPS cameras publish only new frames. The 50 Hz exporter reuses its cached latest image when no new image arrived.
-- ZED captures and publishes at 60 FPS. The exporter samples the latest message at 50 Hz; ZMQ discards superseded messages rather than interpolating frames.
+- Existing 30 FPS cameras publish only new frames. The 50 Hz exporter deliberately reuses the cached image between arrivals, while rejecting a stalled stream or a source below `--minimum-camera-rate-hz` (25 Hz by default).
+- ZED captures and publishes at 60 FPS. The exporter drains the bounded camera FIFO into its timestamp history each tick, then selects the closest past image for each 50 Hz target. FIFO overflow drops are counted; ordinary 60-to-50 Hz sampling does not discard images before timestamp selection.
 - The dataset timeline is controlled by `--data-collection-frequency` (50 Hz by default).
+- The browser status reports camera receive/publish rates, queue depth, local overflow/latency drops, and publisher sequence gaps.
+
+### Causal Stream Synchronization
+
+The recorder uses Thor's monotonic clock as its master timeline and runs 100 ms behind real time by default. For each 50 Hz target timestamp, every required stream must first advance beyond that target. The recorder then selects the newest sample whose Thor-side receive timestamp is less than or equal to the target. It never substitutes a future sample.
+
+Robot state, camera packets, and manager state are always required. Active POSE mode additionally requires a past SONIC pose; active planner modes require a past planner command; and external-hand collection requires a past hand state. POSE_PAUSE requires no advancing SONIC pose because that mode intentionally stops publishing poses. Every selected sample must remain within its stream-specific maximum age.
+
+If a stream has not advanced, the status loop remains responsive while the target waits for up to `--synchronization-wait-timeout`. A timed-out or stale target is skipped, recorded as a synchronization error, and causes the episode to be saved as discarded for inspection. This allows live sources to reconnect without silently accepting a misaligned episode.
+
+The canonical LeRobot `timestamp` remains the uniform episode-relative timeline (`frame_index / fps`). Each Parquet row additionally stores the Thor target, selected receive timestamps, non-negative sample ages, camera sequence, and per-camera capture ages under `capture.*` features. A repeated 30 Hz image therefore has the same camera sequence in consecutive 50 Hz rows and a progressively larger causal age.
 
 The tmux launcher accepts the same host setting:
 
@@ -173,11 +184,14 @@ The camera server publishes a single msgpack-encoded payload per frame cycle con
 ```python
 {
     "timestamps": {"ego_view": 1712345678.123, "left_wrist": 1712345678.125},
+    "capture_monotonic_ns": {"ego_view": 99800123, "left_wrist": 99802125},
+    "publisher_sequence": 42,
+    "publisher_monotonic_ns": 99810000,
     "images": {"ego_view": "<base64-jpeg>", "left_wrist": "<base64-jpeg>"}
 }
 ```
 
-Images are JPEG-compressed (quality 80) and either base64-encoded strings or raw JPEG bytes (when MJPEG on-device encoding is enabled). The data exporter's `ComposedCameraClientSensor` handles both formats automatically.
+Capture times are retained independently for every camera, so one fresh camera cannot hide a stale wrist or head camera. Monotonic intervals are calculated within each host's clock domain, so a remote camera server does not require matching boot-time clock origins. Images are JPEG-compressed (quality 80) and either base64-encoded strings or raw JPEG bytes (when MJPEG on-device encoding is enabled). The data exporter's `ComposedCameraClientSensor` handles both formats automatically.
 
 ---
 
@@ -368,6 +382,10 @@ These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent
 | `c` | **Toggle** recording (same as X + B) |
 | `x` | **Discard** episode (same as Y + A — flagged for removal) |
 
+Stopping first enters a short draining state so synchronized targets through the stop-command timestamp are recorded; the episode is then detached and finalized in a background worker. Discarding can detach immediately. The UI reports an episode as saved only after finalization completes, and a new recording remains disabled until then. If finalization fails, the detached episode buffer is kept under the dataset's `recovery/` directory for inspection.
+
+The next episode's video files open only on its first frame, so a failure opening them cannot prevent the previous episode from being saved. Video shutdown timeouts cover draining, encoder flushing, and container closing. A timeout leaves the video worker owning the container so it can finish safely; it does not forcibly interrupt an encoder or filesystem operation.
+
 ```{note}
 Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.
 ```
@@ -418,6 +436,13 @@ Key options:
 | `--data-collection-frequency` | `50` | Recording frequency in Hz |
 | `--camera-host` | `localhost` | Camera server hostname |
 | `--camera-port` | `5555` | Camera server port |
+| `--camera-max-age` | `0.25` | Maximum age of every required camera frame while recording |
+| `--minimum-camera-rate-hz` | `25.0` | Minimum live camera publish rate admitted while recording |
+| `--finalizer-shutdown-timeout` | `30.0` | Maximum shutdown wait for a pending episode commit |
+| `--synchronization-delay` | `0.1` | Recorder lookback delay used to observe stream watermarks past each target |
+| `--synchronization-wait-timeout` | `0.25` | Additional wait before a missing watermark invalidates and skips a target |
+| `--proprio-max-age` | `0.1` | Maximum age of the selected past robot-state sample |
+| `--teleop-max-age` | `0.2` | Maximum age of selected past manager, SONIC, or planner samples |
 | `--sonic-zmq-host` | `localhost` | SMPL pose publisher host |
 | `--sonic-zmq-port` | `5556` | SMPL pose publisher port |
 | `--state-zmq-host` | `localhost` | Robot state publisher host |
@@ -465,6 +490,11 @@ Each frame contains:
 | `action.joint_position` | `(N,)` | Teleop target joint positions |
 | `action.body_rotation_6d` | `(6,)` | Teleop target body rotation |
 | `annotation.human.action.task_description` | string | Task prompt for this frame |
+| `capture.sync_target_monotonic_ns` | `(1,)` | Thor master timestamp selected for this row |
+| `capture.<stream>_received_monotonic_ns` | `(1,)` | Thor receive timestamp of the selected causal sample |
+| `capture.<stream>_age_ms` | `(1,)` | Target minus selected receive timestamp; `-1` when the stream is inactive |
+| `capture.camera_sequence` | `(1,)` | Camera publisher sequence, repeated when a camera frame is reused |
+| `capture.camera_capture_age_ms` | `(3,)` | Per-camera capture age at the target for ego, left wrist, and right wrist |
 
 ---
 
