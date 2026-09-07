@@ -6,7 +6,6 @@ import copy
 from dataclasses import asdict, dataclass
 from functools import partial
 import json
-import os
 from pathlib import Path
 import shutil
 from typing import Any
@@ -33,147 +32,6 @@ from torchvision import transforms
 from gear_sonic.data.video_writer import VideoWriter
 
 disable_progress_bars()
-
-
-_TRANSACTION_METADATA_FILES = (
-    "info.json",
-    "tasks.jsonl",
-    "episodes.jsonl",
-    "episodes_stats.jsonl",
-    "stats.json",
-    "episode_quality.jsonl",
-)
-
-
-def _atomic_write(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    with open(temporary, "wb") as output:
-        output.write(payload)
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary, path)
-
-
-class _EpisodeCommitTransaction:
-    """Recover a partially written episode metadata commit."""
-
-    ROOT = Path("meta/.transactions")
-
-    def __init__(self, exporter: "Gr00tDataExporter", episode_index: int):
-        self.exporter = exporter
-        self.root = Path(exporter.root)
-        self.episode_index = episode_index
-        self.path = self.root / self.ROOT / f"episode_{episode_index:06d}"
-        self._metadata_state: dict[str, Any] = {}
-
-    @staticmethod
-    def _episode_files(exporter: "Gr00tDataExporter", episode_index: int) -> list[Path]:
-        paths = [Path(exporter.meta.get_data_file_path(episode_index))]
-        paths.extend(
-            Path(exporter.meta.get_video_file_path(episode_index, key))
-            for key in exporter.meta.video_keys
-        )
-        return paths
-
-    @classmethod
-    def recover_pending(cls, root: str | Path) -> None:
-        dataset_root = Path(root)
-        transactions_root = dataset_root / cls.ROOT
-        if not transactions_root.is_dir():
-            return
-        for transaction_path in sorted(transactions_root.iterdir()):
-            if not transaction_path.is_dir():
-                continue
-            if (transaction_path / "COMMITTED").is_file():
-                shutil.rmtree(transaction_path, ignore_errors=True)
-                continue
-            manifest_path = transaction_path / "manifest.json"
-            if not manifest_path.is_file():
-                raise RuntimeError(f"incomplete episode journal: {transaction_path}")
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            for name, existed in manifest["metadata"].items():
-                if Path(name).name != name:
-                    raise RuntimeError(
-                        f"unsafe metadata path in episode journal: {name!r}"
-                    )
-                target = dataset_root / "meta" / name
-                backup = transaction_path / "metadata" / name
-                if existed:
-                    _atomic_write(target, backup.read_bytes())
-                else:
-                    target.unlink(missing_ok=True)
-            recovery_root = (
-                dataset_root
-                / "recovery"
-                / f"episode_{int(manifest['episode_index']):06d}"
-                / "files"
-            )
-            for relative_value in manifest["episode_files"]:
-                relative_path = Path(relative_value)
-                if relative_path.is_absolute() or ".." in relative_path.parts:
-                    raise RuntimeError(
-                        f"unsafe path in episode journal: {relative_value!r}"
-                    )
-                source = dataset_root / relative_path
-                if source.is_file():
-                    target = recovery_root / relative_path
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(source, target)
-            shutil.rmtree(transaction_path)
-
-    def begin(self) -> None:
-        self.recover_pending(self.root)
-        self.path.mkdir(parents=True, exist_ok=False)
-        try:
-            metadata_manifest: dict[str, bool] = {}
-            for name in _TRANSACTION_METADATA_FILES:
-                source = self.root / "meta" / name
-                metadata_manifest[name] = source.is_file()
-                if source.is_file():
-                    backup = self.path / "metadata" / name
-                    backup.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, backup)
-            episode_files = []
-            for path in self._episode_files(self.exporter, self.episode_index):
-                if path.is_absolute() or ".." in path.parts:
-                    raise RuntimeError(f"unsafe episode output path: {path}")
-                episode_files.append(str(path))
-            manifest = {
-                "episode_index": self.episode_index,
-                "metadata": metadata_manifest,
-                "episode_files": episode_files,
-            }
-            _atomic_write(
-                self.path / "manifest.json",
-                json.dumps(manifest, sort_keys=True).encode("utf-8"),
-            )
-            for attribute in (
-                "info",
-                "episodes",
-                "episodes_stats",
-                "stats",
-                "tasks",
-                "task_to_task_index",
-            ):
-                if hasattr(self.exporter.meta, attribute):
-                    self._metadata_state[attribute] = copy.deepcopy(
-                        getattr(self.exporter.meta, attribute)
-                    )
-        except Exception:
-            shutil.rmtree(self.path, ignore_errors=True)
-            raise
-
-    def rollback(self) -> None:
-        self.recover_pending(self.root)
-        for attribute, value in self._metadata_state.items():
-            setattr(self.exporter.meta, attribute, value)
-
-    def commit(self) -> None:
-        _atomic_write(self.path / "COMMITTED", b"committed\n")
-        # Once the marker is durable, journal cleanup is housekeeping and must
-        # not turn an already committed episode into a reported failure.
-        shutil.rmtree(self.path, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +200,6 @@ class Gr00tDataExporter(LeRobotDataset):
             shutil.rmtree(save_root)
 
         if (Path(save_root)).exists():
-            _EpisodeCommitTransaction.recover_pending(save_root)
             try:
                 obj.meta = Gr00tDatasetMetadata(
                     repo_id=repo_id,
@@ -510,8 +367,18 @@ class Gr00tDataExporter(LeRobotDataset):
             self.tolerance_s,
         )
 
-        transaction = _EpisodeCommitTransaction(self, episode_index)
-        transaction.begin()
+        metadata_state = {
+            attribute: copy.deepcopy(getattr(self.meta, attribute))
+            for attribute in (
+                "info",
+                "episodes",
+                "episodes_stats",
+                "stats",
+                "tasks",
+                "task_to_task_index",
+            )
+            if hasattr(self.meta, attribute)
+        }
         try:
             for task in episode_tasks:
                 task_index = self.meta.get_task_index(task)
@@ -573,30 +440,22 @@ class Gr00tDataExporter(LeRobotDataset):
                         episode_index,
                     ]
 
+            quality = dict(self.meta.info.get("episode_quality", {}))
+            quality[str(episode_index)] = {
+                "discarded": bool(discarded),
+                "validation": validation
+                or {"passed": not discarded, "errors": []},
+            }
+            self.meta.info["episode_quality"] = quality
             self.meta.save_episode(
                 episode_index,
                 episode_length,
                 episode_tasks,
                 ep_stats,
             )
-
-            quality_record = {
-                "episode_index": episode_index,
-                "discarded": bool(discarded),
-                "validation": validation
-                or {"passed": not discarded, "errors": []},
-            }
-            quality_path = self.root / "meta" / "episode_quality.jsonl"
-            with open(quality_path, "a", encoding="utf-8") as quality_file:
-                quality_file.write(
-                    json.dumps(quality_record, separators=(",", ":")) + "\n"
-                )
-                quality_file.flush()
-                os.fsync(quality_file.fileno())
-
-            transaction.commit()
         except Exception:
-            transaction.rollback()
+            for attribute, value in metadata_state.items():
+                setattr(self.meta, attribute, value)
             raise
 
         if active_episode:

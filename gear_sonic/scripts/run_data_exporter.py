@@ -360,7 +360,6 @@ class GrootDataCollector:
         self._synchronization_errors: list[str] = []
         self._synchronization_skipped_targets = 0
         self.latest_hand_state = None
-        self.latest_hand_state_received_at = None
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -383,9 +382,6 @@ class GrootDataCollector:
         self.latest_image_received_at = None
         self._episode_camera_stats_start: dict[str, object] = {}
         self.latest_proprio_msg = None
-        self.latest_sonic_msg = None
-        self.latest_planner_msg = None
-        self.latest_manager_msg = None
 
         self.current_stream_mode = 0
 
@@ -607,12 +603,11 @@ class GrootDataCollector:
             received_ns = time.monotonic_ns()
             state["received_monotonic_ns"] = received_ns
             self.latest_hand_state = state
-            self.latest_hand_state_received_at = received_ns / 1e9
             self._synchronizer.observe("hand", state, received_ns)
 
     def _external_hand_values(
         self,
-        hand_state: dict | None = None,
+        hand_state: dict,
     ) -> tuple[
         np.ndarray,
         np.ndarray,
@@ -621,26 +616,17 @@ class GrootDataCollector:
         np.ndarray,
         np.ndarray,
     ]:
-        state = self.latest_hand_state if hand_state is None else hand_state
-        if state is None:
-            raise RuntimeError("external hand state is unavailable")
-        if hand_state is None:
-            if self.latest_hand_state_received_at is None:
-                raise RuntimeError("external hand state receive time is unavailable")
-            age = time.monotonic() - self.latest_hand_state_received_at
-            if age > self.hand_state_max_age:
-                raise RuntimeError(f"external hand state is stale ({age:.3f}s)")
-        if state.get("mode") == "fault":
+        if hand_state.get("mode") == "fault":
             raise RuntimeError("external hand controller is faulted")
-        if state.get("input_stale") or state.get("intent_sequence") is None:
+        if hand_state.get("input_stale") or hand_state.get("intent_sequence") is None:
             raise RuntimeError("external hand target is missing or stale")
         for side in ("left", "right"):
-            if state.get("sides", {}).get(side, {}).get("intent_closed") is None:
+            if hand_state.get("sides", {}).get(side, {}).get("intent_closed") is None:
                 raise RuntimeError(f"external {side} hand has no valid click intent")
         values = []
         for field in ("requested_position_rad", "applied_position_rad", "measured_position_rad"):
             for side in ("left", "right"):
-                side_state = state.get("sides", {}).get(side)
+                side_state = hand_state.get("sides", {}).get(side)
                 if not side_state or not side_state.get("valid") or not side_state.get("connected"):
                     raise RuntimeError(f"external {side} hand is invalid or disconnected")
                 array = np.asarray(side_state.get(field), dtype=np.float64).reshape(-1)
@@ -801,11 +787,11 @@ class GrootDataCollector:
         if "stream_mode" in data:
             stream_mode = int(data["stream_mode"].flat[0])
             self.current_stream_mode = stream_mode
-        self.latest_manager_msg = {
+        manager_message = {
             "stream_mode": stream_mode,
             "received_monotonic_ns": received_ns,
         }
-        self._synchronizer.observe("manager", self.latest_manager_msg, received_ns)
+        self._synchronizer.observe("manager", manager_message, received_ns)
 
         if self._extract_bool(data, "toggle_data_collection"):
             self._manager_toggle_dc = True
@@ -840,7 +826,7 @@ class GrootDataCollector:
             vr_3pt_orientation = data["vr_orientation"].flatten().astype(np.float32)
 
         received_ns = time.monotonic_ns() if received_ns is None else received_ns
-        self.latest_planner_msg = {
+        planner_message = {
             "planner_mode": planner_mode,
             "planner_movement": planner_movement,
             "planner_facing": planner_facing,
@@ -850,10 +836,9 @@ class GrootDataCollector:
             "vr_3pt_orientation": vr_3pt_orientation,
             "left_hand_joints": self._extract_hand_joints(data, "left_hand_joints"),
             "right_hand_joints": self._extract_hand_joints(data, "right_hand_joints"),
-            "receive_timestamp": time.time(),
             "received_monotonic_ns": received_ns,
         }
-        self._synchronizer.observe("planner", self.latest_planner_msg, received_ns)
+        self._synchronizer.observe("planner", planner_message, received_ns)
 
     def _handle_pose_message(self, raw: bytes, received_ns: int | None = None) -> None:
         G1_L_WRIST_ROLL_IDX = 23
@@ -919,7 +904,7 @@ class GrootDataCollector:
                 vr_3pt_orientation = pose_data["vr_orientation"].flatten().astype(np.float32)
 
             received_ns = time.monotonic_ns() if received_ns is None else received_ns
-            self.latest_sonic_msg = {
+            sonic_message = {
                 "smpl_joints": pose_data["smpl_joints"][0],
                 "smpl_pose": smpl_pose,
                 "body_quat_w": (
@@ -932,10 +917,9 @@ class GrootDataCollector:
                 "vr_3pt_position": vr_3pt_position,
                 "vr_3pt_orientation": vr_3pt_orientation,
                 "frame_index": frame_index,
-                "receive_timestamp": time.time(),
                 "received_monotonic_ns": received_ns,
             }
-            self._synchronizer.observe("sonic", self.latest_sonic_msg, received_ns)
+            self._synchronizer.observe("sonic", sonic_message, received_ns)
         except Exception as e:
             if not hasattr(self, "_sonic_error_count"):
                 self._sonic_error_count = 0
@@ -977,11 +961,8 @@ class GrootDataCollector:
     def _add_images_to_frame_data(
         self,
         frame_data: dict,
-        image_message: dict | None = None,
+        image_message: dict,
     ) -> None:
-        image_message = self.latest_image_msg if image_message is None else image_message
-        if image_message is None:
-            return
         images = image_message["images"]
         for feature_name, feature_info in self.data_exporter.features.items():
             if feature_info.get("dtype") in ["image", "video"]:

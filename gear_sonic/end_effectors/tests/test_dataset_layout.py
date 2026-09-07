@@ -34,9 +34,6 @@ def test_features_and_modality_follow_dynamic_hand_width():
     assert features["observation.state"]["shape"] == (49,)
     assert features["action.wbc"]["shape"] == (49,)
     assert features["control.hand_applied_position"]["shape"] == (20,)
-    assert features["capture.sync_target_monotonic_ns"]["dtype"] == "int64"
-    assert features["capture.camera_capture_age_ms"]["shape"] == (3,)
-    assert features["capture.proprio_age_ms"]["shape"] == (1,)
     assert modality["state"]["left_hand"] == {"start": 22, "end": 32}
     assert modality["state"]["right_hand"] == {"start": 39, "end": 49}
     assert modality["state"]["left_wrist_abs_quat"]["end"] == 7

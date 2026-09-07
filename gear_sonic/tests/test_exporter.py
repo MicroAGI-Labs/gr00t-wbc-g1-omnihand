@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -7,7 +8,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from gear_sonic.data import exporter as exporter_module
-from gear_sonic.data.exporter import Gr00tDataExporter, _EpisodeCommitTransaction
+from gear_sonic.data.exporter import Gr00tDataExporter
 
 
 class FakeMeta:
@@ -104,7 +105,7 @@ def test_timestamp_validation_precedes_files_and_metadata(tmp_path, monkeypatch)
     assert not (tmp_path / "data/episode_000000.parquet").exists()
 
 
-def test_failed_metadata_commit_restores_files_memory_and_episode_data(
+def test_failed_metadata_commit_restores_memory_and_episode_data(
     tmp_path,
     monkeypatch,
 ):
@@ -122,13 +123,10 @@ def test_failed_metadata_commit_restores_files_memory_and_episode_data(
     }
     assert data_exporter.meta.tasks == {}
     assert data_exporter.episode_buffer["size"] == 2
-    assert (tmp_path / "meta/info.json").read_text() == "original metadata"
-    assert not (tmp_path / "data/episode_000000.parquet").exists()
-    assert (tmp_path / "recovery/episode_000000/files/data/episode_000000.parquet").read_bytes() == b"parquet"
-    assert not (tmp_path / "meta/.transactions/episode_000000").exists()
+    assert (tmp_path / "data/episode_000000.parquet").read_bytes() == b"parquet"
 
 
-def test_successful_commit_keeps_episode_and_removes_journal(tmp_path, monkeypatch):
+def test_successful_save_keeps_episode_and_quality_metadata(tmp_path, monkeypatch):
     data_exporter = _build_exporter(tmp_path, monkeypatch)
     monkeypatch.setattr(exporter_module, "check_timestamps_sync", lambda *args: None)
 
@@ -136,32 +134,13 @@ def test_successful_commit_keeps_episode_and_removes_journal(tmp_path, monkeypat
 
     assert (tmp_path / "data/episode_000000.parquet").read_bytes() == b"parquet"
     assert data_exporter.meta.info["total_episodes"] == 1
-    assert not (tmp_path / "meta/.transactions/episode_000000").exists()
-    quality = (tmp_path / "meta/episode_quality.jsonl").read_text()
-    assert '"episode_index":0' in quality
-    assert '"discarded":false' in quality
+    assert data_exporter.meta.info["episode_quality"]["0"] == {
+        "discarded": False,
+        "validation": {"passed": True, "errors": []},
+    }
 
 
-def test_startup_recovery_rolls_back_an_interrupted_commit(tmp_path, monkeypatch):
-    data_exporter = _build_exporter(tmp_path, monkeypatch)
-    transaction = _EpisodeCommitTransaction(data_exporter, 0)
-    transaction.begin()
-    (tmp_path / "meta/info.json").write_text("partial metadata")
-    data_path = tmp_path / "data/episode_000000.parquet"
-    data_path.parent.mkdir(parents=True)
-    data_path.write_bytes(b"partial episode")
-
-    _EpisodeCommitTransaction.recover_pending(tmp_path)
-
-    assert (tmp_path / "meta/info.json").read_text() == "original metadata"
-    assert not data_path.exists()
-    assert (
-        tmp_path / "recovery/episode_000000/files/data/episode_000000.parquet"
-    ).read_bytes() == b"partial episode"
-    assert not transaction.path.exists()
-
-
-def test_real_exporter_commits_parquet_metadata_and_quality_record(tmp_path):
+def test_real_exporter_writes_parquet_timing_and_quality_metadata(tmp_path):
     data_exporter = Gr00tDataExporter.create(
         save_root=tmp_path / "dataset",
         fps=50,
@@ -222,6 +201,10 @@ def test_real_exporter_commits_parquet_metadata_and_quality_record(tmp_path):
         1_020_000_000,
     ]
     assert table["capture.camera_age_ms"].to_pylist() == [5.0, 8.0]
-    quality = (tmp_path / "dataset/meta/episode_quality.jsonl").read_text()
-    assert '"episode_index":0' in quality
-    assert '"discarded":false' in quality
+    quality = json.loads((tmp_path / "dataset/meta/info.json").read_text())[
+        "episode_quality"
+    ]["0"]
+    assert quality == {
+        "discarded": False,
+        "validation": {"passed": True, "errors": []},
+    }

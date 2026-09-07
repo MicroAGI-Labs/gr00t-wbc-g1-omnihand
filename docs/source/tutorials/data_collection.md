@@ -382,7 +382,7 @@ These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent
 | `c` | **Toggle** recording (same as X + B) |
 | `x` | **Discard** episode (same as Y + A — flagged for removal) |
 
-Stopping first enters a short draining state so synchronized targets through the stop-command timestamp are recorded; the episode is then detached and finalized in a background worker. Discarding can detach immediately. The UI says that the episode is queued while finalization is in progress and reports it as saved only after the durable commit succeeds. A new recording remains disabled until that commit completes. If finalization fails, the previous metadata is restored and recoverable episode files are kept under the dataset's `recovery/` directory.
+Stopping first enters a short draining state so synchronized targets through the stop-command timestamp are recorded; the episode is then detached and finalized in a background worker. Discarding can detach immediately. The UI reports an episode as saved only after finalization completes, and a new recording remains disabled until then. If finalization fails, the detached episode buffer is kept under the dataset's `recovery/` directory for inspection.
 
 ```{note}
 Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.
