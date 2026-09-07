@@ -24,10 +24,15 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
+import os
 from pathlib import Path
+import pickle
 import queue
 import re
+import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 
@@ -147,7 +152,7 @@ class SonicDataExporterConfig:
     """Maximum active planner/SMPL message age admitted while recording."""
 
     minimum_recording_rate_hz: float = 45.0
-    """Minimum source rate required for a successful episode."""
+    """Legacy rate reference retained for CLI compatibility; diagnostic only."""
 
     required_stream_mode: int = 5
     """Stream mode required for recording (1=POSE, 5=VR3PT, 6=IK upper)."""
@@ -162,7 +167,10 @@ class SonicDataExporterConfig:
     """ZMQ PUB port for browser-visible recorder status."""
 
     require_hub_upload: bool = False
-    """Require browser Hub setup and a completed upload between episodes."""
+    """Require a browser Hub dataset before recording (uploads stay in the background)."""
+
+    shutdown_upload_timeout: float = 300.0
+    """Seconds to keep uploading queued episodes while shutting down."""
 
 
 # ---------------------------------------------------------------------------
@@ -288,14 +296,21 @@ class StreamRateTracker:
         return round(float(1.0 / np.percentile(positive, 25)), 2)
 
 
+@dataclass(frozen=True)
+class _SnapshotUploadJob:
+    episode_index: int
+    snapshot_root: Path
+
+
 class EpisodeHubUploader:
     """Upload each finalized episode while keeping recorder state observable."""
 
     _EPISODE_FILE_RE = re.compile(r"episode_(\d+)\.(?:mp4|parquet)$")
 
-    def __init__(self, data_exporter: Gr00tDataExporter):
+    def __init__(self, data_exporter: Gr00tDataExporter, upload_runner=None):
         self.data_exporter = data_exporter
-        self._queue: queue.Queue[int | None] = queue.Queue()
+        self._queue: queue.Queue[_SnapshotUploadJob | None] = queue.Queue()
+        self._upload_runner = upload_runner or self._run_upload_subprocess
         self._condition = threading.Condition()
         self._stop = threading.Event()
         self._config: dict[str, object] | None = None
@@ -304,6 +319,7 @@ class EpisodeHubUploader:
         self._retrying = False
         self._last_uploaded_episode: int | None = None
         self._error: str | None = None
+        self._process: subprocess.Popen | None = None
         self._thread = threading.Thread(
             target=self._run,
             name="episode-hub-uploader",
@@ -326,16 +342,33 @@ class EpisodeHubUploader:
             self._condition.notify_all()
 
     def enqueue(self, episode_index: int) -> None:
+        snapshot_root = self._create_snapshot(episode_index)
         with self._condition:
             if self._config is None:
+                shutil.rmtree(snapshot_root, ignore_errors=True)
                 raise RuntimeError("choose a Hugging Face dataset before saving an episode")
             self._pending += 1
             self._condition.notify_all()
-        self._queue.put(episode_index)
+        self._queue.put(
+            _SnapshotUploadJob(
+                episode_index=episode_index,
+                snapshot_root=snapshot_root,
+            )
+        )
 
     def can_record(self) -> bool:
+        """Recording only needs a configured dataset; uploads run in the background."""
         with self._condition:
-            return self._config is not None and self._pending == 0 and not self._uploading
+            return self._config is not None
+
+    def report_enqueue_failure(self, episode_index: int, error: Exception) -> None:
+        """Expose upload staging failures without poisoning local finalization."""
+        detail = f"episode {episode_index} upload staging failed: {error}"
+        print(f"[Hub] {detail}")
+        with self._condition:
+            self._retrying = False
+            self._error = detail[-500:]
+            self._condition.notify_all()
 
     def status(self) -> dict[str, object]:
         with self._condition:
@@ -365,38 +398,152 @@ class EpisodeHubUploader:
     def close(self, timeout: float = 30.0) -> None:
         self.wait_until_idle(timeout=timeout)
         self._stop.set()
+        with self._condition:
+            process = self._process
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2.0)
         self._queue.put(None)
         self._thread.join(timeout=2.0)
 
-    def _upload_patterns(self, episode_index: int) -> list[str]:
-        patterns = ["meta/**"]
+    def _create_snapshot(self, episode_index: int) -> Path:
+        """Freeze metadata and hard-link finalized episode files for upload."""
         root = Path(self.data_exporter.root)
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            match = self._EPISODE_FILE_RE.search(path.name)
-            if match and int(match.group(1)) <= episode_index:
-                patterns.append(path.relative_to(root).as_posix())
-        return patterns
+        snapshots_root = root / ".upload_snapshots"
+        snapshots_root.mkdir(parents=True, exist_ok=True)
+        snapshot_root = Path(
+            tempfile.mkdtemp(
+                prefix=f"episode_{episode_index:06d}_",
+                dir=snapshots_root,
+            )
+        )
+        try:
+            source_meta = root / "meta"
+            if not source_meta.is_dir():
+                raise FileNotFoundError(
+                    f"dataset metadata directory is missing: {source_meta}"
+                )
+            shutil.copytree(
+                source_meta,
+                snapshot_root / "meta",
+                copy_function=shutil.copy2,
+            )
+
+            for root_file in ("README.md", "LICENSE"):
+                source = root / root_file
+                if source.is_file():
+                    shutil.copy2(source, snapshot_root / root_file)
+
+            selected = 0
+            for dirpath, _, filenames in os.walk(root, onerror=lambda _error: None):
+                path = Path(dirpath)
+                if path == snapshots_root or snapshots_root in path.parents:
+                    continue
+                for filename in filenames:
+                    match = self._EPISODE_FILE_RE.search(filename)
+                    if not match or int(match.group(1)) > episode_index:
+                        continue
+                    source = path / filename
+                    target = snapshot_root / source.relative_to(root)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        os.link(source, target)
+                    except OSError:
+                        shutil.copy2(source, target)
+                    selected += 1
+            if selected == 0:
+                raise FileNotFoundError(
+                    f"no finalized files found through episode {episode_index}"
+                )
+            return snapshot_root
+        except Exception:
+            shutil.rmtree(snapshot_root, ignore_errors=True)
+            raise
+
+    @staticmethod
+    def _discard_snapshot(job: _SnapshotUploadJob) -> None:
+        shutil.rmtree(job.snapshot_root, ignore_errors=True)
+
+    def _run_upload_subprocess(
+        self,
+        snapshot_root: Path,
+        config: dict[str, object],
+    ) -> None:
+        helper = Path(__file__).with_name("upload_dataset_snapshot.py")
+        command = [
+            sys.executable,
+            str(helper),
+            str(snapshot_root),
+            str(config["repo_id"]),
+            "--max-cpus",
+            "2",
+        ]
+        if bool(config.get("private", True)):
+            command.append("--private")
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        with self._condition:
+            self._process = process
+        try:
+            _, stderr = process.communicate()
+        finally:
+            with self._condition:
+                if self._process is process:
+                    self._process = None
+        if process.returncode != 0:
+            detail = (stderr or "no error output").strip()[-2000:]
+            raise RuntimeError(
+                f"snapshot upload process exited with {process.returncode}: {detail}"
+            )
+
+    def _coalesce_queued(self, job: _SnapshotUploadJob) -> _SnapshotUploadJob:
+        """Fold queued jobs into the newest complete dataset snapshot."""
+        newest = job
+        collapsed_jobs = []
+        while True:
+            try:
+                queued = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if queued is None:
+                self._queue.put(None)
+                break
+            if queued.episode_index >= newest.episode_index:
+                collapsed_jobs.append(newest)
+                newest = queued
+            else:
+                collapsed_jobs.append(queued)
+        for collapsed in collapsed_jobs:
+            self._discard_snapshot(collapsed)
+        if collapsed_jobs:
+            with self._condition:
+                self._pending -= len(collapsed_jobs)
+                self._condition.notify_all()
+        return newest
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            episode_index = self._queue.get()
-            if episode_index is None:
+            job = self._queue.get()
+            if job is None:
                 return
             retry_delay = 1.0
             while not self._stop.is_set():
+                job = self._coalesce_queued(job)
                 with self._condition:
                     config = dict(self._config or {})
                     self._uploading = True
                     self._retrying = retry_delay > 1.0
                     self._condition.notify_all()
                 try:
-                    self.data_exporter.push_to_hub(
-                        private=bool(config.get("private", True)),
-                        allow_patterns=self._upload_patterns(episode_index),
-                        upload_large_folder=True,
-                    )
+                    self._upload_runner(job.snapshot_root, config)
                 except Exception as exc:
                     with self._condition:
                         self._uploading = False
@@ -408,14 +555,181 @@ class EpisodeHubUploader:
                     retry_delay = min(retry_delay * 2.0, 30.0)
                     continue
 
+                self._discard_snapshot(job)
                 with self._condition:
                     self._pending -= 1
                     self._uploading = False
                     self._retrying = False
                     self._error = None
-                    self._last_uploaded_episode = episode_index
+                    self._last_uploaded_episode = job.episode_index
                     self._condition.notify_all()
                 break
+
+
+@dataclass
+class _EpisodeFinalizationJob:
+    episode_index: int
+    episode_buffer: dict
+    video_writers: dict
+    success: bool
+    validation: dict
+
+
+class EpisodeFinalizer:
+    """Finalize local episode files without blocking recorder control/status."""
+
+    def __init__(
+        self,
+        data_exporter: Gr00tDataExporter,
+        hub_uploader: EpisodeHubUploader,
+        max_pending: int = 2,
+    ):
+        self.data_exporter = data_exporter
+        self.hub_uploader = hub_uploader
+        self.max_pending = max_pending
+        self._queue: queue.Queue[_EpisodeFinalizationJob | None] = queue.Queue()
+        self._condition = threading.Condition()
+        self._pending = 0
+        self._finalizing = False
+        self._last_finalized_episode: int | None = None
+        self._error: str | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="episode-finalizer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def enqueue(
+        self,
+        *,
+        episode_index: int,
+        episode_buffer: dict,
+        video_writers: dict,
+        success: bool,
+        validation: dict,
+    ) -> None:
+        with self._condition:
+            self._pending += 1
+            self._condition.notify_all()
+        self._queue.put(
+            _EpisodeFinalizationJob(
+                episode_index=episode_index,
+                episode_buffer=episode_buffer,
+                video_writers=video_writers,
+                success=success,
+                validation=validation,
+            )
+        )
+
+    def can_record(self) -> bool:
+        with self._condition:
+            return self._error is None and self._pending < self.max_pending
+
+    def status(self) -> dict[str, object]:
+        with self._condition:
+            return {
+                "pending": self._pending,
+                "finalizing": self._finalizing,
+                "last_finalized_episode": self._last_finalized_episode,
+                "error": self._error,
+                "at_capacity": self._pending >= self.max_pending,
+            }
+
+    def wait_until_idle(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while self._pending or self._finalizing:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+            return True
+
+    def close(self, timeout: float | None = None) -> None:
+        self.wait_until_idle(timeout=timeout)
+        self._queue.put(None)
+        self._thread.join(timeout=2.0)
+
+    def _persist_failed_job(self, job: _EpisodeFinalizationJob) -> Path:
+        """Preserve an owned episode buffer if normal finalization fails."""
+        recovery_root = Path(self.data_exporter.root) / "recovery"
+        recovery_root.mkdir(parents=True, exist_ok=True)
+        recovery_path = recovery_root / f"episode_{job.episode_index:06d}.pkl"
+        temporary_path = recovery_path.with_suffix(".pkl.tmp")
+        payload = {
+            "episode_index": job.episode_index,
+            "episode_buffer": job.episode_buffer,
+            "success": job.success,
+            "validation": job.validation,
+        }
+        with open(temporary_path, "wb") as recovery_file:
+            pickle.dump(payload, recovery_file, protocol=pickle.HIGHEST_PROTOCOL)
+            recovery_file.flush()
+            os.fsync(recovery_file.fileno())
+        os.replace(temporary_path, recovery_path)
+        return recovery_path
+
+    @staticmethod
+    def _stop_job_writers(job: _EpisodeFinalizationJob) -> None:
+        for writer in job.video_writers.values():
+            try:
+                writer.stop()
+            except Exception:
+                pass
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:
+                return
+            with self._condition:
+                self._finalizing = True
+                self._condition.notify_all()
+            try:
+                if job.success:
+                    self.data_exporter.save_episode(
+                        job.episode_buffer,
+                        video_writers=job.video_writers,
+                        validation=job.validation,
+                    )
+                else:
+                    self.data_exporter.save_episode_as_discarded(
+                        job.episode_buffer,
+                        video_writers=job.video_writers,
+                        validation=job.validation,
+                    )
+                with self._condition:
+                    self._last_finalized_episode = job.episode_index
+            except Exception as exc:
+                self._stop_job_writers(job)
+                try:
+                    recovery_path = self._persist_failed_job(job)
+                    recovery_detail = f"; recovery saved to {recovery_path}"
+                except Exception as recovery_exc:
+                    recovery_detail = f"; recovery also failed: {recovery_exc}"
+                error = f"{exc}{recovery_detail}"
+                print(f"[Finalizer] Episode {job.episode_index} failed: {error}")
+                with self._condition:
+                    self._error = error[-500:]
+            else:
+                if self.hub_uploader.status()["ready"]:
+                    try:
+                        self.hub_uploader.enqueue(job.episode_index)
+                    except Exception as exc:
+                        # The local episode is already committed. Keep that
+                        # success authoritative and report upload staging as a
+                        # separate, non-blocking fault. A later cumulative
+                        # snapshot also includes this episode.
+                        self.hub_uploader.report_enqueue_failure(
+                            job.episode_index,
+                            exc,
+                        )
+            finally:
+                with self._condition:
+                    self._pending -= 1
+                    self._finalizing = False
+                    self._condition.notify_all()
 
 
 def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
@@ -702,6 +1016,7 @@ class GrootDataCollector:
         minimum_hand_motion_rad: float = 0.02,
         recording_status_port: int = 5581,
         require_hub_upload: bool = False,
+        shutdown_upload_timeout: float = 300.0,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -723,6 +1038,7 @@ class GrootDataCollector:
         self.require_hand_activity = require_hand_activity
         self.minimum_hand_motion_rad = minimum_hand_motion_rad
         self.require_hub_upload = require_hub_upload
+        self.shutdown_upload_timeout = shutdown_upload_timeout
         self.latest_hand_state = None
         self.latest_hand_state_received_at = None
         self.latest_hand_state_received_monotonic_ns = None
@@ -730,11 +1046,16 @@ class GrootDataCollector:
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
         self.hub_uploader = EpisodeHubUploader(data_exporter)
+        self.episode_finalizer = EpisodeFinalizer(data_exporter, self.hub_uploader)
         self._recording_message = (
             "Choose a Hugging Face dataset to begin"
             if require_hub_upload
             else "Ready to record"
         )
+        self._recording_audio_event = ""
+        self._recording_audio_sequence = time.monotonic_ns()
+        self._recording_audio_event_expires_at = 0.0
+        self._last_announced_finalizer_error: str | None = None
         self._recording_status_ctx = zmq.Context()
         self._recording_status_socket = self._recording_status_ctx.socket(zmq.PUB)
         self._recording_status_socket.setsockopt(zmq.SNDHWM, 2)
@@ -820,10 +1141,28 @@ class GrootDataCollector:
         else:
             print(message)
 
+    def _set_recording_audio_event(self, event: str) -> None:
+        if event not in {"start", "saved", "discard", "save_failed"}:
+            raise ValueError(f"Unsupported recording audio event: {event}")
+        self._recording_audio_sequence += 1
+        self._recording_audio_event = event
+        # Repeat briefly in status packets so a PUB/SUB slow join cannot lose it.
+        self._recording_audio_event_expires_at = time.monotonic() + 2.0
+
     def _publish_recording_status(self) -> None:
         """Publish authoritative recorder state for the loopback browser UI."""
         state = self._episode_state.get_state()
         hub_status = self.hub_uploader.status()
+        finalizer_status = self.episode_finalizer.status()
+        finalizer_error = finalizer_status.get("error")
+        if finalizer_error and finalizer_error != self._last_announced_finalizer_error:
+            self._last_announced_finalizer_error = str(finalizer_error)
+            self._set_recording_audio_event("save_failed")
+            self._recording_message = (
+                "Background episode save failed; local recovery data was preserved"
+            )
+        elif not finalizer_error:
+            self._last_announced_finalizer_error = None
         hub_status["required"] = self.require_hub_upload
         hand_ready = True
         if self.hand_config is not None:
@@ -841,15 +1180,22 @@ class GrootDataCollector:
                 )
             )
         message = self._recording_message
-        if hub_status["uploading"]:
-            message = f"Uploading episode {self.current_episode_index - 1} to Hugging Face"
-        elif hub_status["retrying"]:
-            message = "Upload failed; retrying automatically"
+        if state == self._episode_state.IDLE:
+            if hub_status["uploading"]:
+                message = f"{message} · uploading in background"
+            elif hub_status["retrying"]:
+                message = f"{message} · upload retrying automatically"
         payload = {
             "state": state,
             "recording": state == self._episode_state.RECORDING,
             "saving": state == self._episode_state.NEED_TO_SAVE,
             "episode_index": self.current_episode_index,
+            "recording_audio_event": (
+                self._recording_audio_event
+                if time.monotonic() <= self._recording_audio_event_expires_at
+                else ""
+            ),
+            "recording_audio_sequence": self._recording_audio_sequence,
             "frame_count": self.data_exporter.episode_buffer.get("size", 0),
             "total_episodes": self.data_exporter.meta.info.get("total_episodes", 0),
             "dataset_root": str(self.data_exporter.meta.root),
@@ -867,6 +1213,7 @@ class GrootDataCollector:
                 self.current_stream_mode, self.required_stream_mode
             ),
             "message": message,
+            "finalizer": finalizer_status,
             "hub": hub_status,
             "stream_rates": self.stream_rates.snapshot(self.RATE_STREAMS),
             "timestamp": time.time(),
@@ -1065,10 +1412,8 @@ class GrootDataCollector:
                     f"({hand_motion:.4f} rad < {self.minimum_hand_motion_rad:.4f} rad)"
                 )
 
+        # Continuous rolling rates are diagnostic, not episode pass/fail criteria.
         rates = self.stream_rates.snapshot(self.RATE_STREAMS)
-        required_streams = ["robot_state", "camera"]
-        if self.hand_config is not None:
-            required_streams.append("hand_state")
         modes = {
             int(np.asarray(value).reshape(-1)[0])
             for value in self.data_exporter.episode_buffer.get("teleop.stream_mode", [])
@@ -1082,26 +1427,68 @@ class GrootDataCollector:
                 f"episode contains stream modes {unexpected_modes}; "
                 f"required {required_name} ({self.required_stream_mode}) only"
             )
-        if modes & {5, 6}:
-            required_streams.append("planner")
-        if modes & {1, 4}:
-            required_streams.append("pico_pose")
-        for stream in required_streams:
-            sent_hz = rates.get(stream, {}).get("sent_hz")
-            if sent_hz is None or float(sent_hz) < self.minimum_recording_rate_hz:
-                errors.append(
-                    f"{stream} source rate is {sent_hz} Hz; "
-                    f"minimum is {self.minimum_recording_rate_hz:.1f} Hz"
-                )
-
         errors = sorted(set(errors))
         return {
             "passed": not errors,
             "errors": errors,
             "hand_command_range_rad": round(hand_motion, 6),
-            "required_minimum_rate_hz": self.minimum_recording_rate_hz,
+            "rate_check_enforced": False,
             "stream_rates": rates,
         }
+
+    def _finish_recording(self, *, save: bool, discard_reason: str) -> None:
+        """Acknowledge an outcome and hand local finalization to the worker."""
+        episode_index = self.current_episode_index
+        buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+        if buffer_size <= 0:
+            self._set_recording_audio_event("discard")
+            self._recording_message = "Nothing saved: no frames collected"
+            self._episode_state.reset_state()
+            self._initial_yaw = None
+            self._print_and_say("Skipping empty recording", say=False)
+            return
+
+        if save:
+            validation = self._episode_validation()
+            success = bool(validation["passed"])
+        else:
+            validation = {
+                "passed": False,
+                "errors": [discard_reason],
+            }
+            success = False
+
+        episode_buffer, video_writers = self.data_exporter.detach_episode()
+        self.episode_finalizer.enqueue(
+            episode_index=episode_index,
+            episode_buffer=episode_buffer,
+            video_writers=video_writers,
+            success=success,
+            validation=validation,
+        )
+
+        self.sonic_timing_monitor.reset()
+        self._episode_input_errors.clear()
+        self._initial_yaw = None
+        self._episode_state.reset_state()
+        if success:
+            self._set_recording_audio_event("saved")
+            self._recording_message = (
+                f"Episode {episode_index} accepted; saving and upload continue in background"
+            )
+            self._print_and_say("Recording saved", say=False)
+        else:
+            self._set_recording_audio_event("discard")
+            if save:
+                reasons = "; ".join(validation["errors"])
+                self._recording_message = (
+                    f"Episode {episode_index} failed validation and was discarded: {reasons}"
+                )
+            else:
+                self._recording_message = (
+                    f"Episode {episode_index} discarded; finalizing in background"
+                )
+            self._print_and_say("Recording discarded", say=False)
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
@@ -1115,6 +1502,9 @@ class GrootDataCollector:
                     raise RuntimeError("stop or discard the active episode before changing dataset")
                 if self.data_exporter.episode_buffer.get("size", 0) > 0:
                     raise RuntimeError("cannot change dataset after collecting frames")
+                finalizer_status = self.episode_finalizer.status()
+                if finalizer_status["pending"] or finalizer_status["finalizing"]:
+                    raise RuntimeError("cannot change dataset while an episode is finalizing")
                 if self.data_exporter.meta.info.get("total_episodes", 0) > 0:
                     raise RuntimeError("cannot change dataset after saving an episode")
                 self.hub_uploader.configure(
@@ -1139,6 +1529,9 @@ class GrootDataCollector:
             self._manager_toggle_dc = False
 
         if key == "c":
+            if self._episode_state.get_state() == self._episode_state.RECORDING:
+                self._finish_recording(save=True, discard_reason=discard_reason)
+                return
             if (
                 self._episode_state.get_state() == self._episode_state.IDLE
                 and not _recording_mode_ready(
@@ -1155,12 +1548,21 @@ class GrootDataCollector:
                 and self.require_hub_upload
                 and not self.hub_uploader.can_record()
             ):
-                status = self.hub_uploader.status()
-                message = (
-                    "Wait for the Hugging Face upload to finish"
-                    if status["ready"]
-                    else "Choose a Hugging Face dataset in the browser first"
-                )
+                message = "Choose a Hugging Face dataset in the browser first"
+                self._recording_message = message
+                self._print_and_say(message, blocking=False)
+                return
+            if (
+                self._episode_state.get_state() == self._episode_state.IDLE
+                and not self.episode_finalizer.can_record()
+            ):
+                finalizer_status = self.episode_finalizer.status()
+                if finalizer_status["error"]:
+                    message = (
+                        "Recorder finalizer failed; restart after checking the local dataset"
+                    )
+                else:
+                    message = "Recorder is catching up with local saves; try again shortly"
                 self._recording_message = message
                 self._print_and_say(message, blocking=False)
                 return
@@ -1168,41 +1570,14 @@ class GrootDataCollector:
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
                 self._episode_input_errors.clear()
+                self._set_recording_audio_event("start")
                 self._recording_message = f"Recording episode {self.current_episode_index}"
                 self._print_and_say(
-                    f"Started recording {self.current_episode_index}", blocking=False
+                    f"Recording started. Episode {self.current_episode_index}", say=False
                 )
-            elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
-                self._recording_message = f"Saving episode {self.current_episode_index}"
-                self._print_and_say("Stopping recording, preparing to save", blocking=False)
-            elif self._episode_state.get_state() == self._episode_state.IDLE:
-                self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
-                buffer_size = self.data_exporter.episode_buffer.get("size", 0)
-                if buffer_size > 0:
-                    discarded_episode = self.current_episode_index
-                    self.data_exporter.save_episode_as_discarded(
-                        validation={
-                            "passed": False,
-                            "errors": [discard_reason],
-                        }
-                    )
-                    if self.hub_uploader.status()["ready"]:
-                        self.hub_uploader.enqueue(discarded_episode)
-                        message = f"Episode {discarded_episode} discarded and queued for upload"
-                    else:
-                        message = f"Episode {discarded_episode} discarded"
-                else:
-                    # A discard can arrive before the first complete frame (for
-                    # example while an external hand source is still starting).
-                    # LeRobot rejects zero-frame episodes, so just return the
-                    # recorder to idle in that case.
-                    message = "Nothing discarded: no frames collected"
-                self._episode_state.reset_state()
-                self._initial_yaw = None
-                self._recording_message = message
-                self._print_and_say(message, blocking=False)
+                self._finish_recording(save=False, discard_reason=discard_reason)
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
@@ -1246,14 +1621,8 @@ class GrootDataCollector:
                 )
             ):
                 required_name = _RECORDING_STREAM_MODE_NAMES[self.required_stream_mode]
-                self._manager_toggle_da = True
-                self._manager_discard_reason = (
-                    "required_teleop_mode_exited: "
-                    f"expected {required_name} ({self.required_stream_mode}), "
-                    f"got stream mode {new_stream_mode}"
-                )
                 self._recording_message = (
-                    f"Discarding episode: exited {required_name} mode"
+                    f"Recording paused: return to {required_name} mode"
                 )
             self.current_stream_mode = new_stream_mode
         self.latest_manager_msg = {
@@ -1484,37 +1853,7 @@ class GrootDataCollector:
             print(f"DataExporter Missed: {t_end - t_start} sec")
 
         if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
-            saved_episode = self.current_episode_index
-            buffer_size = self.data_exporter.episode_buffer.get("size", 0)
-            if buffer_size > 0:
-                validation = self._episode_validation()
-                if validation["passed"]:
-                    self.data_exporter.save_episode(validation=validation)
-                else:
-                    self.data_exporter.save_episode_as_discarded(validation=validation)
-                if self.hub_uploader.status()["ready"]:
-                    self.hub_uploader.enqueue(saved_episode)
-                self.sonic_timing_monitor.reset()
-                self._initial_yaw = None
-                if not validation["passed"]:
-                    reasons = "; ".join(validation["errors"])
-                    self._recording_message = (
-                        f"Episode {saved_episode} failed validation and was discarded: {reasons}"
-                    )
-                    self._print_and_say(
-                        f"Episode failed validation and was discarded: {reasons}",
-                        blocking=False,
-                    )
-                elif self.hub_uploader.status()["ready"]:
-                    self._recording_message = f"Saved episode {saved_episode}; upload queued"
-                    self._print_and_say("Finished saving episode, upload started")
-                else:
-                    self._recording_message = f"Saved episode {saved_episode}"
-                    self._print_and_say("Finished saving episode")
-            else:
-                self._recording_message = "Nothing saved: no frames collected"
-                self._print_and_say("Skipping save: no frames collected", say=False)
-            self._episode_state.change_state()
+            self._finish_recording(save=True, discard_reason="operator_discarded")
         return True
 
     def _add_data_frame(self):
@@ -1960,28 +2299,45 @@ class GrootDataCollector:
         )
         return quat_to_rot6d(target_quat)
 
+    def _drain_uploads_on_shutdown(self) -> None:
+        """Let queued uploads finish at exit, reporting progress while waiting."""
+        deadline = time.monotonic() + self.shutdown_upload_timeout
+        while time.monotonic() < deadline:
+            status = self.hub_uploader.status()
+            if not status["pending"] and not status["uploading"]:
+                return
+            print(f"[Hub] Finishing uploads ({status['pending']} queued); Ctrl-C to skip")
+            try:
+                if self.hub_uploader.wait_until_idle(timeout=15.0):
+                    return
+            except KeyboardInterrupt:
+                print("[Hub] Upload skipped by operator; local data is preserved")
+                return
+        print(
+            f"[Hub] Upload still pending after {self.shutdown_upload_timeout:.0f} seconds; "
+            "local data is preserved"
+        )
+
     def save_and_cleanup(self):
         try:
-            self._print_and_say("saving episode done", blocking=False)
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
-                saved_episode = self.current_episode_index
-                self.data_exporter.save_episode_as_discarded(
-                    validation={
-                        "passed": False,
-                        "errors": ["collector_shutdown_before_episode_save"],
-                    }
+                self._finish_recording(
+                    save=False,
+                    discard_reason="collector_shutdown_before_episode_save",
                 )
-                if self.hub_uploader.status()["ready"]:
-                    self.hub_uploader.enqueue(saved_episode)
-            if not self.hub_uploader.wait_until_idle(timeout=30.0):
-                print("[Hub] Upload still pending after 30 seconds; local data is preserved")
+            self.episode_finalizer.wait_until_idle()
+            self._drain_uploads_on_shutdown()
             self._print_and_say(
                 f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
             )
         except Exception as e:
             self._print_and_say(f"Error saving episode: {e}", blocking=True)
 
+        try:
+            self.episode_finalizer.close(timeout=0.0)
+        except Exception:
+            pass
         try:
             self.hub_uploader.close(timeout=0.0)
         except Exception:
@@ -2015,6 +2371,7 @@ class GrootDataCollector:
         self._print_and_say("Shutting down data exporter...", say=False)
 
     def run(self):
+        next_tick = time.monotonic()
         try:
             while True:
                 t_start = time.monotonic()
@@ -2034,8 +2391,13 @@ class GrootDataCollector:
                         if img_msg is not None:
                             self.latest_image_msg = img_msg
                         if self._image_subscriber.idx != previous_image_index and img_msg is not None:
-                            self.latest_image_received_at = time.monotonic()
-                            self.latest_image_received_monotonic_ns = time.monotonic_ns()
+                            receiver_monotonic_ns = _integer_scalar(
+                                img_msg.get("receiver_monotonic_ns")
+                            )
+                            if receiver_monotonic_ns <= 0:
+                                receiver_monotonic_ns = time.monotonic_ns()
+                            self.latest_image_received_monotonic_ns = receiver_monotonic_ns
+                            self.latest_image_received_at = receiver_monotonic_ns / 1e9
                             source_timestamps = [
                                 timestamp
                                 for value in img_msg.get("timestamps", {}).values()
@@ -2056,6 +2418,7 @@ class GrootDataCollector:
                                     and not isinstance(img_msg.get("publisher_sequence"), bool)
                                     else None
                                 ),
+                                received_timestamp=receiver_monotonic_ns / 1e9,
                             )
 
                     with self.telemetry.timer("add_frame"):
@@ -2068,8 +2431,17 @@ class GrootDataCollector:
 
                     end_time = time.monotonic()
 
-                elapsed = time.monotonic() - t_start
-                sleep_time = self.loop_period - elapsed
+                # Pace against an absolute deadline. Sleeping for
+                # ``period - work_time`` every iteration accumulates the small
+                # wake-up delay from time.sleep(), which made a configured
+                # 50 Hz loop settle around 49 Hz. Do not replay a large backlog
+                # after genuinely blocking work such as episode finalization.
+                next_tick += self.loop_period
+                now = time.monotonic()
+                if next_tick < now - self.loop_period:
+                    skipped_ticks = int((now - next_tick) / self.loop_period) + 1
+                    next_tick += skipped_ticks * self.loop_period
+                sleep_time = next_tick - now
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
@@ -2080,12 +2452,6 @@ class GrootDataCollector:
 
         except KeyboardInterrupt:
             print("Data exporter terminated by user")
-            buffer_size = self.data_exporter.episode_buffer.get("size", 0)
-            if buffer_size > 0:
-                discarded_episode = self.current_episode_index
-                self.data_exporter.save_episode_as_discarded()
-                if self.hub_uploader.status()["ready"]:
-                    self.hub_uploader.enqueue(discarded_episode)
 
         finally:
             self.save_and_cleanup()
@@ -2179,6 +2545,7 @@ def main(config: SonicDataExporterConfig):
         minimum_hand_motion_rad=config.minimum_hand_motion_rad,
         recording_status_port=config.recording_status_port,
         require_hub_upload=config.require_hub_upload,
+        shutdown_upload_timeout=config.shutdown_upload_timeout,
     )
     data_collector.run()
 

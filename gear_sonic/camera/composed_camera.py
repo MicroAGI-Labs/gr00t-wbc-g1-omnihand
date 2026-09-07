@@ -479,10 +479,22 @@ class ComposedCameraSensor(Sensor, SensorServer):
         """Merge per-camera data into a single ImageMessageSchema."""
         all_timestamps = {}
         all_images = {}
+        sample_monotonic_values = []
         for _mount, camera_data in message.items():
             all_timestamps.update(camera_data.get("timestamps", {}))
             all_images.update(camera_data.get("images", {}))
-        img_schema = ImageMessageSchema(timestamps=all_timestamps, images=all_images)
+            sample_monotonic_ns = camera_data.get("sample_monotonic_ns")
+            if isinstance(sample_monotonic_ns, int) and sample_monotonic_ns > 0:
+                sample_monotonic_values.append(sample_monotonic_ns)
+        img_schema = ImageMessageSchema(
+            timestamps=all_timestamps,
+            images=all_images,
+            # Match the existing wall-timestamp fallback, which uses the most
+            # recent capture when several cameras share one published packet.
+            sample_monotonic_ns=(
+                max(sample_monotonic_values) if sample_monotonic_values else None
+            ),
+        )
         return img_schema.serialize()
 
     def run_server(self):
@@ -542,9 +554,8 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         self._staleness_warning_interval = 2.0
         self._background = background
         self._background_lock = threading.Lock()
-        self._background_message = None
-        self._background_sequence = 0
-        self._consumed_sequence = 0
+        self._background_messages: deque[dict[str, Any]] = deque(maxlen=5)
+        self._background_target_depth = 2
         self._receiver_stop = threading.Event()
         self._receiver_ready = threading.Event()
         self._receiver_error: BaseException | None = None
@@ -569,7 +580,12 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
 
     def _receive_loop(self, server_ip: str, port: int) -> None:
         try:
-            self.start_client(server_ip, port)
+            # This thread is fast enough to drain the publisher continuously.
+            # Keep a short FIFO so a brief scheduler/GIL stall does not make
+            # ZMQ_CONFLATE discard frames that the 50 Hz collector could use.
+            # The foreground/non-threaded client remains conflated to preserve
+            # its latest-frame semantics.
+            self.start_client(server_ip, port, conflate=False, receive_hwm=5)
         except BaseException as exc:
             self._receiver_error = exc
             self._receiver_ready.set()
@@ -581,9 +597,9 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
                 if message is None:
                     continue
                 decoded = ImageMessageSchema.deserialize(message).asdict()
+                decoded["receiver_monotonic_ns"] = time.monotonic_ns()
                 with self._background_lock:
-                    self._background_message = decoded
-                    self._background_sequence += 1
+                    self._background_messages.append(decoded)
         except BaseException as exc:
             self._receiver_error = exc
         finally:
@@ -597,12 +613,16 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             raise RuntimeError(f"camera receiver failed: {self._receiver_error}")
         if self._background:
             with self._background_lock:
-                sequence = self._background_sequence
-                message = self._background_message
-            if sequence == self._consumed_sequence:
-                message = None
-            else:
-                self._consumed_sequence = sequence
+                # Convert the faster, bursty publisher into a steady collector
+                # stream. Keep one decoded frame in reserve across the normal
+                # 60 Hz -> 50 Hz downsample, and discard only excess old frames.
+                while len(self._background_messages) > self._background_target_depth:
+                    self._background_messages.popleft()
+                message = (
+                    self._background_messages.popleft()
+                    if self._background_messages
+                    else None
+                )
         elif blocking:
             message = self.receive_message()
             if not message:
@@ -620,8 +640,14 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             self._last_new_message_time = current_time
 
             if self.idx % 10 == 0:
+                sample_monotonic_ns = self._latest_message.get("sample_monotonic_ns")
                 for image_key, image_time in self._latest_message["timestamps"].items():
-                    image_latency = (time.time() - image_time) * 1000
+                    if isinstance(sample_monotonic_ns, int) and sample_monotonic_ns > 0:
+                        image_latency = (
+                            time.monotonic_ns() - sample_monotonic_ns
+                        ) / 1e6
+                    else:
+                        image_latency = (time.time() - image_time) * 1000
                     print(f"Image latency for {image_key}: {image_latency:.2f} ms")
 
             self._msg_received_time = time.time()

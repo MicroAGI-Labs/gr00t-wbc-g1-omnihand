@@ -198,7 +198,12 @@ class SensorServer:
             for value in payload.get("timestamps", {}).values()
             if isinstance(value, (int, float, np.number)) and np.isfinite(value) and value > 0
         ]
-        if capture_times:
+        supplied_sample_monotonic_ns = payload.get("sample_monotonic_ns")
+        has_sample_monotonic = (
+            isinstance(supplied_sample_monotonic_ns, int)
+            and supplied_sample_monotonic_ns > 0
+        )
+        if capture_times and not has_sample_monotonic:
             capture_age_ns = int(max(0.0, published_wall_s - max(capture_times)) * 1e9)
             payload["sample_monotonic_ns"] = published_monotonic_ns - capture_age_ns
         payload["publisher_sequence"] = self.message_sent + 1
@@ -221,12 +226,21 @@ class SensorServer:
 class SensorClient:
     """ZMQ SUB client that receives msgpack-encoded sensor payloads."""
 
-    def start_client(self, server_ip: str, port: int):
+    def start_client(
+        self,
+        server_ip: str,
+        port: int,
+        *,
+        conflate: bool = True,
+        receive_hwm: int = 3,
+    ):
+        if receive_hwm <= 0:
+            raise ValueError(f"receive_hwm must be positive, got {receive_hwm}")
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        self.socket.setsockopt(zmq.CONFLATE, True)
-        self.socket.setsockopt(zmq.RCVHWM, 3)
+        self.socket.setsockopt(zmq.CONFLATE, conflate)
+        self.socket.setsockopt(zmq.RCVHWM, receive_hwm)
         self.socket.connect(f"tcp://{server_ip}:{port}")
 
     def stop_client(self):

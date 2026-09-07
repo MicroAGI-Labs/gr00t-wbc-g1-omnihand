@@ -127,6 +127,13 @@ class ZEDSensor(Sensor):
             print(f"[{self.mount_position}] ZED grab failed: {grab_status}")
             return None
 
+        # A successful blocking grab means a new frame is available now.  Use
+        # host clocks at that boundary rather than the ZED IMAGE timestamp:
+        # the SDK's epoch mapping is established when the camera opens and can
+        # retain an old offset if CLOCK_REALTIME is stepped by NTP afterwards.
+        capture_time = time.time()
+        sample_monotonic_ns = time.monotonic_ns()
+
         retrieve_status = self._camera.retrieve_image(
             self._image,
             self._sl.VIEW.LEFT,
@@ -148,12 +155,10 @@ class ZEDSensor(Sensor):
             image_bgra[::-1, ::-1, 2::-1] if self.config.rotate_180 else image_bgra[..., 2::-1]
         )
 
-        timestamp_ns = self._camera.get_timestamp(self._sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
-        capture_time = timestamp_ns / 1e9 if timestamp_ns > 0 else time.time()
-
         return {
             "timestamps": {self.mount_position: capture_time},
             "images": {self.mount_position: image_rgb},
+            "sample_monotonic_ns": sample_monotonic_ns,
         }
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -162,6 +167,7 @@ class ZEDSensor(Sensor):
         return ImageMessageSchema(
             timestamps=data["timestamps"],
             images=data["images"],
+            sample_monotonic_ns=data.get("sample_monotonic_ns"),
         ).serialize()
 
     def observation_space(self):

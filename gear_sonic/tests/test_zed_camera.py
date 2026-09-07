@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from gear_sonic.camera import sensor_server
 from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor
 from gear_sonic.camera.drivers import zed as zed_driver
 
@@ -134,11 +135,13 @@ def test_zed_sensor_configures_hd720_60fps_without_depth(fake_sdk):
     assert (sensor._output_resolution.width, sensor._output_resolution.height) == (640, 480)
 
 
-def test_zed_sensor_returns_owned_rgb_frame_and_epoch_timestamp(monkeypatch):
+def test_zed_sensor_returns_owned_rgb_frame_and_host_timestamps(monkeypatch):
     bgra = np.zeros((480, 640, 4), dtype=np.uint8)
     bgra[0, 0] = [10, 20, 30, 255]
     sdk = FakeSDK(image=bgra)
     monkeypatch.setattr(zed_driver, "_load_zed_sdk", lambda: sdk)
+    monkeypatch.setattr(zed_driver.time, "time", lambda: 2_000_000_000.0)
+    monkeypatch.setattr(zed_driver.time, "monotonic_ns", lambda: 123_456_789)
     sensor = zed_driver.ZEDSensor(mount_position="ego_view")
 
     sample = sensor.read()
@@ -149,12 +152,72 @@ def test_zed_sensor_returns_owned_rgb_frame_and_epoch_timestamp(monkeypatch):
     assert image.shape == (480, 640, 3)
     assert image.flags.c_contiguous
     assert not np.shares_memory(image, bgra)
-    assert sample["timestamps"]["ego_view"] == pytest.approx(1_700_000_000.25)
+    assert sample["timestamps"]["ego_view"] == 2_000_000_000.0
+    assert sample["sample_monotonic_ns"] == 123_456_789
+    assert sensor.serialize(sample)["sample_monotonic_ns"] == 123_456_789
     assert sdk.camera.retrieve_args[1:] == (
         sdk.VIEW.LEFT,
         sdk.MEM.CPU,
         sensor._output_resolution,
     )
+
+
+def test_zed_sensor_ignores_sdk_epoch_after_clock_jump(monkeypatch):
+    sdk = FakeSDK()
+    sdk.timestamp_ns = 1_700_000_000_000_000_000
+    monkeypatch.setattr(zed_driver, "_load_zed_sdk", lambda: sdk)
+    monkeypatch.setattr(zed_driver.time, "time", lambda: 2_000_000_000.0)
+    monkeypatch.setattr(zed_driver.time, "monotonic_ns", lambda: 987_654_321)
+
+    sample = zed_driver.ZEDSensor().read()
+
+    assert sample["timestamps"]["ego_view"] == 2_000_000_000.0
+    assert sample["sample_monotonic_ns"] == 987_654_321
+    assert not hasattr(sdk.camera, "time_reference")
+
+
+def test_composed_camera_preserves_source_monotonic_timestamp():
+    composed = object.__new__(ComposedCameraSensor)
+    image = np.zeros((2, 2, 3), dtype=np.uint8)
+
+    serialized = composed.serialize_message(
+        {
+            "ego_view": {
+                "timestamps": {"ego_view": 2_000_000_000.0},
+                "images": {"ego_view": image},
+                "sample_monotonic_ns": 123_456_789,
+            }
+        }
+    )
+
+    assert serialized["sample_monotonic_ns"] == 123_456_789
+
+
+def test_sensor_server_does_not_rederive_supplied_monotonic_timestamp(monkeypatch):
+    class CapturingSocket:
+        def send(self, payload, flags):
+            self.payload = payload
+
+    server = object.__new__(sensor_server.SensorServer)
+    server.socket = CapturingSocket()
+    server.message_sent = 0
+    server.message_dropped = 0
+    monkeypatch.setattr(
+        sensor_server.msgpack, "packb", lambda payload, use_bin_type: payload
+    )
+    monkeypatch.setattr(sensor_server.time, "time", lambda: 2_000_000_010.0)
+    monkeypatch.setattr(sensor_server.time, "monotonic_ns", lambda: 999_999_999)
+
+    server.send_message(
+        {
+            "timestamps": {"ego_view": 1_700_000_000.0},
+            "images": {},
+            "sample_monotonic_ns": 123_456_789,
+        }
+    )
+
+    assert server.socket.payload["sample_monotonic_ns"] == 123_456_789
+    assert server.socket.payload["publisher_monotonic_ns"] == 999_999_999
 
 
 def test_zed_sensor_rotates_frame_180(monkeypatch):

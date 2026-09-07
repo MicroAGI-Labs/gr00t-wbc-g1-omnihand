@@ -1,17 +1,39 @@
 #include "audio_thread.hpp"
 #include <chrono>
+#include <iostream>
+#include <nlohmann/json.hpp>
 
 static const std::string PLANNER_MODE = "Planner mode";
 static const std::string POSE_MODE = "Pose mode";
 static const std::string WARNING_STREAMING_DATA_ABSENT = "Streaming data absent";
 static const std::string WARNING_MOTOR_ERROR = "Motor error detected";
 static const std::string WARNING_LOW_STATE_LATE = "ROBOT DATA LATE";
+static const std::string RECORDING_STARTED = "Recording started";
+static const std::string RECORDING_DISCARDED = "Recording discarded";
+static const std::string RECORDING_SAVED = "Recording saved";
+static const std::string RECORDING_SAVE_FAILED = "Recording save failed";
 
 AudioThread::AudioThread():
-  client_() {
+  client_(),
+  recording_status_context_(1) {
   client_.Init();
   client_.SetTimeout(10.0f);
   client_.SetVolume(100);
+
+  try {
+    recording_status_socket_ =
+      std::make_unique<zmq::socket_t>(recording_status_context_, zmq::socket_type::sub);
+    recording_status_socket_->set(zmq::sockopt::linger, 0);
+    recording_status_socket_->set(zmq::sockopt::rcvhwm, 100);
+    recording_status_socket_->set(zmq::sockopt::subscribe, "");
+    recording_status_socket_->connect("tcp://127.0.0.1:5581");
+    std::cout << "[AudioThread] Listening for recording events on port 5581" << std::endl;
+  } catch (const zmq::error_t& error) {
+    std::cerr << "[AudioThread] Recording status connection failed: "
+              << error.what() << std::endl;
+    recording_status_socket_.reset();
+  }
+
   thread_ = std::jthread([this](std::stop_token st) { loop(st); });
 }
 
@@ -29,8 +51,59 @@ void AudioThread::SetCommand(const AudioCommand& command) {
   }
 }
 
+void AudioThread::PollRecordingStatus() {
+  if (!recording_status_socket_) {
+    return;
+  }
+
+  try {
+    while (true) {
+      zmq::message_t message;
+      const auto received =
+        recording_status_socket_->recv(message, zmq::recv_flags::dontwait);
+      if (!received) {
+        return;
+      }
+
+      const std::string payload(
+        static_cast<const char*>(message.data()), message.size());
+      const auto status = nlohmann::json::parse(payload, nullptr, false);
+      if (status.is_discarded()) {
+        continue;
+      }
+
+      const auto sequence =
+        status.value("recording_audio_sequence", std::uint64_t{0});
+      const auto event =
+        status.value("recording_audio_event", std::string{});
+      if (event.empty() || sequence <= last_recording_audio_sequence_) {
+        continue;
+      }
+      last_recording_audio_sequence_ = sequence;
+
+      if (event == "start") {
+        client_.TtsMaker(RECORDING_STARTED, 1);
+      } else if (event == "saved") {
+        client_.TtsMaker(RECORDING_SAVED, 1);
+      } else if (event == "discard") {
+        client_.TtsMaker(RECORDING_DISCARDED, 1);
+      } else if (event == "save_failed") {
+        client_.TtsMaker(RECORDING_SAVE_FAILED, 1);
+      }
+    }
+  } catch (const zmq::error_t& error) {
+    std::cerr << "[AudioThread] Recording status receive failed: "
+              << error.what() << std::endl;
+    recording_status_socket_.reset();
+  } catch (const nlohmann::json::exception& error) {
+    std::cerr << "[AudioThread] Invalid recording status: "
+              << error.what() << std::endl;
+  }
+}
+
 void AudioThread::loop(std::stop_token st) {
   while (!st.stop_requested()) {
+    PollRecordingStatus();
     AudioCommand command;
     {
       std::lock_guard<std::mutex> lock(command_mutex_);
@@ -59,6 +132,6 @@ void AudioThread::loop(std::stop_token st) {
     }
 
     command_last_ = command;
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 }

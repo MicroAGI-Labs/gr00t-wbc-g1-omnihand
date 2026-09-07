@@ -53,6 +53,10 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_rotation_matrix,
 )
 from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.teleop.gesture_trackers import (
+    DoublePressTracker,
+    recording_face_action,
+)
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
 try:
@@ -2235,11 +2239,11 @@ def run_pico_manager(
     """
     Manager: publishes body and latest-only hand intent from one fixed-rate loop.
     Controller input:
-      A+X: Toggle between planner and the launch-selected teleop mode
+      A+X: Save while recording; otherwise twice within 2s toggles teleop mode
       A+B+X+Y: Start the policy from OFF
       B+Y: Freeze/unfreeze the upper body
       X+B: Start/stop-success recording
-      Y+A: Discard active recording
+      Y+A: The only explicit discard gesture
     """
     reader = _init_input_source(input_source, buffer_size)
     if teleop_mode not in {"pose", "vr3pt", "ik-upper"}:
@@ -2324,11 +2328,11 @@ def run_pico_manager(
     # State machine diagram:
     #
     #   With --teleop-mode vr3pt (data-collection default):
-    #     OFF --(A+B+X+Y)--> PLANNER <--(A+X)--> PLANNER_VR_3PT
+    #     OFF --(A+B+X+Y)--> PLANNER <--(A+X twice within 2s)--> PLANNER_VR_3PT
     #     PLANNER_VR_3PT <--(B+Y)--> PLANNER_FROZEN_UPPER_BODY
     #
     #   With --teleop-mode ik-upper:
-    #     OFF --(A+B+X+Y)--> PLANNER <--(A+X)--> PLANNER_IK_UPPER
+    #     OFF --(A+B+X+Y)--> PLANNER <--(A+X twice within 2s)--> PLANNER_IK_UPPER
     #     PLANNER_IK_UPPER <--(B+Y)--> PLANNER_FROZEN_UPPER_BODY
     #
     #   With --teleop-mode pose, retain the legacy two chains below.
@@ -2338,18 +2342,19 @@ def run_pico_manager(
     #                                                                         |
     #                                                                    (by)--> POSE
     #
-    #   Chain 2 (ax_pressed enters/exits, left_axis_click toggles sub-mode):
-    #     POSE <--(ax)--> PLANNER <--(left_axis_click)--> PLANNER_VR_3PT
+    #   Chain 2 (confirmed A+X pair enters/exits, left_axis_click toggles sub-mode):
+    #     POSE <--(A+X twice within 2s)--> PLANNER <--(left_axis_click)--> PLANNER_VR_3PT
     #                                                        |
-    #                                                   (ax)--> POSE
+    #                                  (A+X twice within 2s)--> POSE
     #
     #   A+B+X+Y is start-only. Once running, stop through the UI or terminate
     #   the process; the headset gesture cannot transition back to OFF.
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
     print(
-        f"Manager controls: A+X=toggle {teleop_mode.upper()} teleop, "
-        "B+Y=frozen upper body, X+B=record/save, Y+A=discard, "
+        f"Manager controls: A+X=save while recording; otherwise twice within 2s="
+        f"toggle {teleop_mode.upper()} teleop, B+Y=frozen upper body, "
+        "X+B=record/save, Y+A=only discard, "
         f"A+B+X+Y=start policy (start-only); initial gait={initial_mode.name}"
     )
     current_mode = StreamMode.OFF
@@ -2359,6 +2364,7 @@ def run_pico_manager(
     recorder_is_recording = False
     recorder_command_timestamp = 0.0
     face_chords = FaceChordTracker()
+    ax_double_press = DoublePressTracker(window_seconds=2.0)
     manager_period = 1.0 / max(target_fps, 1)
     manager_deadline = time.monotonic()
     rate_report_started = manager_deadline
@@ -2414,6 +2420,7 @@ def run_pico_manager(
                 prev_start_combo = False
                 prev_left_axis_click = False
                 face_chords.reset()
+                ax_double_press.reset()
                 print(
                     "[Manager] Teleop reconnected; SONIC is still running and "
                     "teleop remains OFF. "
@@ -2445,11 +2452,20 @@ def run_pico_manager(
             )
             start_combo = bool(a_pressed) and bool(b_pressed) and bool(x_pressed) and bool(y_pressed)
 
-            # A+X toggles the launch-selected teleop mode against PLANNER.
-            ax_pressed = face_command == "ax"
+            # During recording, a completed A+X is reserved for save. While
+            # idle, two completed A+X gestures toggle the teleop mode.
+            ax_pressed = False
+            if face_command == "ax" and not recorder_is_recording:
+                ax_pressed = ax_double_press.register()
+                if not ax_pressed:
+                    print(
+                        "[Manager] A+X registered; press A+X again within 2s "
+                        "to toggle teleop"
+                    )
 
-            # B+Y freezes both upper body and external OmniHands until toggled off.
-            by_pressed = face_command == "by"
+            # Mode changes are disabled while recording. This makes Y+A the
+            # only gesture that can discard a take.
+            by_pressed = face_command == "by" and not recorder_is_recording
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
@@ -2464,7 +2480,7 @@ def run_pico_manager(
                         print("[Manager] WARNING: No SMPL data available for calibration")
 
             elif current_mode == StreamMode.PLANNER:
-                # Data collection defaults A+X to upper-body VR_3PT while the
+                # Data collection defaults the A+X pair to upper-body VR_3PT while the
                 # legacy standalone manager can retain full-body POSE.
                 if ax_pressed and not prev_ax_pressed:
                     new_mode = teleop_stream_mode
@@ -2515,14 +2531,20 @@ def run_pico_manager(
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY
 
-            discard_for_mode_exit = (
-                recorder_is_recording
-                and current_mode == teleop_stream_mode
-                and new_mode != current_mode
-            )
+            if recorder_is_recording and new_mode != current_mode:
+                attempted_mode = new_mode
+                new_mode = current_mode
+                print(
+                    "[Manager] Mode change ignored while recording: "
+                    f"{current_mode.name} -> {attempted_mode.name}; "
+                    "save with A+X or X+B, or discard with Y+A first"
+                )
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
+                # A mode change invalidates any unconfirmed gesture from the
+                # previous interaction context. Confirmed pairs are already reset.
+                ax_double_press.reset()
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
 
@@ -2580,33 +2602,32 @@ def run_pico_manager(
                 current_mode = new_mode
 
             # Mode-independent: send manager_state for data exporter
-            toggle_dc_requested = face_command == "xb"
-            toggle_dc = toggle_dc_requested and (
-                recorder_is_recording or current_mode == teleop_stream_mode
+            recording_action = recording_face_action(
+                face_command,
+                recorder_is_recording=recorder_is_recording,
+                recording_mode_ready=current_mode == teleop_stream_mode,
             )
-            toggle_da = face_command == "ya" or discard_for_mode_exit
+            toggle_dc_requested = face_command == "xb"
+            toggle_dc = recording_action in {"start", "save"}
+            toggle_da = recording_action == "discard"
             if toggle_dc_requested and not toggle_dc:
                 print(
-                    "[Manager] Recorder start rejected: use A+X to enter "
+                    "[Manager] Recorder start rejected: use A+X twice within 2s to enter "
                     f"{teleop_stream_mode.name} first"
                 )
             if toggle_dc:
-                recorder_is_recording = not recorder_is_recording
+                was_recording = recorder_is_recording
+                recorder_is_recording = recording_action == "start"
                 recorder_command_timestamp = time.time()
+                gesture = "A+X" if face_command == "ax" else "X+B"
                 print(
-                    "[Manager] Recorder X+B -> "
-                    f"{'start' if recorder_is_recording else 'stop/save'}"
+                    f"[Manager] Recorder {gesture} -> "
+                    f"{'stop/save' if was_recording else 'start'}"
                 )
             elif toggle_da:
                 recorder_is_recording = False
                 recorder_command_timestamp = time.time()
-                if discard_for_mode_exit:
-                    print(
-                        "[Manager] Recorder auto-discard: exited required "
-                        f"{teleop_stream_mode.name} mode"
-                    )
-                else:
-                    print("[Manager] Recorder Y+A -> discard")
+                print("[Manager] Recorder Y+A -> discard")
             socket.send(
                 pack_pose_message(
                     {
@@ -2791,7 +2812,7 @@ if __name__ == "__main__":
         choices=["pose", "vr3pt", "ik-upper"],
         default="pose",
         help=(
-            "A+X teleop mode: full-body pose, learned VR 3-point planner, "
+            "Teleop mode selected by double A+X: full-body pose, learned VR 3-point planner, "
             "or deterministic arm IK with planner-owned legs/waist"
         ),
     )

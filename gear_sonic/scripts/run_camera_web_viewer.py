@@ -294,12 +294,13 @@ _INDEX_HTML = """<!doctype html>
         recordDetail.textContent =
           `episode ${status.episode_index} · ${status.frame_count} frames · ` +
           `${status.dataset_root} · ${readiness} · ` +
-          'headset: release X+B to record/save, release Y+A to discard';
+          (status.recording
+            ? 'headset: release A+X or X+B to save, release Y+A to discard'
+            : 'headset: release X+B to start; A+X twice toggles teleop');
         recordToggle.textContent = status.recording ? 'Stop & Save' : 'Start Recording';
         recordToggle.className = status.recording ? 'stop' : '';
         recordToggle.disabled = commandPending || status.saving ||
-          (!status.recording && (!ready || (hub.required && !hub.ready) ||
-            hub.uploading || hub.pending));
+          (!status.recording && (!ready || (hub.required && !hub.ready)));
         recordDiscard.disabled = commandPending || !status.recording;
         updateDatasetStatus(status);
       } catch (_) {
@@ -310,8 +311,9 @@ _INDEX_HTML = """<!doctype html>
     function updateDatasetStatus(status) {
       const connected = Boolean(status.connected);
       const hub = status.hub || {};
+      const finalizer = status.finalizer || {};
       const locked = Boolean(status.recording || status.saving || status.total_episodes > 0 ||
-        hub.uploading || hub.pending);
+        finalizer.finalizing || finalizer.pending || hub.uploading || hub.pending);
       if (hub.ready && hub.repo_id && hydratedRepo !== hub.repo_id) {
         datasetRepo.value = hub.repo_id.split('/').slice(1).join('/');
         datasetPrompt.value = hub.prompt || datasetPrompt.value;
@@ -329,11 +331,14 @@ _INDEX_HTML = """<!doctype html>
       if (hub.uploading) {
         datasetState.textContent = 'UPLOADING';
         datasetState.className = 'uploading';
-        datasetMessage.textContent = `Uploading to ${hub.repo_id}… next recording is paused.`;
+        const queued = hub.pending > 1 ? ` · ${hub.pending} episodes queued` : '';
+        datasetMessage.textContent =
+          `Uploading to ${hub.repo_id}${queued}… you can keep recording.`;
       } else if (hub.retrying || hub.error) {
         datasetState.textContent = 'RETRYING';
         datasetState.className = 'error';
-        datasetMessage.textContent = `Upload error: ${hub.error || 'retrying automatically'}`;
+        datasetMessage.textContent =
+          `Upload error (recording still allowed): ${hub.error || 'retrying automatically'}`;
       } else if (hub.ready) {
         datasetState.textContent = 'READY';
         datasetState.className = 'ready';
@@ -667,6 +672,9 @@ class RecorderControlHub:
         status = self.status()
         if status.get("recording") or status.get("saving"):
             raise RuntimeError("stop or discard the active episode first")
+        finalizer = status.get("finalizer") or {}
+        if finalizer.get("pending") or finalizer.get("finalizing"):
+            raise RuntimeError("wait for local episode finalization before changing dataset")
         if int(status.get("total_episodes", 0) or 0) > 0:
             raise RuntimeError("repository and prompt are locked after the first saved episode")
 
