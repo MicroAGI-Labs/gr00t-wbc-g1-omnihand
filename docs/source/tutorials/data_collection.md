@@ -307,8 +307,9 @@ python gear_sonic/scripts/launch_data_collection.py --body-control-mode full-smp
 In the planner-owned `vr3pt` and `ik-upper` configurations, **A+B+X+Y** starts
 SONIC in idle. A confirmed **A+X** then moves the arms smoothly over two seconds
 to `IDLE_BASE_POSE` (20-degree shoulder pitch moves the elbows behind the torso
-for balance, the physical elbow angle is 110 degrees, and neutral wrists keep
-the hands parallel to the forearms while the palms face each other). The operator
+for balance, a negative elbow offset produces the 110-degree bend with the
+forearms pointing forward, and neutral wrists keep the hands parallel to the
+forearms while the palms face each other). The operator
 physically matches that robot pose and confirms **A+X** again; only then does
 the manager calibrate the operator against the robot's measured pose and enter
 teleoperation. **B+Y** reverses the same flow, first returning to base pose and

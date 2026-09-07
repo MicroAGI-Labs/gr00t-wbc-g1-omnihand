@@ -13,7 +13,7 @@ from gear_sonic.utils.teleop.pose_transition import (
 def test_idle_base_pose_has_rearward_elbows_and_neutral_wrists():
     assert IDLE_BASE_UPPER_BODY_RAD.shape == (17,)
     np.testing.assert_allclose(IDLE_BASE_SHOULDER_PITCH_RAD, np.deg2rad(20.0))
-    np.testing.assert_allclose(IDLE_BASE_ELBOW_RAD, np.deg2rad(20.0))
+    np.testing.assert_allclose(IDLE_BASE_ELBOW_RAD, np.deg2rad(-20.0))
     np.testing.assert_allclose(
         IDLE_BASE_UPPER_BODY_RAD[3:11],
         [
