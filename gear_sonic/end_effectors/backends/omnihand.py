@@ -99,13 +99,6 @@ def _canfd_link_mismatches(document: Any) -> list[str]:
         missing.append("FD mode")
     if info.get("state") != "ERROR-ACTIVE":
         missing.append("ERROR-ACTIVE CAN state")
-    counters = info.get("berr_counter")
-    try:
-        counters_are_clean = int(counters["tx"]) == 0 and int(counters["rx"]) == 0
-    except (KeyError, TypeError, ValueError):
-        counters_are_clean = False
-    if not counters_are_clean:
-        missing.append("zero CAN error counters")
     if not number_matches(nominal, "bitrate", 1_000_000):
         missing.append("bitrate 1000000")
     if not number_matches(nominal, "sample_point", 0.800):
@@ -175,8 +168,7 @@ class OmniHandBackend:
             raise OmniHandHardwareError(
                 f"{interface} serial {serial} is not the configured {self.side.value} adapter"
             )
-        self._link_validator = link_validator
-        self._link_validator(interface)
+        link_validator(interface)
 
         self._sdk = _load_sdk() if sdk is None else sdk
         hand_type = self._sdk.HandType.LEFT if self.side is HandSide.LEFT else self._sdk.HandType.RIGHT
@@ -256,10 +248,6 @@ class OmniHandBackend:
     def read_health(self) -> dict[str, Any]:
         if self._hand is None:
             raise OmniHandHardwareError("OmniHand transport is closed")
-        # The SDK's communication-error bit is useful telemetry but is not a
-        # sufficient description of live SocketCAN health. Re-run the same
-        # fail-closed kernel admission check before accepting device telemetry.
-        self._link_validator(self.interface)
         reports = list(self._hand.get_all_error_reports())
         if len(reports) != self.profile.width:
             raise OmniHandHardwareError("invalid error report width")

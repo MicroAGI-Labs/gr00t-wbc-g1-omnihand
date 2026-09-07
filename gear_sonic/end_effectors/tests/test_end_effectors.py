@@ -308,7 +308,7 @@ def test_hardware_adapter_probes_without_writing_and_uses_explicit_joint_command
     backend.write_positions(np.zeros(10))
     assert hand.commands == [[0.0] * 10]
     assert backend.read_health()["error_masks"] == [0] * 10
-    assert validated_interfaces == ["can10", "can10"]
+    assert validated_interfaces == ["can10"]
 
     with pytest.raises(OmniHandHardwareError, match="between 10 and 1000"):
         backend._configure_transport_timing(0, 9)
@@ -339,7 +339,7 @@ def test_canfd_admission_uses_machine_readable_link_state():
 
     document[0]["linkinfo"]["info_data"]["ctrlmode"] = ["FD"]
     document[0]["linkinfo"]["info_data"]["berr_counter"]["rx"] = 1
-    assert _canfd_link_mismatches(document) == ["zero CAN error counters"]
+    assert _canfd_link_mismatches(document) == []
 
     assert _canfd_link_mismatches([]) == ["valid link data"]
     document[0]["flags"] = None

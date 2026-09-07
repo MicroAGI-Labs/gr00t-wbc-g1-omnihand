@@ -337,10 +337,12 @@ or `can5`. Required settings: 1 Mbps arbitration/80% sample point, 5 Mbps data/
 finite feedback; it never silently reconfigures the host. `can10` observation is
 not proof of bilateral setup—validate `can11` independently.
 
-Admission parses `ip -details -json link` and requires an UP CAN-FD interface,
-MTU 72, ERROR-ACTIVE state, zero live error counters, 1 Mbps arbitration at an
-80% sample point, and 5 Mbps data at a 75% sample point. The same bounded check
-runs during health polling so later link degradation fails closed. SDK v1.1.8
+Connection admission parses `ip -details -json link` and requires an UP CAN-FD
+interface, MTU 72, ERROR-ACTIVE state, 1 Mbps arbitration at an 80% sample
+point, and 5 Mbps data at a 75% sample point. This bounded check runs whenever a
+backend is created, including each reconnect, rather than during normal health
+polling. Transient counters are not an admission failure; live communication
+failures surface through SDK reads and writes and trigger reconnect. SDK v1.1.8
 is configured with request interval `0` (no SDK rate limit) and a `50 ms` CAN
 frame timeout; both settings are read back and verified before feedback is
 accepted.
