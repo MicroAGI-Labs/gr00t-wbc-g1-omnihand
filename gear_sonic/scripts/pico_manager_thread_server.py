@@ -57,6 +57,12 @@ from gear_sonic.utils.teleop.gesture_trackers import (
     DoublePressTracker,
     recording_face_action,
 )
+from gear_sonic.utils.teleop.pose_transition import (
+    IDLE_BASE_UPPER_BODY_MASK,
+    IDLE_BASE_UPPER_BODY_RAD,
+    UPPER_BODY_WIDTH,
+    JointPoseTransition,
+)
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
 try:
@@ -139,6 +145,8 @@ class StreamMode(Enum):
     OFF = 0
     POSE = 1
     PLANNER = 2
+    PLANNER_IDLE_BASE_POSE = 3
+    # Wire-compatible alias for older tools and recorded metadata.
     PLANNER_FROZEN_UPPER_BODY = 3
     POSE_PAUSE = 4
     PLANNER_VR_3PT = 5
@@ -148,7 +156,7 @@ class StreamMode(Enum):
 PLANNER_STREAM_MODES = frozenset(
     {
         StreamMode.PLANNER,
-        StreamMode.PLANNER_FROZEN_UPPER_BODY,
+        StreamMode.PLANNER_IDLE_BASE_POSE,
         StreamMode.PLANNER_VR_3PT,
         StreamMode.PLANNER_IK_UPPER,
     }
@@ -1925,6 +1933,7 @@ class FeedbackReader:
         self.upper_body_joint_indices = self._get_upper_body_joint_indices()
 
         self.upper_body_position_target = None
+        self.upper_body_planner_target = None
         self.left_hand_position_target = None
         self.right_hand_position_target = None
         # Full body joint configuration (29 DOFs) as measured from robot,
@@ -1940,12 +1949,13 @@ class FeedbackReader:
 
     def poll_feedback(self, *, retain_last: bool = False) -> bool:
         """Poll once and report whether a complete body sample was received."""
-        upper_body, left_hand, right_hand, full_body = (
+        upper_body, planner_target, left_hand, right_hand, full_body = (
             self._process_upper_body_position_targets()
         )
         if full_body is None and retain_last:
             return False
         self.upper_body_position_target = upper_body
+        self.upper_body_planner_target = planner_target
         self.left_hand_position_target = left_hand
         self.right_hand_position_target = right_hand
         self.full_body_q_measured = full_body
@@ -1958,22 +1968,43 @@ class FeedbackReader:
 
     def _process_upper_body_position_targets(
         self,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    ) -> tuple[
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+    ]:
         data = self.poller.get_data()
 
         if data is None:
             print("[PlannerLoop] No feedback data received")
-            return None, None, None, None
+            return None, None, None, None, None
 
         unpacked = msgpack.unpackb(data, raw=False)
         full_body_q = None
         if "body_q_measured" in unpacked:
-            body_q_swizzled = unpacked["body_q_measured"]
-            full_body_q = np.array(body_q_swizzled, dtype=np.float64)
-            body_q = [body_q_swizzled[i] for i in self.upper_body_joint_indices]
+            candidate = np.asarray(unpacked["body_q_measured"], dtype=np.float64)
+            if candidate.shape == (29,) and np.all(np.isfinite(candidate)):
+                full_body_q = candidate
+                body_q = candidate[self.upper_body_joint_indices]
+            else:
+                print("[PlannerLoop] body_q_measured feedback is invalid")
+                body_q = None
         else:
             print("[PlannerLoop] body_q_measured not in feedback data")
             body_q = None
+
+        if "body_q_target" in unpacked:
+            body_q_target = np.asarray(unpacked["body_q_target"], dtype=np.float64)
+            if body_q_target.shape == (29,) and np.all(np.isfinite(body_q_target)):
+                planner_target = body_q_target[self.upper_body_joint_indices]
+            else:
+                print("[PlannerLoop] body_q_target feedback is invalid")
+                planner_target = None
+        else:
+            print("[PlannerLoop] body_q_target not in feedback data")
+            planner_target = None
 
         if "left_hand_q_measured" in unpacked:
             left_hand_q = unpacked["left_hand_q_measured"]
@@ -1987,7 +2018,7 @@ class FeedbackReader:
             print("[PlannerLoop] right_hand_q_measured not in feedback data")
             right_hand_q = None
 
-        return body_q, left_hand_q, right_hand_q, full_body_q
+        return body_q, planner_target, left_hand_q, right_hand_q, full_body_q
 
 
 class PlannerStreamer:
@@ -2035,7 +2066,32 @@ class PlannerStreamer:
         """Poll feedback and save upper body position target."""
         self.feedback_reader.poll_feedback()
 
-    def recalibrate_for_vr3pt(self):
+    def poll_fresh_feedback(self, *, require_planner_target: bool = False) -> bool:
+        """Refresh robot feedback used to seed a safe upper-body transition."""
+        deadline = time.monotonic() + 0.1
+        while (
+            not self.feedback_reader.poll_feedback(retain_last=True)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        measured = self.feedback_reader.upper_body_position_target
+        received_at = self.feedback_reader.last_body_feedback_monotonic
+        if (
+            measured is None
+            or np.asarray(measured).shape != (UPPER_BODY_WIDTH,)
+            or received_at is None
+            or time.monotonic() - received_at > 0.25
+        ):
+            print("[PlannerLoop] Cannot transition without fresh upper-body feedback")
+            return False
+        if require_planner_target:
+            target = self.feedback_reader.upper_body_planner_target
+            if target is None or np.asarray(target).shape != (UPPER_BODY_WIDTH,):
+                print("[PlannerLoop] Cannot return to idle without a planner joint target")
+                return False
+        return True
+
+    def recalibrate_for_vr3pt(self) -> bool:
         """
         Recalibrate VR 3-point pose tracking using the robot's current measured joints.
 
@@ -2043,28 +2099,23 @@ class PlannerStreamer:
         schedules recalibration so VR tracking aligns with the robot's current pose.
         This prevents sudden jumps when entering VR 3PT mode from PLANNER mode.
         """
-        self.feedback_reader.poll_feedback()
-        if self.feedback_reader.full_body_q_measured is not None:
-            self.three_point.reset_with_measured_q(self.feedback_reader.full_body_q_measured)
-            print("[PlannerLoop] VR 3PT recalibration scheduled with measured robot pose")
-        else:
-            # Fallback: use zeros if no feedback available
-            print(
-                "[PlannerLoop] WARNING: No feedback data for VR 3PT recalibration, "
-                "using zero body_q as fallback"
-            )
-            self.three_point.reset_with_measured_q(np.zeros(29, dtype=np.float64))
+        if not self.poll_fresh_feedback():
+            print("[PlannerLoop] Cannot enter VR 3PT without fresh robot feedback")
+            return False
+        measured_q = self.feedback_reader.full_body_q_measured
+        if measured_q is None or np.asarray(measured_q).shape != (29,):
+            print("[PlannerLoop] Cannot enter VR 3PT without complete 29-DOF feedback")
+            return False
+        self.three_point.reset_with_measured_q(measured_q)
+        print("[PlannerLoop] VR 3PT recalibration scheduled with measured robot pose")
+        return True
 
     def prepare_ik_upper_body(self) -> bool:
         """Seed calibrated arm IK from fresh measured robot feedback."""
         if self.ik_upper_body is None:
             raise RuntimeError("upper-body IK was not initialized")
-        deadline = time.monotonic() + 0.1
-        while (
-            not self.feedback_reader.poll_feedback(retain_last=True)
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.01)
+        if not self.poll_fresh_feedback():
+            return False
         measured_q = self.feedback_reader.full_body_q_measured
         received_at = self.feedback_reader.last_body_feedback_monotonic
         if (
@@ -2082,12 +2133,23 @@ class PlannerStreamer:
         print("[PlannerLoop] Upper-body IK seeded from measured robot pose")
         return True
 
-    def run_once(self, stream_mode: StreamMode, *, face_command: str | None = None) -> bool:
+    def run_once(
+        self,
+        stream_mode: StreamMode,
+        *,
+        face_command: str | None = None,
+        upper_body_override: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+        force_locomotion_idle: bool = False,
+    ) -> bool:
         """Execute one iteration of the planner control loop."""
         try:
             # Avoid sending old commands if XRT timestamp hasn't advanced, in case of headset disconnect
             xrt_timestamp = self.reader.get_timestamp_ns()
-            if xrt_timestamp == self.last_xrt_timestamp:
+            transition_or_base_pose = (
+                upper_body_override is not None
+                or stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE
+            )
+            if xrt_timestamp == self.last_xrt_timestamp and not transition_or_base_pose:
                 return False
             self.last_xrt_timestamp = xrt_timestamp
 
@@ -2136,17 +2198,34 @@ class PlannerStreamer:
 
             movement = [movement_global[0], movement_global[1], 0.0]
 
+            if force_locomotion_idle or stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE:
+                mode_to_send = LocomotionMode.IDLE
+                movement = [0.0, 0.0, 0.0]
+                speed = -1.0
+
             upper_body_position = None
             upper_body_velocity = None
             upper_body_mask = None
             left_hand_position = None
             right_hand_position = None
-            if stream_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                upper_body_position = self.feedback_reader.upper_body_position_target
-                if upper_body_position is not None:
-                    upper_body_velocity = np.zeros(17, dtype=np.float32)
+            if stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE:
+                upper_body_position = IDLE_BASE_UPPER_BODY_RAD.copy()
+                upper_body_velocity = np.zeros(UPPER_BODY_WIDTH, dtype=np.float64)
+                upper_body_mask = IDLE_BASE_UPPER_BODY_MASK.copy()
                 left_hand_position = self.feedback_reader.left_hand_position_target
                 right_hand_position = self.feedback_reader.right_hand_position_target
+
+            if upper_body_override is not None:
+                upper_body_position, upper_body_velocity, upper_body_mask = upper_body_override
+                upper_body_position = np.asarray(upper_body_position, dtype=np.float64)
+                upper_body_velocity = np.asarray(upper_body_velocity, dtype=np.float64)
+                upper_body_mask = np.asarray(upper_body_mask, dtype=bool)
+                if (
+                    upper_body_position.shape != (UPPER_BODY_WIDTH,)
+                    or upper_body_velocity.shape != (UPPER_BODY_WIDTH,)
+                    or upper_body_mask.shape != (UPPER_BODY_WIDTH,)
+                ):
+                    raise ValueError("upper-body override must contain three 17-element arrays")
 
             vr_3pt_position = None
             vr_3pt_orientation = None
@@ -2235,19 +2314,22 @@ def run_pico_manager(
     initial_locomotion_mode: str = "idle",
     recording_status_host: str = "localhost",
     recording_status_port: int = 5581,
+    idle_base_transition_duration: float = 2.0,
 ):
     """
     Manager: publishes body and latest-only hand intent from one fixed-rate loop.
     Controller input:
-      A+X: Save while recording; otherwise twice within 2s toggles teleop mode
+      A+X: Save while recording; otherwise twice within 2s advances toward teleop
       A+B+X+Y: Start the policy from OFF
-      B+Y: Freeze/unfreeze the upper body
+      B+Y: Step back from teleop to base pose, then from base pose to idle
       X+B: Start/stop-success recording
       Y+A: The only explicit discard gesture
     """
     reader = _init_input_source(input_source, buffer_size)
     if teleop_mode not in {"pose", "vr3pt", "ik-upper"}:
         raise ValueError("teleop_mode must be 'pose', 'vr3pt', or 'ik-upper'")
+    if not np.isfinite(idle_base_transition_duration) or idle_base_transition_duration <= 0:
+        raise ValueError("idle_base_transition_duration must be positive and finite")
     try:
         initial_mode = LocomotionMode[initial_locomotion_mode.upper()]
     except KeyError as exc:
@@ -2325,27 +2407,19 @@ def run_pico_manager(
     )
     hand_intent = HandIntentStream()
 
-    # State machine diagram:
+    # Stable manager states for planner-based teleoperation:
     #
-    #   With --teleop-mode vr3pt (data-collection default):
-    #     OFF --(A+B+X+Y)--> PLANNER <--(A+X twice within 2s)--> PLANNER_VR_3PT
-    #     PLANNER_VR_3PT <--(B+Y)--> PLANNER_FROZEN_UPPER_BODY
+    #              A+X                         A+X + calibration
+    #     PLANNER ------> IDLE_BASE_POSE --------------------------> TELEOP
+    #             <------                 <--------------------------
+    #               B+Y                              B+Y
     #
-    #   With --teleop-mode ik-upper:
-    #     OFF --(A+B+X+Y)--> PLANNER <--(A+X twice within 2s)--> PLANNER_IK_UPPER
-    #     PLANNER_IK_UPPER <--(B+Y)--> PLANNER_FROZEN_UPPER_BODY
+    # The arrows touching IDLE_BASE_POSE use a private two-second joint
+    # interpolation. They are not additional public FSM states. During both
+    # directions locomotion is idle and hand intent is held.
     #
-    #   With --teleop-mode pose, retain the legacy two chains below.
-    #
-    #   Chain 1 (by_pressed enters/exits, left_axis_click toggles sub-mode):
-    #     POSE <--(by)--> PLANNER_FROZEN_UPPER_BODY <--(left_axis_click)--> PLANNER_VR_3PT
-    #                                                                         |
-    #                                                                    (by)--> POSE
-    #
-    #   Chain 2 (confirmed A+X pair enters/exits, left_axis_click toggles sub-mode):
-    #     POSE <--(A+X twice within 2s)--> PLANNER <--(left_axis_click)--> PLANNER_VR_3PT
-    #                                                        |
-    #                                  (A+X twice within 2s)--> POSE
+    # Full-body POSE retains its legacy switching behavior; the safe base-pose
+    # path applies to the planner-owned VR_3PT and IK upper-body modes.
     #
     #   A+B+X+Y is start-only. Once running, stop through the UI or terminate
     #   the process; the headset gesture cannot transition back to OFF.
@@ -2353,14 +2427,14 @@ def run_pico_manager(
     #
     print(
         f"Manager controls: A+X=save while recording; otherwise twice within 2s="
-        f"toggle {teleop_mode.upper()} teleop, B+Y=frozen upper body, "
+        f"advance toward {teleop_mode.upper()} teleop, B+Y=step back toward idle, "
         "X+B=record/save, Y+A=only discard, "
         f"A+B+X+Y=start policy (start-only); initial gait={initial_mode.name}"
     )
     current_mode = StreamMode.OFF
-    # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
-    # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
+    upper_body_transition: JointPoseTransition | None = None
+    transition_destination: StreamMode | None = None
     recorder_is_recording = False
     recorder_command_timestamp = 0.0
     face_chords = FaceChordTracker()
@@ -2385,6 +2459,8 @@ def run_pico_manager(
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
                 current_mode = StreamMode.OFF
+                upper_body_transition = None
+                transition_destination = None
 
                 # OFF is local manager state only. Never send stop=True from the
                 # headset process: SONIC lifetime is owned by the operator UI or
@@ -2441,7 +2517,6 @@ def run_pico_manager(
                     recorder_is_recording = bool(recorder_status.get("recording", False))
 
             left_menu_button, _, _, _, _ = get_controller_inputs(reader)
-
             left_axis_click, _ = get_axis_clicks(reader)
 
             # Confirm a two-button chord only after all face buttons are
@@ -2452,15 +2527,15 @@ def run_pico_manager(
             )
             start_combo = bool(a_pressed) and bool(b_pressed) and bool(x_pressed) and bool(y_pressed)
 
-            # During recording, a completed A+X is reserved for save. While
-            # idle, two completed A+X gestures toggle the teleop mode.
+            # During recording, a completed A+X is reserved for save. Otherwise,
+            # two completed A+X gestures advance one step toward teleoperation.
             ax_pressed = False
             if face_command == "ax" and not recorder_is_recording:
                 ax_pressed = ax_double_press.register()
                 if not ax_pressed:
                     print(
                         "[Manager] A+X registered; press A+X again within 2s "
-                        "to toggle teleop"
+                        "to advance toward teleop"
                     )
 
             # Mode changes are disabled while recording. This makes Y+A the
@@ -2468,90 +2543,129 @@ def run_pico_manager(
             by_pressed = face_command == "by" and not recorder_is_recording
 
             new_mode = current_mode
-            if current_mode == StreamMode.OFF:
+            requested_transition: StreamMode | None = None
+            planner_based_teleop = teleop_stream_mode in {
+                StreamMode.PLANNER_VR_3PT,
+                StreamMode.PLANNER_IK_UPPER,
+            }
+
+            # An interpolation owns the upper body until its final sample has
+            # been sent. Do not accept another mode gesture halfway through it.
+            if upper_body_transition is not None:
+                pass
+            elif current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.PLANNER
-                    # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
-                    # Uses the current Pico SMPL frame + FK of all-zero body joints.
-                    sample = reader.get_latest()
-                    if sample is not None:
-                        three_point.calibrate_now(sample["body_poses_np"])
+                    if planner_based_teleop:
+                        print(
+                            "[Manager] Planner started in IDLE; operator calibration "
+                            "is deferred until IDLE_BASE_POSE -> TELEOP"
+                        )
                     else:
-                        print("[Manager] WARNING: No SMPL data available for calibration")
+                        # Legacy full-body POSE uses its zero-reference calibration.
+                        sample = reader.get_latest()
+                        if sample is not None:
+                            three_point.calibrate_now(sample["body_poses_np"])
+                        else:
+                            print("[Manager] WARNING: No SMPL data available for calibration")
 
             elif current_mode == StreamMode.PLANNER:
-                # Data collection defaults the A+X pair to upper-body VR_3PT while the
-                # legacy standalone manager can retain full-body POSE.
-                if ax_pressed and not prev_ax_pressed:
+                if planner_based_teleop and ax_pressed and not prev_ax_pressed:
+                    requested_transition = StreamMode.PLANNER_IDLE_BASE_POSE
+                elif not planner_based_teleop and ax_pressed and not prev_ax_pressed:
                     new_mode = teleop_stream_mode
-                elif left_axis_click and not prev_left_axis_click:
+                elif (
+                    not planner_based_teleop
+                    and left_axis_click
+                    and not prev_left_axis_click
+                ):
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE:
                 if ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.PLANNER  # Enter chain 2
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY  # Enter chain 1
+                    new_mode = StreamMode.PLANNER
                 elif left_menu_button:
                     new_mode = StreamMode.POSE_PAUSE
 
-            elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                if by_pressed and not prev_by_pressed:
+            elif current_mode == StreamMode.PLANNER_IDLE_BASE_POSE:
+                if planner_based_teleop and ax_pressed and not prev_ax_pressed:
                     new_mode = teleop_stream_mode
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = StreamMode.PLANNER_VR_3PT
+                elif planner_based_teleop and by_pressed and not prev_by_pressed:
+                    requested_transition = StreamMode.PLANNER
 
             elif current_mode == StreamMode.POSE_PAUSE:
                 if not left_menu_button:
                     new_mode = StreamMode.POSE
 
             elif current_mode == StreamMode.PLANNER_VR_3PT:
-                # VR_3PT is reachable from both chains:
-                #   left_axis_click → return to parent (PLANNER or FROZEN)
-                #   ax_pressed      → POSE (chain 2 exit)
-                #   by_pressed      → POSE (chain 1 exit)
-                if left_axis_click and not prev_left_axis_click:
-                    new_mode = vr3pt_parent_mode  # Return to parent mode
-                elif ax_pressed and not prev_ax_pressed:
-                    new_mode = (
-                        StreamMode.PLANNER
-                        if teleop_stream_mode == StreamMode.PLANNER_VR_3PT
-                        else StreamMode.POSE
-                    )
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = (
-                        StreamMode.PLANNER_FROZEN_UPPER_BODY
-                        if teleop_stream_mode == StreamMode.PLANNER_VR_3PT
-                        else StreamMode.POSE
-                    )
+                if planner_based_teleop and by_pressed and not prev_by_pressed:
+                    requested_transition = StreamMode.PLANNER_IDLE_BASE_POSE
+                elif (
+                    not planner_based_teleop
+                    and left_axis_click
+                    and not prev_left_axis_click
+                ):
+                    new_mode = vr3pt_parent_mode
+                elif not planner_based_teleop and ax_pressed and not prev_ax_pressed:
+                    new_mode = StreamMode.POSE
 
             elif current_mode == StreamMode.PLANNER_IK_UPPER:
-                if ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.PLANNER
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY
+                if by_pressed and not prev_by_pressed:
+                    requested_transition = StreamMode.PLANNER_IDLE_BASE_POSE
 
-            if recorder_is_recording and new_mode != current_mode:
-                attempted_mode = new_mode
+            if recorder_is_recording and (
+                new_mode != current_mode or requested_transition is not None
+            ):
+                attempted_mode = requested_transition or new_mode
                 new_mode = current_mode
+                requested_transition = None
                 print(
                     "[Manager] Mode change ignored while recording: "
                     f"{current_mode.name} -> {attempted_mode.name}; "
                     "save with A+X or X+B, or discard with Y+A first"
                 )
 
-            # Handle mode transitions before running loop
-            if new_mode != current_mode:
+            if requested_transition is not None:
+                needs_planner_target = requested_transition == StreamMode.PLANNER
+                if planner_streamer.poll_fresh_feedback(
+                    require_planner_target=needs_planner_target
+                ):
+                    transition_start = np.asarray(
+                        planner_streamer.feedback_reader.upper_body_position_target,
+                        dtype=np.float64,
+                    )
+                    transition_goal = (
+                        np.asarray(
+                            planner_streamer.feedback_reader.upper_body_planner_target,
+                            dtype=np.float64,
+                        )
+                        if needs_planner_target
+                        else IDLE_BASE_UPPER_BODY_RAD
+                    )
+                    upper_body_transition = JointPoseTransition(
+                        transition_start,
+                        transition_goal,
+                        started_at=time.monotonic(),
+                        duration_s=idle_base_transition_duration,
+                    )
+                    transition_destination = requested_transition
+                    ax_double_press.reset()
+                    print(
+                        "[Manager] Smooth upper-body transition: "
+                        f"{current_mode.name} -> {requested_transition.name} "
+                        f"({idle_base_transition_duration:.2f}s)"
+                    )
+
+            # Handle instantaneous mode transitions before running the loop.
+            if upper_body_transition is None and new_mode != current_mode:
                 # A mode change invalidates any unconfirmed gesture from the
                 # previous interaction context. Confirmed pairs are already reset.
                 ax_double_press.reset()
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
 
-                # Track parent when entering VR_3PT
                 if new_mode == StreamMode.PLANNER_VR_3PT:
                     vr3pt_parent_mode = current_mode
-                    print(f"[Manager] VR_3PT parent: {vr3pt_parent_mode.name}")
 
                 if new_mode == StreamMode.POSE:
                     pose_streamer.reset_yaw()
@@ -2562,27 +2676,32 @@ def run_pico_manager(
                     # Only reset yaw when freshly entering PLANNER from POSE,
                     # not when returning from VR_3PT sub-mode
                     planner_streamer.reset_yaw()
-                elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                    if current_mode not in {
-                        StreamMode.PLANNER_VR_3PT,
-                        StreamMode.PLANNER_IK_UPPER,
-                    }:
-                        # Freshly entering from POSE: reset yaw and grab initial targets
-                        planner_streamer.reset_yaw()
-                    # Always re-grab the latest robot state as frozen targets,
-                    # whether entering from POSE or returning from tracked arms
-                    # (the old targets are stale after a tracking mode moved them)
-                    planner_streamer.save_upper_body_position_target()
                 elif new_mode == StreamMode.PLANNER_VR_3PT:
                     # Recalibrate VR tracking against the robot's actual current pose
                     # (read via g1_debug feedback + FK) to prevent sudden jumps
-                    planner_streamer.recalibrate_for_vr3pt()
+                    if not planner_streamer.recalibrate_for_vr3pt():
+                        new_mode = current_mode
                 elif new_mode == StreamMode.PLANNER_IK_UPPER:
                     if not planner_streamer.prepare_ik_upper_body():
                         new_mode = current_mode
 
-            # Run one iteration of the new mode
-            if new_mode == StreamMode.POSE:
+            # Run one iteration. Smooth transitions are emitted as planner
+            # overrides while the stable public source state remains unchanged.
+            transition_completed = False
+            if upper_body_transition is not None:
+                transition_sample = upper_body_transition.sample(time.monotonic())
+                planner_sent = planner_streamer.run_once(
+                    StreamMode.PLANNER,
+                    upper_body_override=(
+                        transition_sample.position,
+                        transition_sample.velocity,
+                        IDLE_BASE_UPPER_BODY_MASK,
+                    ),
+                    force_locomotion_idle=True,
+                )
+                planner_report_count += int(planner_sent)
+                transition_completed = transition_sample.complete
+            elif new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
             elif new_mode in PLANNER_STREAM_MODES:
                 planner_sent = planner_streamer.run_once(
@@ -2592,7 +2711,7 @@ def run_pico_manager(
                 planner_report_count += int(planner_sent)
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
-            if new_mode != current_mode:
+            if upper_body_transition is None and new_mode != current_mode:
                 if new_mode in PLANNER_STREAM_MODES:
                     socket.send(build_command_message(start=True, stop=False, planner=True))
                 elif new_mode == StreamMode.POSE:
@@ -2601,11 +2720,26 @@ def run_pico_manager(
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
 
+            if transition_completed:
+                completed_destination = transition_destination
+                if completed_destination is None:
+                    raise RuntimeError("upper-body transition has no destination")
+                print(
+                    f"[Manager] StreamMode switch: {current_mode.name} -> "
+                    f"{completed_destination.name}"
+                )
+                current_mode = completed_destination
+                upper_body_transition = None
+                transition_destination = None
+
             # Mode-independent: send manager_state for data exporter
             recording_action = recording_face_action(
                 face_command,
                 recorder_is_recording=recorder_is_recording,
-                recording_mode_ready=current_mode == teleop_stream_mode,
+                recording_mode_ready=(
+                    upper_body_transition is None
+                    and current_mode == teleop_stream_mode
+                ),
             )
             toggle_dc_requested = face_command == "xb"
             toggle_dc = recording_action in {"start", "save"}
@@ -2631,7 +2765,16 @@ def run_pico_manager(
             socket.send(
                 pack_pose_message(
                     {
-                        "stream_mode": np.array([current_mode.value], dtype=np.int32),
+                        "stream_mode": np.array(
+                            [
+                                (
+                                    transition_destination
+                                    if transition_destination is not None
+                                    else current_mode
+                                ).value
+                            ],
+                            dtype=np.int32,
+                        ),
                         "toggle_data_collection": np.array([toggle_dc], dtype=bool),
                         "toggle_data_abort": np.array([toggle_da], dtype=bool),
                         "publisher_monotonic_ns": np.array(
@@ -2645,7 +2788,10 @@ def run_pico_manager(
             hand_intent.publish(
                 hand_socket,
                 reader,
-                hold=current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY,
+                hold=(
+                    upper_body_transition is not None
+                    or current_mode == StreamMode.PLANNER_IDLE_BASE_POSE
+                ),
             )
 
             prev_ax_pressed = ax_pressed
@@ -2822,6 +2968,12 @@ if __name__ == "__main__":
         default="idle",
         help="Initial joystick gait in planner and VR 3-point modes",
     )
+    parser.add_argument(
+        "--idle-base-transition-duration",
+        type=float,
+        default=2.0,
+        help="Seconds for each arm transition into or out of idle base pose (default: 2.0)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2868,6 +3020,7 @@ if __name__ == "__main__":
             initial_locomotion_mode=args.initial_locomotion_mode,
             recording_status_host=args.recording_status_host,
             recording_status_port=args.recording_status_port,
+            idle_base_transition_duration=args.idle_base_transition_duration,
         )
     else:
         # Run legacy single-thread pose streaming

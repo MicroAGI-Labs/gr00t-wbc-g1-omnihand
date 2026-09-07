@@ -277,6 +277,7 @@ Common options:
 | `--body-control-mode` | `vr3pt-slow-planner` | `vr3pt-slow-planner`, `ik-upper-slow-planner`, or `full-smpl` |
 | `--omnihand-close-scale` | `1.0` | Use the full calibrated OmniHand closing range |
 | `--omnihand-transition-duration` | `0.2` | Open/close transition duration in seconds |
+| `--idle-base-transition-duration` | `2.0` | Arm interpolation time into and out of the teleop alignment pose |
 | `--hand-control-port` | `5572` | Manual hand reconnect command port |
 | `--data-exporter-frequency` | `50` | Recording frequency (Hz) |
 | `--deploy-checkpoint` | *(default)* | Custom checkpoint path for deploy.sh |
@@ -303,12 +304,19 @@ python gear_sonic/scripts/launch_data_collection.py \
 python gear_sonic/scripts/launch_data_collection.py --body-control-mode full-smpl
 ```
 
-In all three configurations, **A+B+X+Y** starts SONIC in PLANNER mode and
-**A+X** toggles the selected teleop mode. In `ik-upper`, PICO wrist targets
-are retargeted by the established arm IK solver, arm speed is limited during
-transitions, and SONIC's locomotion planner remains the sole owner of the legs
-and waist. Entering that mode requires fresh 29-DOF robot feedback; otherwise
-the manager stays in its current mode.
+In the planner-owned `vr3pt` and `ik-upper` configurations, **A+B+X+Y** starts
+SONIC in idle. A confirmed **A+X** then moves the arms smoothly over two seconds
+to `IDLE_BASE_POSE` (default shoulders and 90-degree elbows). The operator
+physically matches that robot pose and confirms **A+X** again; only then does
+the manager calibrate the operator against the robot's measured pose and enter
+teleoperation. **B+Y** reverses the same flow, first returning to base pose and
+then interpolating back to idle. Locomotion is forced idle and hand intent is
+held during both interpolations.
+
+Fresh 29-DOF robot feedback is required before an interpolation or calibration.
+If it is unavailable, the manager stays in its current stable state instead of
+issuing a fallback pose. The legacy `full-smpl` configuration retains its direct
+POSE/PLANNER switch.
 
 After updating an existing checkout, rebuild the deployment and refresh the
 teleop environment once so the masked arm command and IK dependencies match:
@@ -426,10 +434,10 @@ There are two ways to control recording: **PICO VR controllers** (recommended du
 | **X + B** | **Toggle on release** — starts a new episode only while the A+X teleop mode is active, or stops and saves the current one |
 | **Y + A** | **Discard on release** — saves the active episode flagged for removal during post-processing |
 
-Recording is locked to the launch-selected A+X teleop mode (POSE, VR3PT, or
-IK upper). Exiting that mode while recording—including toggling A+X again—
-automatically discards the active episode so generic planner or frozen frames
-cannot enter a successful take.
+Recording is locked to the launch-selected teleop mode (POSE, VR3PT, or IK
+upper). Mode changes are rejected while recording, so save or discard the take
+before using **B+Y** to leave teleoperation. Idle, base-pose, and interpolation
+frames cannot enter a successful take.
 
 **Keyboard over ZMQ:**
 

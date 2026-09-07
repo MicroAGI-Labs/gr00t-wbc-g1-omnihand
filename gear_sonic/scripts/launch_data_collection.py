@@ -165,6 +165,9 @@ class DataCollectionLaunchConfig:
     pico_waist_tracking: bool = False
     """Enable waist tracking on the teleop streamer."""
 
+    idle_base_transition_duration: float = 2.0
+    """Seconds for smooth arm motion into and out of the teleop alignment pose."""
+
     # Data exporter options
     task_prompt: str = DEFAULT_TASK_PROMPT
     """Language task prompt for the data exporter."""
@@ -296,6 +299,8 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
 
     if config.pico_input_source not in {"xrt", "isaac-teleop"}:
         errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
+    if config.idle_base_transition_duration <= 0.0:
+        errors.append("--idle-base-transition-duration must be positive")
 
     if errors:
         print("ERROR: Prerequisites not met:\n")
@@ -544,6 +549,7 @@ def main(config: DataCollectionLaunchConfig):
         f"--input-source {config.pico_input_source} "
         f"--hand-intent-port {config.hand_intent_port} "
         f"--teleop-mode {pico_teleop_mode} "
+        f"--idle-base-transition-duration {config.idle_base_transition_duration} "
         "--initial-locomotion-mode slow_walk"
     )
     if config.pico_manager:
