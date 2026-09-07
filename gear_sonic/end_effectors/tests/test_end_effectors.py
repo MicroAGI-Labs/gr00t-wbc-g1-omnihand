@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from gear_sonic.end_effectors.backends.omnihand import OmniHandBackend
+from gear_sonic.end_effectors.backends.omnihand import (
+    OmniHandBackend,
+    OmniHandHardwareError,
+    _canfd_link_mismatches,
+)
 from gear_sonic.end_effectors.backends.sim import SimHandBackend
 from gear_sonic.end_effectors.controller import (
     HandControllerError,
@@ -222,12 +226,26 @@ def test_hardware_adapter_probes_without_writing_and_uses_explicit_joint_command
     class FakeHand:
         def __init__(self):
             self.commands = []
+            self.request_interval_ms = None
+            self.frame_recv_timeout_ms = None
 
         def init(self):
             return True
 
         def get_product_type(self):
             return 7
+
+        def set_request_interval(self, value):
+            self.request_interval_ms = value
+
+        def get_request_interval(self):
+            return self.request_interval_ms
+
+        def set_frame_recv_timeout(self, value):
+            self.frame_recv_timeout_ms = value
+
+        def get_frame_recv_timeout(self):
+            return self.frame_recv_timeout_ms
 
         def get_joint_names(self):
             return list(OMNIHAND_O10.right.joint_names)
@@ -237,6 +255,24 @@ def test_hardware_adapter_probes_without_writing_and_uses_explicit_joint_command
 
         def set_all_active_joint_angles(self, values):
             self.commands.append(values)
+
+        def get_all_error_reports(self):
+            return [
+                SimpleNamespace(
+                    stalled=False,
+                    overheat=False,
+                    over_current=False,
+                    motor_except=False,
+                    commu_except=False,
+                )
+                for _ in range(10)
+            ]
+
+        def get_all_temperature_reports(self):
+            return [25.0] * 10
+
+        def get_all_current_reports(self):
+            return [0.0] * 10
 
     hand = FakeHand()
     sdk = SimpleNamespace(
@@ -253,6 +289,7 @@ def test_hardware_adapter_probes_without_writing_and_uses_explicit_joint_command
     device = net_class / "can10" / "device"
     device.mkdir(parents=True)
     (device / "driver").symlink_to(driver, target_is_directory=True)
+    validated_interfaces = []
     backend = OmniHandBackend(
         HandSide.RIGHT,
         OMNIHAND_O10.right,
@@ -262,8 +299,48 @@ def test_hardware_adapter_probes_without_writing_and_uses_explicit_joint_command
         net_class=net_class,
         interface_index=lambda _: 10,
         serial_reader=lambda *_: "2082395E534B50052",
-        link_validator=lambda _: None,
+        link_validator=validated_interfaces.append,
     )
     assert hand.commands == []
+    assert hand.request_interval_ms == 0
+    assert hand.frame_recv_timeout_ms == 50
+    assert validated_interfaces == ["can10"]
     backend.write_positions(np.zeros(10))
     assert hand.commands == [[0.0] * 10]
+    assert backend.read_health()["error_masks"] == [0] * 10
+    assert validated_interfaces == ["can10", "can10"]
+
+    with pytest.raises(OmniHandHardwareError, match="between 10 and 1000"):
+        backend._configure_transport_timing(0, 9)
+
+
+def test_canfd_admission_uses_machine_readable_link_state():
+    document = [
+        {
+            "link_type": "can",
+            "mtu": 72,
+            "linkinfo": {
+                "info_data": {
+                    "ctrlmode": ["FD"],
+                    "state": "ERROR-ACTIVE",
+                    "berr_counter": {"tx": 0, "rx": 0},
+                    "bittiming": {"bitrate": 1_000_000, "sample_point": "0.800"},
+                    "data_bittiming": {"bitrate": 5_000_000, "sample_point": "0.750"},
+                }
+            },
+            "operstate": "UP",
+            "flags": ["UP", "LOWER_UP"],
+        }
+    ]
+    assert _canfd_link_mismatches(document) == []
+
+    document[0]["linkinfo"]["info_data"]["ctrlmode"] = []
+    assert _canfd_link_mismatches(document) == ["FD mode"]
+
+    document[0]["linkinfo"]["info_data"]["ctrlmode"] = ["FD"]
+    document[0]["linkinfo"]["info_data"]["berr_counter"]["rx"] = 1
+    assert _canfd_link_mismatches(document) == ["zero CAN error counters"]
+
+    assert _canfd_link_mismatches([]) == ["valid link data"]
+    document[0]["flags"] = None
+    assert "UP interface" in _canfd_link_mismatches(document)
