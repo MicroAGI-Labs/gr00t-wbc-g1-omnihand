@@ -8,9 +8,15 @@ from gear_sonic.utils.teleop.pose_transition import (
 )
 
 
-def test_idle_base_pose_has_ninety_degree_elbows_and_arm_only_mask():
+def test_idle_base_pose_has_forward_forearms_and_inward_pointing_hands():
     assert IDLE_BASE_UPPER_BODY_RAD.shape == (17,)
-    np.testing.assert_allclose(IDLE_BASE_UPPER_BODY_RAD[9:11], np.pi / 2.0)
+    # Zero is the G1's physical 90-degree elbow pose. Opposite wrist yaws
+    # point the left fingers rightward and the right fingers leftward.
+    np.testing.assert_allclose(IDLE_BASE_UPPER_BODY_RAD[3:15], 0.0)
+    np.testing.assert_allclose(
+        IDLE_BASE_UPPER_BODY_RAD[15:17],
+        [-np.pi / 2.0, np.pi / 2.0],
+    )
     np.testing.assert_array_equal(
         IDLE_BASE_UPPER_BODY_MASK,
         np.asarray([False, False, False] + [True] * 14),
