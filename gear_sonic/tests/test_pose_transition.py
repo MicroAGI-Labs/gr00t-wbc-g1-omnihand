@@ -8,11 +8,13 @@ from gear_sonic.utils.teleop.pose_transition import (
 )
 
 
-def test_idle_base_pose_has_forward_forearms_and_neutral_wrists():
+def test_idle_base_pose_has_rearward_elbows_and_neutral_wrists():
     assert IDLE_BASE_UPPER_BODY_RAD.shape == (17,)
-    # Zero is the G1's physical 90-degree elbow pose. Neutral wrists keep the
-    # fingers pointing forward, parallel to the forearms, with opposing palms.
-    np.testing.assert_allclose(IDLE_BASE_UPPER_BODY_RAD, 0.0)
+    # Positive shoulder pitch moves the elbows slightly behind the torso. Zero
+    # elbow is the physical 90-degree bend, and neutral wrists keep the hands
+    # parallel to their forearms with opposing palms.
+    np.testing.assert_allclose(IDLE_BASE_UPPER_BODY_RAD[3:5], 0.2)
+    np.testing.assert_allclose(IDLE_BASE_UPPER_BODY_RAD[5:], 0.0)
     np.testing.assert_array_equal(
         IDLE_BASE_UPPER_BODY_MASK,
         np.asarray([False, False, False] + [True] * 14),
