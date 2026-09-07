@@ -9,7 +9,7 @@ import zmq
 
 from gear_sonic.end_effectors.mujoco_driver import OmniHandMuJoCoDriver
 from gear_sonic.end_effectors.profiles import OMNIHAND_O10
-from gear_sonic.end_effectors.protocol import HAND_STATE_SCHEMA, HAND_STATE_TOPIC, encode
+from gear_sonic.end_effectors.protocol import HAND_STATE_SCHEMA, HAND_STATE_TOPIC, decode_state, encode
 
 REPO = Path(__file__).resolve().parents[3]
 ASSET_ROOT = REPO / "gear_sonic/data/robot_model/model_data/g1_omnihand"
@@ -37,6 +37,23 @@ def _controller_state(left: list[float], right: list[float]) -> bytes:
             },
         },
     )
+
+
+def test_state_sequence_resets_on_worker_restart_within_same_session():
+    # The protocol gate needs no model assets or physics execution.
+    driver = OmniHandMuJoCoDriver.__new__(OmniHandMuJoCoDriver)
+    driver._session_id, driver._worker_id, driver._state_sequence = None, None, None
+    payload = decode_state(_controller_state(list(OMNIHAND_O10.left.open_rad), list(OMNIHAND_O10.right.open_rad)))
+    payload.update(worker_id="first", sequence=100)
+    driver._accept_state(encode(HAND_STATE_TOPIC, payload))
+    assert driver._state_sequence == 100
+    payload["sequence"] = 1
+    driver._accept_state(encode(HAND_STATE_TOPIC, payload))
+    assert driver._state_sequence == 100  # Reject replay within a worker.
+    payload["worker_id"] = "second"
+    driver._accept_state(encode(HAND_STATE_TOPIC, payload))
+    assert driver._state_sequence == 1
+    assert driver._worker_id == "second"
 
 
 def test_atlas_combined_asset_has_body_active_passive_and_contact_contract():

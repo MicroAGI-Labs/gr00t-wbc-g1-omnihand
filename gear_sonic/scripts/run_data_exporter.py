@@ -54,6 +54,7 @@ from gear_sonic.end_effectors.protocol import (
     HAND_STATE_TOPIC,
     decode_config,
     decode_state,
+    hand_state_age_s,
 )
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
@@ -519,15 +520,11 @@ class GrootDataCollector:
         camera = self._camera_health()
         hand_ready = True
         if self.hand_config is not None:
-            hand_ready = bool(
-                self.latest_hand_state
-                and not self.latest_hand_state.get("input_stale", True)
-                and self.latest_hand_state.get("intent_sequence") is not None
-                and all(
-                    side.get("valid") and side.get("connected")
-                    for side in self.latest_hand_state.get("sides", {}).values()
-                )
-            )
+            try:
+                self._validate_hand_freshness(self.latest_hand_state or {}, time.monotonic_ns())
+                self._external_hand_values(self.latest_hand_state or {})
+            except RuntimeError:
+                hand_ready = False
         payload = {
             "state": state,
             "recording": state == self._episode_state.RECORDING,
@@ -609,8 +606,23 @@ class GrootDataCollector:
                 continue
             received_ns = time.monotonic_ns()
             state["received_monotonic_ns"] = received_ns
+            previous = self.latest_hand_state
             self.latest_hand_state = state
+            if "worker_id" in state and previous is not None:
+                if all(state.get(key) == previous.get(key) for key in ("worker_id", "sequence", "mode")):
+                    continue  # A status heartbeat is not new physical feedback.
+                if state["worker_id"] != previous.get("worker_id") and self._next_target_ns is not None:
+                    if len(self._synchronization_errors) < 100:
+                        self._synchronization_errors.append("hand worker restarted during recording")
             self._synchronizer.observe("hand", state, received_ns)
+
+    def _validate_hand_freshness(self, state: dict, target_ns: int) -> None:
+        received_ns = state.get("received_monotonic_ns")
+        if received_ns is None:
+            raise RuntimeError("external hand feedback is missing")
+        age = hand_state_age_s(state, (target_ns - received_ns) / 1e9)
+        if age is None or age > self.hand_state_max_age:
+            raise RuntimeError("external hand control snapshot is stale")
 
     def _external_hand_values(
         self,
@@ -1065,6 +1077,7 @@ class GrootDataCollector:
         if hand is None:
             return ["hand has no causal sample"]
         try:
+            self._validate_hand_freshness(hand.value, selection.target_ns)
             self._external_hand_values(hand.value)
         except RuntimeError as exc:
             return [str(exc)]

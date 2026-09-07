@@ -24,10 +24,11 @@ were missing or ambiguous:
 - **Clock domains need an explicit rule.** Remote `monotonic_ns` values are
   provenance only; watchdog age is measured from local receive time because
   monotonic clocks are not comparable across hosts.
-- **Reconnect session semantics were unclear.** Transport reconnects retain the
-  controller process session ID, discard the old target, seed a new measured
-  hold, and require an intent received after reconnect. Process restart creates
-  a new session ID and the collector must relock before another episode.
+- **Reconnect session semantics.** The supervisor retains its session ID across
+  worker restarts; each worker gets a new `worker_id`, discards old targets,
+  establishes a measured hold, and requires a post-connect intent. The collector
+  invalidates an episode spanning a worker restart. Restarting the supervisor
+  creates a new session and requires restarting the collector to relock.
 - **“Exact SDK names” assumes the Python binding exposes names.** Product and
   active-DOF identity are mandatory. Exact name/order comparison is also made
   when `get_joint_names()` exists; otherwise the pinned SDK/API order is the
@@ -81,6 +82,38 @@ GR00T joint output (future) ---------------+                             ^
 executable. Process isolation keeps the Python-only OmniHand SDK and its
 reconnect lifecycle out of the body controller. Dex3 remains in the legacy C++
 owner until a separately reviewed external backend exists.
+
+### Hand worker recovery and status
+
+`launch_data_collection.py --hand-backend omnihand --remote-ui` runs the hand
+controller as a child of `gear_sonic.end_effectors.supervisor`. The supervisor
+owns the public state endpoint (`5570`) and loopback reconnect endpoint (`5572`).
+It relays worker snapshots over a separate 50 Hz clock; blocking SDK calls affect
+the worker, not the browser reconnect control or state publisher.
+
+Transport failures request a fresh worker after a one-second delay. Ten seconds
+without a worker update also triggers replacement. A reconnect requests worker
+termination, escalates after two seconds, and starts a replacement only after
+the old process exits. Unexpected failures wait for manual reconnect. Known
+motor faults remain latched and never trigger automatic restart. The browser's
+**Reconnect Hands** button explicitly restarts the hand worker, including a
+faulted one; it does not restart the body controller, camera, or recorder.
+
+`sequence` and `monotonic_ns` still identify the original control sample.
+`publish_sequence` identifies relay messages, and `state_age_s` measures the
+control sample's age on the supervisor's host. Receivers add their own elapsed
+time rather than comparing remote monotonic clocks. Heartbeats do not advance
+the collector's hand watermark. Feedback older than `--hand-state-max-age`
+(200 ms by default) is rejected even if relay messages keep arriving at 50 Hz.
+This does not compensate for unknown network transit time.
+
+The MuJoCo bridge also keys sequence checks by `worker_id`, so reconnecting a
+simulated hand does not leave its new commands behind the old worker's counter.
+
+Direct `controller run` remains supported without the supervisor. Physical
+workers still require `--enable-command` and the launcher's `OMNIHAND`
+acknowledgement. The existing 0.35 physical close scale and command cadence are
+unchanged. Test recovery with simulated workers before commissioning on hardware.
 
 ### Ownership modes in C++
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,6 +13,8 @@ from gear_sonic.data.causal_sync import (
     CausalSynchronizer,
     TimedSample,
 )
+from gear_sonic.end_effectors.profiles import OMNIHAND_O10
+from gear_sonic.end_effectors.protocol import HAND_STATE_SCHEMA, HAND_STATE_TOPIC, encode
 from gear_sonic.scripts.run_data_exporter import GrootDataCollector
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 
@@ -313,3 +317,37 @@ def test_rejected_finalizer_handoff_restores_completed_episode(monkeypatch):
         collector._finish_recording(discarded=False, reason="")
     assert collector.data_exporter.episode_buffer is completed
     assert "observation.images.ego_view" in collector.data_exporter.video_writers
+
+
+def test_hand_heartbeats_do_not_advance_watermark_and_restart_invalidates_episode():
+    collector = _recording_collector()
+    collector.hand_config = {"session_id": "session"}
+    collector.hand_profile = OMNIHAND_O10
+    collector.latest_hand_state = None
+    messages = deque()
+    collector._hand_zmq_socket = SimpleNamespace(poll=lambda _: bool(messages), recv=messages.popleft)
+
+    def receive(worker, sequence, age):
+        messages.append(encode(HAND_STATE_TOPIC, dict(
+            schema=HAND_STATE_SCHEMA, session_id="session", profile=OMNIHAND_O10.name,
+            worker_id=worker, sequence=sequence, state_age_s=age, mode="tracking",
+        )))
+        collector._poll_hand_zmq()
+
+    receive("first", 1, 0.01)
+    watermark = collector._synchronizer.status()["hand"]["watermark_ns"]
+    receive("first", 1, 0.3)
+    assert collector._synchronizer.status()["hand"]["watermark_ns"] == watermark
+    with pytest.raises(RuntimeError, match="snapshot is stale"):
+        collector._validate_hand_freshness(collector.latest_hand_state, time.monotonic_ns())
+    receive("second", 1, 0.01)
+    assert collector._synchronizer.status()["hand"]["watermark_ns"] > watermark
+    assert collector._synchronization_errors == ["hand worker restarted during recording"]
+
+
+def test_causal_hand_validation_includes_relay_and_collector_age():
+    collector = _recording_collector()
+    state = {"worker_id": "worker", "state_age_s": 0.15, "received_monotonic_ns": 1_000_000_000}
+    collector._validate_hand_freshness(state, 1_040_000_000)
+    with pytest.raises(RuntimeError, match="snapshot is stale"):
+        collector._validate_hand_freshness(state, 1_060_000_000)

@@ -6,6 +6,7 @@ import argparse
 from collections.abc import Callable, Mapping, Sequence
 import json
 import math
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -15,8 +16,8 @@ import numpy as np
 import zmq
 
 from .backends.base import HandBackend
-from .backends.mujoco import MuJoCoHandTransport, MuJoCoSimHandBackend
-from .backends.omnihand import OmniHandBackend, vendor_output_to_stderr
+from .backends.mujoco import MuJoCoHandTransport, MuJoCoHandTransportError, MuJoCoSimHandBackend
+from .backends.omnihand import OmniHandBackend, OmniHandHardwareError, vendor_output_to_stderr
 from .profiles import HandProfile, HandSide, get_hand_profile
 from .protocol import (
     HAND_CONFIG_SCHEMA,
@@ -24,6 +25,8 @@ from .protocol import (
     HAND_INTENT_TOPIC,
     HAND_STATE_SCHEMA,
     HAND_STATE_TOPIC,
+    RECOVERABLE_DISCONNECT_EXIT_CODE,
+    HandProtocolError,
     decode_intent,
     encode,
 )
@@ -39,6 +42,12 @@ def _has_hard_motor_error(masks: Sequence[int]) -> bool:
 
 class HandControllerError(RuntimeError):
     pass
+
+
+def _worker_failure_exit_code(exc: Exception, *, fault_latched: bool = False) -> int:
+    if not fault_latched and isinstance(exc, (OmniHandHardwareError, MuJoCoHandTransportError)):
+        return RECOVERABLE_DISCONNECT_EXIT_CODE
+    return 1  # Controller safety checks, latched faults and unexpected bugs need an operator.
 
 
 class TriggerHysteresis:
@@ -356,11 +365,26 @@ def run(args: argparse.Namespace) -> int:
     subscriber.setsockopt(zmq.RCVHWM, 4)
     subscriber.setsockopt(zmq.SUBSCRIBE, HAND_INTENT_TOPIC)
     subscriber.connect(args.intent_endpoint)
-    publisher = context.socket(zmq.PUB)
+    state_sink = os.environ.get("SONIC_HAND_STATE_SINK")
+    worker_id = os.environ.get("SONIC_HAND_WORKER_ID")
+    publisher = context.socket(zmq.PUSH if state_sink else zmq.PUB)
     publisher.setsockopt(zmq.SNDHWM, 2)
-    publisher.bind(args.state_endpoint)
+    publisher.setsockopt(zmq.LINGER, 0)
+    if state_sink:
+        publisher.connect(state_sink)
+    else:
+        publisher.bind(args.state_endpoint)
+
+    def publish(topic: bytes, payload: dict) -> None:
+        if worker_id:
+            payload = dict(payload, worker_id=worker_id)
+        try:
+            publisher.send(encode(topic, payload), flags=zmq.NOBLOCK)
+        except zmq.Again:
+            pass  # A slow status consumer must not block hand I/O.
+
     selected_sides = _selected_sides(args.sides)
-    session_id = uuid.uuid4().hex
+    session_id = os.environ.get("SONIC_HAND_SESSION_ID", uuid.uuid4().hex)
     controller: SafeHandController | None = None
     next_reconnect_at = 0.0
     last_error: str | None = None
@@ -394,6 +418,9 @@ def run(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     for device in devices.values():
                         device.close()
+                    if state_sink:
+                        print(f"[Hands] Connection failed: {exc}", flush=True)
+                        return _worker_failure_exit_code(exc)
                     last_error = str(exc)
                     next_reconnect_at = started + args.reconnect_interval
 
@@ -409,14 +436,22 @@ def run(args: argparse.Namespace) -> int:
                         while subscriber.poll(0):
                             latest_raw = subscriber.recv(zmq.NOBLOCK)
                         if latest_raw is not None:
-                            controller.accept_intent(decode_intent(latest_raw), now=started)
+                            try:
+                                intent = decode_intent(latest_raw)
+                            except HandProtocolError as exc:
+                                print(f"[Hands] Rejected intent: {exc}")
+                            else:
+                                controller.accept_intent(intent, now=started)
                     state = controller.step(now=started)
-                    publisher.send(encode(HAND_STATE_TOPIC, state))
+                    publish(HAND_STATE_TOPIC, state)
                     if started - last_config >= 2.0:
-                        publisher.send(encode(HAND_CONFIG_TOPIC, controller.config_payload()))
+                        publish(HAND_CONFIG_TOPIC, controller.config_payload())
                         last_config = started
                 except Exception as exc:
                     last_error = str(exc)
+                    if state_sink:
+                        print(f"[Hands] Worker failed: {exc}", flush=True)
+                        return _worker_failure_exit_code(exc, fault_latched=controller.fault_latched)
                     controller.close()
                     controller = None
                     next_reconnect_at = started + args.reconnect_interval
