@@ -208,7 +208,9 @@ Watchdog/recovery:
 - Reconnect reads and holds the new measured pose, discards old targets, and
   requires a post-reconnect target before tracking.
 - Shutdown stops writes and retains the last bounded target; do not auto-open.
-- Poll device health at about 5 Hz; latch non-zero error masks and leave tracking.
+- Poll device health at about 5 Hz. Latch motor-fault bits 0-3 and leave
+  tracking; report the SDK communication bit without latching it because live
+  SDK read/write failures already enter the reconnect path.
 - Publish temperature/current, but do not invent trip thresholds: vendor-approved
   limits remain a commissioning gate.
 
