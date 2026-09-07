@@ -70,32 +70,32 @@ _O10_RIGHT_UPPER = (1.1213, 0.0453, 0.8412, 0.0, 1.4835, 1.4835, 0.1692, 1.4835,
 _O10_LEFT_LOWER = (-1.1213, -0.0453, -0.8412, 0.0, 0.0, 0.0, -0.1692, 0.0, -0.1850, 0.0)
 _O10_LEFT_UPPER = (0.0296, 1.6423, 0.0, 0.1640, 1.4835, 1.4835, 0.0, 1.4835, 0.0, 1.4835)
 _O10_VELOCITY = (0.164, 0.164, 0.308, 0.164, 0.308, 0.308, 0.164, 0.308, 0.164, 0.308)
-# Median measured pose from both powered hands in their desired safe-open
-# configuration.  In particular, the thumb roll and ab/ad joints remain away
-# from the fully extended geometry that can short this hardware revision.
+# Symmetric nominal pose derived by sign-reflecting the recorded powered base
+# poses into the right-hand convention and averaging each joint.  This removes
+# unit-specific offsets while retaining the safe thumb roll and ab/ad geometry.
 _O10_RIGHT_OPEN = (
-    0.549773,
-    -0.757866,
-    0.002735,
-    -0.074805,
+    0.5525805,
+    -0.7803525,
+    0.0013675,
+    -0.0759570,
     0.0,
     0.0,
-    0.083381,
-    0.000840,
-    0.094930,
-    0.000840,
+    0.0836715,
+    0.0004200,
+    0.0936660,
+    0.0004200,
 )
 _O10_LEFT_OPEN = (
-    -0.555388,
-    0.802839,
+    -0.5525805,
+    0.7803525,
+    -0.0013675,
+    0.0759570,
     0.0,
-    0.077109,
     0.0,
-    0.0,
-    -0.083962,
-    0.0,
-    -0.092402,
-    0.0,
+    -0.0836715,
+    0.0004200,
+    -0.0936660,
+    0.0004200,
 )
 _O10_RIGHT_CLOSED = (0.728845, -0.903265, 0.757080, 0.0, 1.335150, 1.335150, 0.0, 1.335150, 0.0, 1.335150)
 _O10_LEFT_CLOSED = (-0.728845, 0.903265, -0.757080, 0.0, 1.335150, 1.335150, 0.0, 1.335150, 0.0, 1.335150)

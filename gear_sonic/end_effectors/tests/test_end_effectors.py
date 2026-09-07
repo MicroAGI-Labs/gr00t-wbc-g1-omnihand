@@ -37,11 +37,25 @@ def test_o10_profile_has_exact_bilateral_contract():
     assert OMNIHAND_O10.width == 10
     assert OMNIHAND_O10.right.joint_names[0] == "R_thumb_roll_joint"
     assert OMNIHAND_O10.left.joint_names[-1] == "L_pinky_pip_joint"
-    np.testing.assert_allclose(
-        OMNIHAND_O10.right.open_rad[:3], (0.549773, -0.757866, 0.002735)
+    expected_right_open = np.asarray(
+        (
+            0.5525805,
+            -0.7803525,
+            0.0013675,
+            -0.0759570,
+            0.0,
+            0.0,
+            0.0836715,
+            0.0004200,
+            0.0936660,
+            0.0004200,
+        )
     )
+    mirror_sign = np.asarray((-1, -1, -1, -1, 1, 1, -1, 1, -1, 1))
+    np.testing.assert_allclose(OMNIHAND_O10.right.open_rad, expected_right_open)
     np.testing.assert_allclose(
-        OMNIHAND_O10.left.open_rad[:3], (-0.555388, 0.802839, 0.0)
+        OMNIHAND_O10.left.open_rad,
+        expected_right_open * mirror_sign,
     )
     for side in (OMNIHAND_O10.left, OMNIHAND_O10.right):
         assert np.all(np.asarray(side.closed_rad) >= np.asarray(side.lower_rad))
