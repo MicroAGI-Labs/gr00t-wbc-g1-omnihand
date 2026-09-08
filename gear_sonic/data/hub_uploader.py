@@ -7,13 +7,11 @@ import contextlib
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 import uuid
 
 DATASET_CONFIG_PREFIX = "dataset_config:"
@@ -51,7 +49,7 @@ class EpisodeHubUploader:
         self._config_path = self.root / ".hub_upload.json"
         self._config = None
         self._condition = threading.Condition()
-        self._stop = threading.Event()
+        self._closed = False
         self._queued = None
         self._active = False
         self._process = None
@@ -72,7 +70,7 @@ class EpisodeHubUploader:
     def configure(self, payload: object) -> None:
         config = validate_dataset_config(payload)
         with self._condition:
-            if self._stop.is_set():
+            if self._closed:
                 raise RuntimeError("uploader is closed")
             if self._config and all(self._config[k] == v for k, v in config.items()):
                 return  # Repeated command delivery is idempotent.
@@ -101,7 +99,7 @@ class EpisodeHubUploader:
             }
 
     def enqueue(self, episode_index: int) -> None:
-        if not self._config or self._stop.is_set():
+        if not self._config or self._closed:
             return
         try:
             snapshot = self._snapshot(episode_index)
@@ -110,54 +108,44 @@ class EpisodeHubUploader:
                 self._staging_error = f"Episode {episode_index} upload staging failed: {exc}"[-500:]
             return  # Local save already succeeded; do not poison the finalizer.
         with self._condition:
-            if self._stop.is_set():
-                shutil.rmtree(snapshot, ignore_errors=True)
+            if self._closed:
+                snapshot.cleanup()
                 return
             old = self._queued
             self._queued = (episode_index, snapshot)
             self._staging_error = None
             self._condition.notify_all()
         if old:
-            shutil.rmtree(old[1], ignore_errors=True)
+            old[1].cleanup()
 
-    def _snapshot(self, episode_index: int) -> Path:
+    def _snapshot(self, episode_index: int) -> tempfile.TemporaryDirectory:
         staging = self.root / ".upload_snapshots"
         staging.mkdir(exist_ok=True)
-        snapshot = Path(tempfile.mkdtemp(prefix=f"episode_{episode_index:06d}_", dir=staging))
+        directory = tempfile.TemporaryDirectory(prefix=f"episode_{episode_index:06d}_", dir=staging)
+        snapshot = Path(directory.name)
         try:
             shutil.copytree(self.root / "meta", snapshot / "meta")
-            for directory, suffix in (("data", "parquet"), ("videos", "mp4")):
-                for source in (self.root / directory).rglob(f"episode_*.{suffix}"):
-                    match = re.fullmatch(r"episode_(\d+)\.(?:parquet|mp4)", source.name)
-                    if match and int(match[1]) <= episode_index:
-                        target = snapshot / source.relative_to(self.root)
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        os.link(source, target)
-            if len(list((snapshot / "data").rglob("*.parquet"))) != episode_index + 1:
-                raise FileNotFoundError("finalized episode data is incomplete")
+            for relative in self.data_exporter.get_episodes_file_paths():
+                target = snapshot / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.link(self.root / relative, target)
             for name in ("README.md", "LICENSE"):
                 if (self.root / name).is_file():
                     shutil.copy2(self.root / name, snapshot / name)
             (snapshot / _IDENTITY_FILE).write_text(json.dumps({"source_id": self._config["source_id"]}))
-            return snapshot
+            return directory
         except Exception:
-            shutil.rmtree(snapshot, ignore_errors=True)
+            directory.cleanup()
             raise
 
     def wait_until_idle(self, timeout: float) -> bool:
-        deadline = time.monotonic() + timeout
         with self._condition:
-            while self._active or self._queued:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._condition.wait(remaining)
-            return True
+            return self._condition.wait_for(lambda: not self._active and not self._queued, timeout)
 
     def close(self, timeout: float = 5.0) -> None:
         self.wait_until_idle(timeout)
         with self._condition:
-            self._stop.set()
+            self._closed = True
             process = self._process
             self._condition.notify_all()
         if process is not None and process.poll() is None:
@@ -170,7 +158,7 @@ class EpisodeHubUploader:
         if self._thread.is_alive():
             raise RuntimeError("upload worker did not stop")
         if self._queued:
-            shutil.rmtree(self._queued[1], ignore_errors=True)
+            self._queued[1].cleanup()
             self._queued = None
 
     def _run_subprocess(self, snapshot: Path, config: dict) -> None:
@@ -178,7 +166,7 @@ class EpisodeHubUploader:
         if config["private"]:
             command.append("--private")
         with self._condition:
-            if self._stop.is_set():
+            if self._closed:
                 return
             self._process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             process = self._process
@@ -191,43 +179,41 @@ class EpisodeHubUploader:
                 self._process = None
 
     def _run(self) -> None:
-        while not self._stop.is_set():
+        job = None
+        delay = 1.0
+        while True:
             with self._condition:
-                self._condition.wait_for(lambda: self._queued is not None or self._stop.is_set())
-                if self._stop.is_set():
-                    return
-                job, self._queued = self._queued, None
-                self._active = True
-            delay = 1.0
-            try:
-                while not self._stop.is_set():
-                    try:
-                        self._upload_runner(job[1], dict(self._config))
-                    except Exception as exc:
-                        with self._condition:
-                            self._error = str(exc)[-500:]
-                        if self._stop.wait(delay):
-                            break
-                        delay = min(delay * 2, 30.0)
-                        old = None
-                        with self._condition:
-                            if self._queued:
-                                old = job
-                                job, self._queued = self._queued, None
-                        if old:
-                            shutil.rmtree(old[1], ignore_errors=True)
-                        continue
-                    if self._stop.is_set():
-                        break
-                    with self._condition:
-                        self._last_uploaded = job[0]
-                        self._error = None
+                self._condition.wait_for(lambda: job or self._queued or self._closed)
+                if self._closed:
                     break
-            finally:
-                shutil.rmtree(job[1], ignore_errors=True)
+                old = None
+                if self._queued:
+                    old, job, self._queued = job, self._queued, None
+                self._active = True
+            if old:
+                old[1].cleanup()
+            try:
+                self._upload_runner(Path(job[1].name), dict(self._config))
+            except Exception as exc:
                 with self._condition:
-                    self._active = False
-                    self._condition.notify_all()
+                    self._error = str(exc)[-500:]
+                    self._condition.wait_for(lambda: self._closed, delay)
+                delay = min(delay * 2, 30.0)
+                continue
+            with self._condition:
+                if not self._closed:
+                    self._last_uploaded = job[0]
+                    self._error = None
+            job[1].cleanup()
+            job, delay = None, 1.0
+            with self._condition:
+                self._active = False
+                self._condition.notify_all()
+        if job:
+            job[1].cleanup()
+        with self._condition:
+            self._active = False
+            self._condition.notify_all()
 
 
 def _check_repository(api, repo_id: str, private: bool, source_id: str | None = None):

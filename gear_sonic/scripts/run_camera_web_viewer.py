@@ -96,9 +96,9 @@ _INDEX_HTML = """<!doctype html>
       <details>
         <summary>Hugging Face dataset</summary>
         <fieldset id="dataset-fields" disabled>
-          <label>Dataset <input id="dataset-repo" placeholder="namespace/dataset" required></label>
-          <label>Task <input id="dataset-prompt" maxlength="1000" required></label>
-          <label><input id="dataset-private" type="checkbox" checked> Private</label>
+          <label>Dataset <input name="repo_id" placeholder="namespace/dataset" required></label>
+          <label>Task <input name="prompt" maxlength="1000" required></label>
+          <label><input name="private" type="checkbox" checked> Private</label>
           <button type="submit">Select &amp; enable uploads</button>
         </fieldset>
       </details>
@@ -120,10 +120,12 @@ _INDEX_HTML = """<!doctype html>
     const datasetFields = document.getElementById('dataset-fields');
     const datasetStatus = document.getElementById('dataset-status');
     const datasetFeedback = document.getElementById('dataset-feedback');
+    const datasetForm = document.getElementById('dataset-form');
+    const fields = datasetForm.elements;
     let datasetPending = false;
     let selectedRepo = null;
 
-    document.getElementById('dataset-form').addEventListener('submit', async (event) => {
+    datasetForm.addEventListener('submit', async (event) => {
       event.preventDefault();
       datasetPending = true;
       datasetFields.disabled = true;
@@ -132,9 +134,7 @@ _INDEX_HTML = """<!doctype html>
         const response = await fetch('/recording/dataset', {
           method: 'POST', headers: {'Content-Type': 'application/json', 'X-Sonic-Command': 'dataset'},
           body: JSON.stringify({
-            repo_id: document.getElementById('dataset-repo').value,
-            prompt: document.getElementById('dataset-prompt').value,
-            private: document.getElementById('dataset-private').checked
+            repo_id: fields.repo_id.value, prompt: fields.prompt.value, private: fields.private.checked
           })
         });
         const result = await response.json();
@@ -200,14 +200,12 @@ _INDEX_HTML = """<!doctype html>
           || status.saving || status.total_episodes > 0;
         if (hub.ready && hub.repo_id !== selectedRepo) {
           selectedRepo = hub.repo_id;
-          document.getElementById('dataset-repo').value = hub.repo_id;
-          document.getElementById('dataset-prompt').value = hub.prompt;
-          document.getElementById('dataset-private').checked = hub.private;
+          fields.repo_id.value = hub.repo_id;
+          fields.prompt.value = hub.prompt;
+          fields.private.checked = hub.private;
         }
         datasetStatus.textContent = hub.ready
-          ? `${hub.repo_id} · ${hub.pending} upload(s) pending · `
-            + (hub.last_uploaded_episode == null
-              ? 'nothing uploaded yet' : `uploaded through episode ${hub.last_uploaded_episode}`)
+          ? `${hub.repo_id} · ${hub.pending} pending · uploaded through: ${hub.last_uploaded_episode ?? 'none'}`
             + (hub.error ? ` · ${hub.error}` : '')
           : (hub.required ? 'Choose a dataset before recording' : 'Uploads disabled · episodes are saved locally');
         if (!status.connected) {

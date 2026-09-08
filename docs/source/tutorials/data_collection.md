@@ -394,37 +394,21 @@ Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). T
 
 ## Background Hugging Face uploads
 
-The browser viewer's **Hugging Face dataset** form accepts a `namespace/name`,
-task prompt, and visibility (private by default). Select these before recording
-the first episode. Selection enables automatic uploads for that local dataset;
-without a selection, recording remains local. Add `--require-hub-upload` to the
-launcher with `--remote-ui`, or to the exporter, to require selection before
-recording can start. This requires the host's existing Hugging Face login to have
-write access to the chosen namespace; credentials are never entered in the browser.
+Before recording, use the browser's **Hugging Face dataset** form to select a
+`namespace/name`, task, and visibility (private by default). Selection uses the
+host's HF login to check/create an empty repository; the recorder confirms it in
+status and locks it after the first save. Existing visibility is never changed.
+Recording stays local until selection. `--require-hub-upload` makes selection
+mandatory; use it with the launcher's `--remote-ui` or on the exporter directly.
 
-Selection checks or creates an empty remote repository before forwarding the
-configuration to the recorder. Network or access errors appear in the browser.
-The recorder confirms selection in its status and locks the destination and task
-after the first saved episode. Every upload rechecks repository ownership; only
-an empty repository or one uploaded from this same local dataset is accepted.
-Existing repository visibility is never changed; a mismatch is reported as an error.
-
-After each local save, the finalizer copies metadata and hard-links the completed
-episode files into an upload snapshot. A separate process uploads that snapshot
-while recording continues. There is at most one active upload and one pending
-snapshot; newer saves replace the pending snapshot with a cumulative copy. Saved
-episodes flagged as discarded retain their flags in the uploaded metadata.
-Capture timing, dataset features, and episode validation are unchanged.
-
-The browser distinguishes local save completion from upload progress and errors.
-Network failures retry with delays up to 30 seconds. Snapshot staging failures
-leave the local save successful and retry on the next save or recorder restart.
-Shutdown allows five seconds for pending uploads, then stops the upload worker.
-To retry later, start the exporter with the same `--dataset-name` and
-`--root-output-dir`: `.hub_upload.json` restores the selection and the latest
-committed dataset is queued again. Keep this file with the local dataset; it also
-identifies which remote repository belongs to it. Never run two recorders against
-the same local dataset directory.
+Completed episodes upload from metadata copies and hard-linked episode files,
+keeping one active upload and the newest cumulative pending snapshot. Discard
+flags are preserved. Upload errors remain separate from local save status and
+retry with backoff up to 30 seconds; staging errors retry on the next save/restart.
+Shutdown waits five seconds before stopping uploads. Resume with the same
+`--dataset-name` and `--root-output-dir` to restore `.hub_upload.json` and requeue
+committed data. Keep that file: its identity prevents overwriting another dataset.
+Never run two recorders on one directory. Capture timing and schemas are unchanged.
 
 ## Camera Viewer
 
