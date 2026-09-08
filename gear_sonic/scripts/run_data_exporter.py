@@ -935,7 +935,7 @@ class GrootDataCollector:
             if "frame_index" in pose_data:
                 frame_index = np.array([pose_data["frame_index"].flat[0]], dtype=np.int64)
 
-            smpl_pose = np.zeros(63, dtype=np.float32)
+            smpl_pose = None
             if "smpl_pose" in pose_data:
                 raw_pose = pose_data["smpl_pose"]
                 if raw_pose.ndim == 3:
@@ -1437,6 +1437,17 @@ class GrootDataCollector:
         target_ns: int,
     ) -> float | None:
         """Add the causal teleop sample selected for the target time."""
+        def vector(message, key, width, *, quaternion=False):
+            try:
+                values = np.asarray((message or {}).get(key), dtype=np.float32).reshape(-1)
+            except (TypeError, ValueError):
+                return None
+            if values.size != width or not np.all(np.isfinite(values)):
+                return None
+            if quaternion and not np.all(np.any(values.reshape(-1, 4) != 0, axis=1)):
+                return None
+            return values
+
         sonic_latency_ms = None
 
         frame_data["teleop.stream_mode"] = np.array([stream_mode], dtype=np.int32)
@@ -1455,24 +1466,18 @@ class GrootDataCollector:
                 sonic_latency_ms = max(0.0, (target_ns - received_ns) / 1e6)
 
         # SMPL features
-        if use_smpl and smpl_msg.get("smpl_joints") is not None:
-            joints = np.asarray(smpl_msg["smpl_joints"], dtype=np.float32)
-            if joints.ndim == 2:
-                joints = joints.flatten()
-            frame_data["teleop.smpl_joints"] = np.ascontiguousarray(joints, dtype=np.float32)
-        else:
-            frame_data["teleop.smpl_joints"] = np.zeros(72, dtype=np.float32)
+        smpl = smpl_msg if use_smpl else None
+        joints = vector(smpl, "smpl_joints", 72)
+        pose = vector(smpl, "smpl_pose", 63)
+        body_quat_w = vector(smpl, "body_quat_w", 4, quaternion=True)
+        frame_data["teleop.smpl_joints"] = joints if joints is not None else np.zeros(72, dtype=np.float32)
+        frame_data["teleop.smpl_pose"] = pose if pose is not None else np.zeros(63, dtype=np.float32)
+        if "teleop.smpl_valid" in self.data_exporter.features:
+            frame_data["teleop.smpl_valid"] = np.asarray(
+                [all(value is not None for value in (joints, pose, body_quat_w))], dtype=np.uint8
+            )
 
-        if use_smpl and smpl_msg.get("smpl_pose") is not None:
-            pose = np.asarray(smpl_msg["smpl_pose"], dtype=np.float32)
-            if pose.ndim > 1:
-                pose = pose.flatten()
-            frame_data["teleop.smpl_pose"] = np.ascontiguousarray(pose, dtype=np.float32)
-        else:
-            frame_data["teleop.smpl_pose"] = np.zeros(63, dtype=np.float32)
-
-        if use_smpl and smpl_msg.get("body_quat_w") is not None:
-            body_quat_w = smpl_msg["body_quat_w"].astype(np.float32)
+        if body_quat_w is not None:
             frame_data["teleop.body_quat_w"] = body_quat_w
             frame_data["teleop.target_body_orientation"] = self._compute_target_body_orientation(
                 body_quat_w, frame_data
@@ -1543,17 +1548,24 @@ class GrootDataCollector:
         )
 
         # VR 3-point pose
+        planner = planner_msg if use_planner else None
+        position = vector(planner, "vr_3pt_position", 9)
+        orientation = vector(planner, "vr_3pt_orientation", 12, quaternion=True)
         frame_data["teleop.vr_3pt_position"] = (
-            planner_msg["vr_3pt_position"].astype(np.float32)
-            if use_planner and planner_msg.get("vr_3pt_position") is not None
-            else np.zeros(9, dtype=np.float32)
+            position if position is not None else np.zeros(9, dtype=np.float32)
         )
-        if use_planner and planner_msg.get("vr_3pt_orientation") is not None:
-            frame_data["teleop.vr_3pt_orientation"] = quat_to_rot6d(
-                planner_msg["vr_3pt_orientation"].astype(np.float32)
+        frame_data["teleop.vr_3pt_orientation"] = (
+            quat_to_rot6d(orientation) if orientation is not None else np.zeros(18, dtype=np.float32)
+        )
+        # Existing datasets retain their original schema when resumed.
+        if "teleop.vr_3pt_orientation_wxyz" in self.data_exporter.features:
+            frame_data["teleop.vr_3pt_orientation_wxyz"] = (
+                orientation if orientation is not None else np.zeros(12, dtype=np.float32)
             )
-        else:
-            frame_data["teleop.vr_3pt_orientation"] = np.zeros(18, dtype=np.float32)
+        if "teleop.vr_3pt_valid" in self.data_exporter.features:
+            frame_data["teleop.vr_3pt_valid"] = np.asarray(
+                [position is not None and orientation is not None], dtype=np.uint8
+            )
 
         return sonic_latency_ms
 

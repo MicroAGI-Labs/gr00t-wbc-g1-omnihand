@@ -22,6 +22,7 @@ from gear_sonic.end_effectors.protocol import HAND_STATE_SCHEMA, HAND_STATE_TOPI
 from gear_sonic.scripts.run_camera_web_viewer import CameraWebViewerConfig, RecorderControlHub
 from gear_sonic.scripts.run_data_exporter import GrootDataCollector
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
+from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message
 
 
 class FakeImageSubscriber:
@@ -105,7 +106,7 @@ def _recording_collector():
     collector._synchronization_skipped_targets = 0
     collector.latest_image_msg = None
     collector.latest_image_received_at = None
-    collector.sonic_timing_monitor = type("Monitor", (), {"reset": lambda self: None})()
+    collector.sonic_timing_monitor = SimpleNamespace(reset=lambda: None, log_time_delta=lambda _dt: None)
     collector._initial_yaw = 1.0
     collector._recording_message = "Recording episode 0"
     collector._last_finalization = None
@@ -174,6 +175,107 @@ def test_recorded_body_state_round_trips_and_resumes(tmp_path, body_state_collec
         assert table["observation.base_angular_velocity"][0].as_py() == [0.5, -1.0, 2.0]
     np.testing.assert_array_equal(table["action.motion_token"][0].as_py(), np.zeros(64))
     np.testing.assert_array_equal(table["action.motion_token"][-1].as_py(), np.arange(64))
+
+
+@pytest.fixture
+def pose_messages():
+    return {
+        "smpl_msg": {"smpl_joints": np.arange(72).reshape(24, 3), "smpl_pose": np.zeros(63),
+                     "body_quat_w": np.array([1.0, 0.0, 0.0, 0.0])},
+        "planner_msg": {"planner_mode": 0, "planner_speed": 0.5, "planner_height": -1.0,
+                        "vr_3pt_position": np.zeros(9),
+                        "vr_3pt_orientation": np.array([2, 0, 0, 0, 0, -3, 0, 0, 0.5, 0.5, 0.5, 0.5])},
+    }
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_recorded_pose_channels_round_trip_and_resume(tmp_path, body_state_collector, pose_messages, legacy):
+    collector = body_state_collector
+    features = dict(collector.data_exporter.features)
+    new_fields = {"teleop.vr_3pt_orientation_wxyz", "teleop.vr_3pt_valid", "teleop.smpl_valid"}
+    if legacy:
+        for key in new_fields:
+            del collector.data_exporter.features[key]
+    frames = []
+    for mode in (0, 1, 2, 3, 4, 5):
+        collector._add_sonic_pose_features(frame := {}, stream_mode=mode, target_ns=0, **pose_messages)
+        frames.append(frame)
+    kwargs = dict(
+        save_root=tmp_path / "dataset", fps=50, task="poses",
+        features={key: features[key] for key in frames[0]},
+        modality_config={"state": {}, "action": {}, "video": {}, "annotation": {}},
+    )
+    exporter = Gr00tDataExporter.create(**kwargs)
+    for frame in frames:
+        exporter.add_frame(frame)
+    exporter.save_episode()
+    resumed = Gr00tDataExporter.create(**(kwargs | {"features": features}))
+    collector.data_exporter = resumed
+    collector._add_sonic_pose_features(frame := {}, stream_mode=5, target_ns=0, **pose_messages)
+    resumed.add_frame(frame)
+    resumed.save_episode()
+    assert resumed.meta.total_frames == 7
+    table = pq.read_table(resumed.root / resumed.meta.get_data_file_path(0))
+    if legacy:
+        assert not new_fields.intersection(table.column_names)
+    else:
+        assert table["teleop.smpl_valid"].to_pylist() == [0, 1, 0, 0, 0, 0]
+        assert table["teleop.vr_3pt_valid"].to_pylist() == [0, 0, 1, 1, 0, 1]
+        assert table["teleop.vr_3pt_valid"].type.bit_width == 8
+        assert table["teleop.vr_3pt_orientation_wxyz"].type.value_type.bit_width == 32
+        np.testing.assert_array_equal(table["teleop.vr_3pt_orientation_wxyz"][0].as_py(), np.zeros(12))
+        np.testing.assert_array_equal(
+            table["teleop.vr_3pt_orientation_wxyz"][5].as_py(), pose_messages["planner_msg"]["vr_3pt_orientation"]
+        )
+    np.testing.assert_array_equal(table["teleop.smpl_joints"][1].as_py(), np.arange(72))
+    np.testing.assert_array_equal(
+        table["teleop.vr_3pt_orientation"][5].as_py(), [1, 0, 0, 0, 1, 0, 1, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0, 1]
+    )
+
+
+@pytest.mark.parametrize("message,key,width", [
+    ("smpl_msg", "smpl_joints", 72), ("smpl_msg", "smpl_pose", 63), ("smpl_msg", "body_quat_w", 4),
+    ("planner_msg", "vr_3pt_position", 9), ("planner_msg", "vr_3pt_orientation", 12),
+])
+@pytest.mark.parametrize("bad_value", [None, [], [0.0], np.nan, np.inf, "bad"])
+def test_incomplete_pose_is_flagged_and_finite(
+    body_state_collector, pose_messages, message, key, width, bad_value
+):
+    pose_messages[message][key] = np.full(width, bad_value) if np.isscalar(bad_value) else bad_value
+    is_smpl = message == "smpl_msg"
+    frame = {}
+    body_state_collector._add_sonic_pose_features(
+        frame, stream_mode=1 if is_smpl else 5, target_ns=0, **pose_messages
+    )
+    assert frame["teleop.smpl_valid" if is_smpl else "teleop.vr_3pt_valid"].item() == 0
+    assert all(np.all(np.isfinite(value)) for value in frame.values())
+
+
+@pytest.mark.parametrize("message,key,width", [("smpl_msg", "body_quat_w", 4),
+                                               ("planner_msg", "vr_3pt_orientation", 12)])
+def test_zero_quaternion_is_unavailable(body_state_collector, pose_messages, message, key, width):
+    pose_messages[message][key][:4] = 0  # One bad quaternion invalidates the VR orientation vector.
+    frame = {}
+    body_state_collector._add_sonic_pose_features(
+        frame, stream_mode=1 if width == 4 else 5, target_ns=0, **pose_messages
+    )
+    assert frame["teleop.smpl_valid" if width == 4 else "teleop.vr_3pt_valid"].item() == 0
+    assert all(np.all(np.isfinite(value)) for value in frame.values())
+
+
+def test_missing_smpl_pose_on_wire_is_not_a_valid_zero_pose(body_state_collector):
+    collector = body_state_collector
+    raw = pack_pose_message({"smpl_joints": np.ones((1, 24, 3)), "body_quat_w": np.array([[1., 0., 0., 0.]])})
+    collector._handle_pose_message(raw, received_ns=1)
+    collector._handle_pose_message(raw, received_ns=3)
+    selected = collector._synchronizer.select(2, required_streams=("sonic",), max_age_ns={})
+    assert selected.ready
+    message = selected.samples["sonic"].value
+    assert message["smpl_pose"] is None
+    collector._add_sonic_pose_features(frame := {}, stream_mode=1, target_ns=2, smpl_msg=message, planner_msg=None)
+    assert frame["teleop.smpl_valid"].item() == 0
+    np.testing.assert_array_equal(frame["teleop.smpl_joints"], np.ones(72))
+    np.testing.assert_array_equal(frame["teleop.smpl_pose"], np.zeros(63))
 
 
 @pytest.mark.parametrize("key,bad_value", [

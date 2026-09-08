@@ -510,6 +510,9 @@ Each frame contains:
 | `action.motion_token` | `(64,)` | SONIC encoder token; zero-filled when unavailable |
 | `action.motion_token_valid` | `(1,)` | uint8: 1 for a present, finite 64-value token; 0 for missing or empty tokens |
 | `teleop.target_body_orientation` | `(6,)` | Teleop target body rotation |
+| `teleop.smpl_valid` | `(1,)` | uint8: active SMPL stream with complete finite joints, pose, and body quaternion |
+| `teleop.vr_3pt_valid` | `(1,)` | uint8: active planner stream with complete finite VR positions and quaternions |
+| `teleop.vr_3pt_orientation_wxyz` | `(12,)` | Original float32 quaternions for left wrist, right wrist, and neck, each in w/x/y/z order |
 | `task_index` | scalar | Task prompt index into `meta/tasks.jsonl` |
 | `capture.sync_target_monotonic_ns` | `(1,)` | Thor master timestamp selected for this row |
 | `capture.<stream>_received_monotonic_ns` | `(1,)` | Thor receive timestamp of the selected causal sample |
@@ -521,6 +524,13 @@ The velocity channels and token-validity flag are added to new datasets. Resumin
 an older dataset preserves its schema. Missing or malformed velocities, and
 malformed nonempty tokens, mark the episode invalid through the existing quality
 report. A valid all-zero token remains distinguishable from an unavailable token.
+
+New datasets also include the pose-validity flags and original VR quaternions,
+alongside the existing 6D rotations. Inactive, missing, malformed, or non-finite
+pose components use the existing zero/identity defaults and clear the relevant
+flag; each quaternion must be nonzero. Valid components are preserved even when
+another component is unavailable. The flags describe pose payload validity;
+capture timing and episode synchronization checks still apply.
 
 ---
 

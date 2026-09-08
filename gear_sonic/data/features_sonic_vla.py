@@ -459,6 +459,25 @@ def get_features_sonic_vla(
                 "neck_r00", "neck_r10", "neck_r01", "neck_r11", "neck_r02", "neck_r12",
             ],
         },
+        "teleop.vr_3pt_orientation_wxyz": {
+            "dtype": "float32",
+            "shape": (12,),
+            "names": [
+                f"{source}_q{component}"
+                for source in ("lwrist", "rwrist", "neck")
+                for component in ("w", "x", "y", "z")
+            ],
+        },
+        "teleop.vr_3pt_valid": {
+            "dtype": "uint8",
+            "shape": (1,),
+            "names": ["vr_3pt_valid"],
+        },
+        "teleop.smpl_valid": {
+            "dtype": "uint8",
+            "shape": (1,),
+            "names": ["smpl_valid"],
+        },
         "capture.sync_target_monotonic_ns": {
             "dtype": "int64",
             "shape": (1,),
