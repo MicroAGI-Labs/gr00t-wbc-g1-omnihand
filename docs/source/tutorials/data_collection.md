@@ -498,21 +498,29 @@ Each frame contains:
 
 | Feature | Shape | Description |
 |---|---|---|
-| `observation.state.joint_position` | `(N,)` | Actuated joint positions (rad) |
-| `observation.state.joint_velocity` | `(N,)` | Actuated joint velocities (rad/s) |
-| `observation.state.body_rotation_6d` | `(6,)` | Base orientation (6D rotation) |
-| `observation.state.projected_gravity` | `(3,)` | Gravity vector in body frame |
+| `observation.state` | `(N,)` | Body and hand joint positions (rad) |
+| `observation.body_joint_velocity` | `(29,)` | Body joint velocities in controller MuJoCo order (rad/s, float32); names in `meta/info.json` |
+| `observation.base_angular_velocity` | `(3,)` | Base IMU gyroscope x/y/z (rad/s, float32) |
+| `observation.root_orientation` | `(4,)` | Base quaternion (w, x, y, z) |
+| `observation.projected_gravity` | `(3,)` | Gravity vector in body frame |
 | `observation.images.ego_view` | `(480, 640, 3)` | Ego camera image (saved as MP4 video) |
 | `observation.images.left_wrist` | `(480, 640, 3)` | Left wrist camera (only with `--record-wrist-cameras`) |
 | `observation.images.right_wrist` | `(480, 640, 3)` | Right wrist camera (only with `--record-wrist-cameras`) |
-| `action.joint_position` | `(N,)` | Teleop target joint positions |
-| `action.body_rotation_6d` | `(6,)` | Teleop target body rotation |
-| `annotation.human.action.task_description` | string | Task prompt for this frame |
+| `action.wbc` | `(N,)` | Body controller targets and requested hand positions |
+| `action.motion_token` | `(64,)` | SONIC encoder token; zero-filled when unavailable |
+| `action.motion_token_valid` | `(1,)` | uint8: 1 for a present, finite 64-value token; 0 for missing or empty tokens |
+| `teleop.target_body_orientation` | `(6,)` | Teleop target body rotation |
+| `task_index` | scalar | Task prompt index into `meta/tasks.jsonl` |
 | `capture.sync_target_monotonic_ns` | `(1,)` | Thor master timestamp selected for this row |
 | `capture.<stream>_received_monotonic_ns` | `(1,)` | Thor receive timestamp of the selected causal sample |
 | `capture.<stream>_age_ms` | `(1,)` | Target minus selected receive timestamp; `-1` when the stream is inactive |
 | `capture.camera_sequence` | `(1,)` | Camera publisher sequence, repeated when a camera frame is reused |
 | `capture.camera_capture_age_ms` | `(3,)` | Per-camera capture age at the target for ego, left wrist, and right wrist |
+
+The velocity channels and token-validity flag are added to new datasets. Resuming
+an older dataset preserves its schema. Missing or malformed velocities, and
+malformed nonempty tokens, mark the episode invalid through the existing quality
+report. A valid all-zero token remains distinguishable from an unavailable token.
 
 ---
 

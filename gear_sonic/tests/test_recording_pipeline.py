@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 
 from gear_sonic.camera.composed_camera import CameraFrameBuffer, ComposedCameraClientSensor
@@ -13,6 +14,9 @@ from gear_sonic.data.causal_sync import (
     CausalSynchronizer,
     TimedSample,
 )
+from gear_sonic.data.exporter import Gr00tDataExporter
+from gear_sonic.data.features_sonic_vla import get_features_sonic_vla
+from gear_sonic.data.robot_model.supplemental_info.g1.g1_supplemental_info import G1SupplementalInfo
 from gear_sonic.end_effectors.profiles import OMNIHAND_O10
 from gear_sonic.end_effectors.protocol import HAND_STATE_SCHEMA, HAND_STATE_TOPIC, encode
 from gear_sonic.scripts.run_camera_web_viewer import CameraWebViewerConfig, RecorderControlHub
@@ -107,6 +111,102 @@ def _recording_collector():
     collector._last_finalization = None
     collector._print_and_say = lambda *args, **kwargs: None
     return collector
+
+
+@pytest.fixture
+def body_state_collector():
+    collector = _recording_collector()
+    info = G1SupplementalInfo()
+    model = SimpleNamespace(joint_names=info.body_actuated_joints, supplemental_info=info)
+    collector.data_exporter.features = get_features_sonic_vla(model)
+    return collector
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_recorded_body_state_round_trips_and_resumes(tmp_path, body_state_collector, legacy):
+    collector = body_state_collector
+    features = collector.data_exporter.features
+    current_features = dict(features)
+    velocity = features["observation.body_joint_velocity"]
+    assert velocity["names"][0] == "left_hip_pitch_joint"
+    assert velocity["names"][22] == "right_shoulder_pitch_joint"
+    assert velocity["names"][-1] == "right_wrist_yaw_joint"
+    new_fields = {
+        "observation.body_joint_velocity", "observation.base_angular_velocity", "action.motion_token_valid"
+    }
+    if legacy:
+        for key in new_fields:
+            del features[key]
+    proprio = {} if legacy else {"body_dq": np.arange(29), "base_ang_vel": [0.5, -1.0, 2.0]}
+    frames = []
+    # Missing key, empty publisher array, null, a valid zero vector, and a nonzero token.
+    for token_fields in (
+        {}, {"token_state": []}, {"token_state": None},
+        {"token_state": np.zeros(64)}, {"token_state": np.arange(64)},
+    ):
+        proprio.update(token_fields)
+        frame = {}
+        collector._add_cpp_state_features(frame, proprio)
+        frames.append(frame)
+    kwargs = dict(
+        save_root=tmp_path / "dataset", fps=50,
+        features={key: features[key] for key in frames[0]},
+        modality_config={"state": {}, "action": {}, "video": {}, "annotation": {}}, task="body state",
+    )
+    exporter = Gr00tDataExporter.create(**kwargs)
+    for frame in frames:
+        exporter.add_frame(frame)
+    exporter.save_episode()
+    resumed = Gr00tDataExporter.create(**(kwargs | {"features": current_features}))
+    collector.data_exporter = resumed
+    collector._add_cpp_state_features(frame := {}, proprio)
+    resumed.add_frame(frame)
+    resumed.save_episode()
+    assert resumed.meta.total_frames == 6
+    table = pq.read_table(resumed.root / resumed.meta.get_data_file_path(0))
+    if legacy:
+        assert not new_fields.intersection(table.column_names)
+    else:
+        assert table["action.motion_token_valid"].to_pylist() == [0, 0, 0, 1, 1]
+        assert table["action.motion_token_valid"].type.bit_width == 8
+        assert table["observation.body_joint_velocity"].type.value_type.bit_width == 32
+        np.testing.assert_array_equal(table["observation.body_joint_velocity"][0].as_py(), np.arange(29))
+        assert table["observation.base_angular_velocity"][0].as_py() == [0.5, -1.0, 2.0]
+    np.testing.assert_array_equal(table["action.motion_token"][0].as_py(), np.zeros(64))
+    np.testing.assert_array_equal(table["action.motion_token"][-1].as_py(), np.arange(64))
+
+
+@pytest.mark.parametrize("key,bad_value", [
+    (key, value)
+    for key, width in (("body_dq", 29), ("base_ang_vel", 3), ("token_state", 64))
+    for value in ([None, []] if key != "token_state" else []) + [
+        [0.0], np.zeros((1, width)), np.full(width, np.nan), np.full(width, np.inf), ["bad"] * width,
+    ]
+])
+def test_malformed_body_state_marks_episode_invalid(body_state_collector, monkeypatch, key, bad_value):
+    collector = body_state_collector
+    proprio = {"body_dq": np.zeros(29), "base_ang_vel": np.zeros(3), "token_state": np.ones(64)}
+    proprio[key] = bad_value
+    target = collector._next_target_ns
+    for stream, value in (
+        ("proprio", proprio), ("manager", {"stream_mode": 0}),
+        ("camera", {"images": {"ego_view": np.zeros((2, 2, 3), dtype=np.uint8)}}),
+    ):
+        collector._synchronizer.observe(stream, value, target)
+        collector._synchronizer.observe(stream, value, target + 1)
+    monkeypatch.setattr(
+        "gear_sonic.scripts.run_data_exporter.time.monotonic_ns",
+        lambda: target + collector.synchronization_delay_ns,
+    )
+
+    assert collector._add_data_frame() is False
+
+    assert collector._next_target_ns == target + collector.loop_period_ns
+    assert "invalid robot state" in collector._synchronization_errors[0]
+    collector._finish_recording(discarded=False, reason="")
+    [job] = collector.episode_finalizer.jobs
+    assert job["discarded"] is True
+    assert job["validation"]["passed"] is False
 
 
 def test_recording_stop_reports_queued_until_background_commit_completes():
@@ -227,7 +327,7 @@ def test_collector_emits_target_only_after_future_watermarks_without_using_them(
         collector._synchronizer.observe(stream, past, target - 5_000_000)
         collector._synchronizer.observe(stream, future, target + 1_000_000)
     selected = []
-    collector._add_data_frame_sonic = lambda _start, selection: selected.append(selection)
+    collector._add_data_frame_sonic = lambda _start, selection: selected.append(selection) or True
     monkeypatch.setattr(
         "gear_sonic.scripts.run_data_exporter.time.monotonic_ns",
         lambda: target + collector.synchronization_delay_ns,
