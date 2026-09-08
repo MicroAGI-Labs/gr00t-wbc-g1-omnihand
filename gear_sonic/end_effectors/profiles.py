@@ -141,7 +141,24 @@ DEX3 = HandProfile(
     ),
 )
 
-PROFILES = {profile.name: profile for profile in (DEX3, OMNIHAND_O10)}
+# Output-shaft radians for the measured Thor pair. These encoder offsets are
+# device-specific; this profile deliberately does not rewrite motor calibration.
+DEX1 = HandProfile(
+    "dex1.v1",
+    SideProfile(("left_gripper_motor_joint",), (-2.60,), (3.10,), (9.0,), (2.84,), (-2.36,)),
+    SideProfile(("right_gripper_motor_joint",), (-0.10,), (5.75,), (9.0,), (5.30,), (0.12,)),
+)
+
+PROFILES = {profile.name: profile for profile in (DEX3, OMNIHAND_O10, DEX1)}
+
+
+def raw_hand_name(profile: HandProfile | None) -> str:
+    """Preserve existing dataset names while identifying native DEX 1 channels."""
+    return "dex1" if profile is not None and profile.name == DEX1.name else "omnihand"
+
+
+def dataset_robot_type(profile: HandProfile | None) -> str:
+    return f"unitree_g1_{raw_hand_name(profile)}_sonic"
 
 
 def get_hand_profile(name: str) -> HandProfile:

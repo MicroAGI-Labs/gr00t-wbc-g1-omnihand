@@ -194,16 +194,18 @@ external_dependencies/XRoboToolkit-PC-Service-Pybind/
 
 # Pinned OmniHand SDK checkout (managed by install_omnihand.sh)
 external_dependencies/agillink_omnihand_sdk/
+external_dependencies/dex1_1_service/
 
 # UV
 uv.lock
 
 # Virtual environments (created by install_scripts/)
-.venv_sim/
-.venv_teleop/
-.venv_data_collection/
-.venv_camera/
-.venv_inference/
+.venv_sim
+.venv_teleop
+.venv_data_collection
+.venv_camera
+.venv_inference
+.venv_omnihand
 
 # XRoboToolkit-PC-Service-Pybind
 xrobotoolkit_sdk.cpython-*-*-*.so

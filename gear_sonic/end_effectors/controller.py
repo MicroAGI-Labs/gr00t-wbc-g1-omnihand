@@ -1,4 +1,4 @@
-"""Safe external open/close controller for simulated or physical OmniHand O10."""
+"""External open/close controller for OmniHand O10 and DEX 1."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import numpy as np
 import zmq
 
 from .backends.base import HandBackend
+from .backends.dex1 import DEFAULT_WORKER, Dex1Backend, Dex1SafetyError
 from .backends.mujoco import MuJoCoHandTransport, MuJoCoSimHandBackend
 from .backends.omnihand import OmniHandBackend, vendor_output_to_stderr
 from .profiles import HandProfile, HandSide, get_hand_profile
@@ -377,6 +378,8 @@ class SafeHandController:
                 target = np.clip(self.requested[side], side_profile.lower_rad, side_profile.upper_rad)
                 maximum = np.asarray(side_profile.velocity_rad_s) * self.velocity_scale[side] * dt
                 safe = self.applied[side] + np.clip(target - self.applied[side], -maximum, maximum)
+                if getattr(device, "owns_trajectory", False):
+                    safe = target  # The motor worker generates the 200 Hz trajectory.
                 # The AGILINK all-joint call expands into multiple CAN
                 # transactions. Re-sending an already reached setpoint every
                 # cycle can fill the vendor queue with old poses, making a new
@@ -384,7 +387,16 @@ class SafeHandController:
                 if not np.array_equal(safe, self.applied[side]):
                     device.write_positions(safe)
                     self.applied[side] = safe
+            set_control_mode = getattr(device, "set_control_mode", None)
+            if set_control_mode is not None:
+                set_control_mode(
+                    "fault" if self.fault_latched
+                    else "hold" if stale_by_side[side] or self.mode == "hold"
+                    else "tracking"
+                )
             self.measured[side] = np.asarray(device.read_positions(), dtype=np.float64).copy()
+            if getattr(device, "owns_trajectory", False):
+                self.applied[side] = np.asarray(getattr(device, "applied_positions"), dtype=np.float64).copy()
             if self.measured[side].shape != (side_profile.width,) or not np.all(np.isfinite(self.measured[side])):
                 raise HandControllerError(f"{side} feedback became invalid")
         if poll_health:
@@ -476,6 +488,12 @@ def _selected_sides(value: str) -> tuple[str, ...]:
 
 def _make_hardware_device(args: argparse.Namespace, side: str, profile: HandProfile) -> HandBackend:
     p = profile.side(side)
+    if args.backend == "dex1":
+        return Dex1Backend(
+            HandSide(side), p, worker=args.dex1_worker,
+            transition_duration=args.dex1_transition_duration,
+            command_enabled=bool(args.enable_command),
+        )
     interface = args.left_interface if side == "left" else args.right_interface
     return OmniHandBackend(HandSide(side), p, interface, command_enabled=bool(args.enable_command))
 
@@ -495,7 +513,19 @@ def _make_devices(
             context=context,
         )
         return {side: MuJoCoSimHandBackend(side, profile.side(side), transport) for side in sides}
-    return {side: _make_hardware_device(args, side, profile) for side in sides}
+    devices: dict[str, HandBackend] = {}
+    try:
+        for side in sides:
+            devices[side] = _make_hardware_device(args, side, profile)
+        return devices
+    except BaseException:
+        for device in devices.values():
+            device.close()
+        raise
+
+
+def _profile_for_backend(backend: str) -> HandProfile:
+    return get_hand_profile("dex1.v1" if backend == "dex1" else "omnihand_o10.v1")
 
 
 def probe(args: argparse.Namespace) -> int:
@@ -526,7 +556,7 @@ def probe(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(json.dumps({"passed": False, "backend": "sim", "error": str(exc)}, indent=2))
             return 1
-    profile = get_hand_profile("omnihand_o10.v1")
+    profile = _profile_for_backend(args.backend)
     devices: dict[str, HandBackend] = {}
     try:
         with vendor_output_to_stderr():
@@ -628,9 +658,9 @@ def hold(args: argparse.Namespace) -> int:
 
 
 def run(args: argparse.Namespace) -> int:
-    if args.backend == "omnihand" and not args.enable_command:
-        raise HandControllerError("--enable-command is required for physical OmniHand writes")
-    profile = get_hand_profile("omnihand_o10.v1")
+    if args.backend in {"omnihand", "dex1"} and not args.enable_command:
+        raise HandControllerError("--enable-command is required for physical hand writes")
+    profile = _profile_for_backend(args.backend)
     context = zmq.Context()
     subscriber = context.socket(zmq.SUB)
     # Hand intent owns a dedicated endpoint, so CONFLATE safely guarantees
@@ -644,6 +674,7 @@ def run(args: argparse.Namespace) -> int:
     controller: SafeHandController | None = None
     next_reconnect_at = 0.0
     last_error: str | None = None
+    fault_latched = False
     state_publisher = FixedRateHandStatePublisher(args.state_endpoint, args.frequency)
 
     def handle_sigterm(_signum: int, _frame: Any) -> None:
@@ -659,7 +690,7 @@ def run(args: argparse.Namespace) -> int:
             "monotonic_ns": int(now * 1e9),
             "backend": args.backend,
             "profile": profile.name,
-            "mode": "disconnected",
+            "mode": "fault" if fault_latched else "disconnected",
             "target_source": "pico_open_close",
             "intent_sequence": None,
             "intent_source_monotonic_ns": None,
@@ -679,7 +710,7 @@ def run(args: argparse.Namespace) -> int:
         while True:
             started = time.monotonic()
             just_connected = False
-            if controller is None and started >= next_reconnect_at:
+            if controller is None and not fault_latched and started >= next_reconnect_at:
                 devices: dict[str, HandBackend] = {}
                 try:
                     devices = _make_devices(args, profile, context)
@@ -689,7 +720,9 @@ def run(args: argparse.Namespace) -> int:
                         backend_name=args.backend,
                         close_scale=args.close_scale,
                         target_timeout_s=args.target_timeout,
-                        transition_duration_s=args.transition_duration,
+                        transition_duration_s=(
+                            args.dex1_transition_duration if args.backend == "dex1" else args.transition_duration
+                        ),
                         session_id=session_id,
                     )
                     last_error = None
@@ -705,11 +738,13 @@ def run(args: argparse.Namespace) -> int:
                     for device in devices.values():
                         device.close()
                     last_error = str(exc)
+                    fault_latched = isinstance(exc, Dex1SafetyError)
                     next_reconnect_at = started + args.reconnect_interval
-                    print(
-                        f"[Hands] Connection attempt failed: {last_error}; "
-                        f"retrying in {args.reconnect_interval:.1f}s"
+                    recovery = (
+                        "use Reconnect hands after checking the fault" if fault_latched
+                        else f"retrying in {args.reconnect_interval:.1f}s"
                     )
+                    print(f"[Hands] Connection attempt failed: {last_error}; {recovery}")
 
             if controller is not None:
                 try:
@@ -731,6 +766,11 @@ def run(args: argparse.Namespace) -> int:
                     )
                     controller.close()
                     controller = None
+                    if isinstance(exc, Dex1SafetyError):
+                        fault_latched = True
+                        state_publisher.update_state(disconnected_state(time.monotonic()))
+                        print("[Hands] DEX 1 stopped; use Reconnect hands after checking the fault")
+                        continue
                     state_publisher.update_state(disconnected_state(time.monotonic()))
                     return RECOVERABLE_DISCONNECT_EXIT_CODE
             else:
@@ -754,11 +794,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("probe", "hold", "run"):
         command = sub.add_parser(name)
-        command.add_argument("--backend", choices=("sim", "omnihand"), default="sim")
+        command.add_argument("--backend", choices=("sim", "omnihand", "dex1"), default="sim")
         command.add_argument("--sides", choices=("left", "right", "both"), default="both")
         command.add_argument("--left-interface", default="can11")
         command.add_argument("--right-interface", default="can10")
         command.add_argument("--enable-command", action="store_true")
+        command.add_argument("--dex1-worker", default=str(DEFAULT_WORKER))
+        command.add_argument("--dex1-transition-duration", type=float, default=1.5)
     runner = sub.choices["run"]
     runner.add_argument(
         "--intent-endpoint", default=f"tcp://localhost:{DEFAULT_HAND_INTENT_PORT}"

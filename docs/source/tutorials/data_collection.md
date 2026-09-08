@@ -257,6 +257,16 @@ python gear_sonic/scripts/launch_data_collection.py \
     --remote-ui
 ```
 
+**With the measured physical DEX 1 pair and browser controls:**
+
+```bash
+bash tools/teleop_dex1.sh
+```
+
+Build its worker once with `bash install_scripts/install_dex1.sh` if this
+checkout is not prepared. See [DEX 1 teleoperation](../references/dex1_teleop.md)
+for device profiles, setup, fault behavior, and the first hardware check.
+
 ```{tip}
 No need to activate a virtual environment first — the launcher automatically detects and uses `.venv_data_collection` if the required dependencies are not in the current Python.
 ```
