@@ -1905,15 +1905,19 @@ class FeedbackReader:
         # return robot_model.get_joint_group_indices("upper_body")
         return [12, 13, 14, 15, 22, 16, 23, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28]
 
-    def poll_feedback(self):
-        """Poll for feedback once, and update internal state."""
+    def poll_feedback(self, *, retain_last: bool = False) -> bool:
+        """Poll once, preserving held targets on a failed calibration attempt."""
+        targets = self._process_upper_body_position_targets()
+        if targets[3] is None and retain_last:
+            return False
         (
             self.upper_body_position_target,
             self.left_hand_position_target,
             self.right_hand_position_target,
             self.full_body_q_measured,
-        ) = self._process_upper_body_position_targets()
+        ) = targets
         print("[PlannerLoop] Saved upper body position target:", self.upper_body_position_target)
+        return self.full_body_q_measured is not None
 
     def _process_upper_body_position_targets(
         self,
@@ -1924,15 +1928,15 @@ class FeedbackReader:
             print("[PlannerLoop] No feedback data received")
             return None, None, None, None
 
-        unpacked = msgpack.unpackb(data, raw=False)
-        full_body_q = None
-        if "body_q_measured" in unpacked:
-            body_q_swizzled = unpacked["body_q_measured"]
-            full_body_q = np.array(body_q_swizzled, dtype=np.float64)
-            body_q = [body_q_swizzled[i] for i in self.upper_body_joint_indices]
-        else:
-            print("[PlannerLoop] body_q_measured not in feedback data")
-            body_q = None
+        try:
+            unpacked = msgpack.unpackb(data, raw=False)
+            full_body_q = np.asarray(unpacked["body_q_measured"], dtype=np.float64)
+            if full_body_q.shape != (29,) or not np.all(np.isfinite(full_body_q)):
+                raise ValueError("body_q_measured must contain 29 finite joint positions")
+        except (msgpack.UnpackException, ValueError, TypeError, KeyError, OverflowError) as exc:
+            print(f"[PlannerLoop] Invalid body feedback: {exc}")
+            return None, None, None, None
+        body_q = full_body_q[self.upper_body_joint_indices]
 
         if "left_hand_q_measured" in unpacked:
             left_hand_q = unpacked["left_hand_q_measured"]
@@ -1987,25 +1991,23 @@ class PlannerStreamer:
         """Poll feedback and save upper body position target."""
         self.feedback_reader.poll_feedback()
 
-    def recalibrate_for_vr3pt(self):
+    def recalibrate_for_vr3pt(self) -> bool:
         """
         Recalibrate VR 3-point pose tracking using the robot's current measured joints.
 
-        Polls the g1_debug feedback to get the robot's actual joint state, then
-        schedules recalibration so VR tracking aligns with the robot's current pose.
-        This prevents sudden jumps when entering VR 3PT mode from PLANNER mode.
+        Discard any queued g1_debug packet, then wait at most 100 ms for a new,
+        complete sample. A failed attempt leaves the current held targets intact.
         """
-        self.feedback_reader.poll_feedback()
-        if self.feedback_reader.full_body_q_measured is not None:
-            self.three_point.reset_with_measured_q(self.feedback_reader.full_body_q_measured)
-            print("[PlannerLoop] VR 3PT recalibration scheduled with measured robot pose")
-        else:
-            # Fallback: use zeros if no feedback available
-            print(
-                "[PlannerLoop] WARNING: No feedback data for VR 3PT recalibration, "
-                "using zero body_q as fallback"
-            )
-            self.three_point.reset_with_measured_q(np.zeros(29, dtype=np.float64))
+        self.feedback_reader.poller.get_data()
+        deadline = time.monotonic() + 0.1
+        while time.monotonic() < deadline:
+            if self.feedback_reader.poll_feedback(retain_last=True):
+                self.three_point.reset_with_measured_q(self.feedback_reader.full_body_q_measured)
+                print("[PlannerLoop] VR 3PT recalibration scheduled with measured robot pose")
+                return True
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        print("[PlannerLoop] Cannot enter VR 3PT without new valid robot feedback; retry when available")
+        return False
 
     def run_once(self, stream_mode: StreamMode, *, face_command: str | None = None):
         """Execute one iteration of the planner control loop."""
@@ -2393,11 +2395,6 @@ def run_pico_manager(
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
 
-                # Track parent when entering VR_3PT
-                if new_mode == StreamMode.PLANNER_VR_3PT:
-                    vr3pt_parent_mode = current_mode
-                    print(f"[Manager] VR_3PT parent: {vr3pt_parent_mode.name}")
-
                 if new_mode == StreamMode.POSE:
                     pose_streamer.reset_yaw()
                 elif new_mode == StreamMode.PLANNER and current_mode != StreamMode.PLANNER_VR_3PT:
@@ -2415,7 +2412,11 @@ def run_pico_manager(
                 elif new_mode == StreamMode.PLANNER_VR_3PT:
                     # Recalibrate VR tracking against the robot's actual current pose
                     # (read via g1_debug feedback + FK) to prevent sudden jumps
-                    planner_streamer.recalibrate_for_vr3pt()
+                    if planner_streamer.recalibrate_for_vr3pt():
+                        vr3pt_parent_mode = current_mode
+                        print(f"[Manager] VR_3PT parent: {vr3pt_parent_mode.name}")
+                    else:
+                        new_mode = current_mode
 
             # Run one iteration of the new mode
             if new_mode == StreamMode.POSE:
