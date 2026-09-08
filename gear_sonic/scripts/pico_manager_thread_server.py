@@ -2150,7 +2150,7 @@ def run_pico_manager(
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
-      A+X: Toggle between planner and pose mode
+      A+X: Save active recording; otherwise toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
       B+Y: Toggle pose/frozen-upper-body mode
       X+B: Start/stop-success recording
@@ -2223,7 +2223,7 @@ def run_pico_manager(
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
     print(
-        "Manager controls: A+X=toggle mode, "
+        "Manager controls: A+X=save while recording, otherwise toggle mode, "
         "B+Y=frozen upper body, X+B=record/save, Y+A=discard, "
         "A+B+X+Y=start/stop policy"
     )
@@ -2308,8 +2308,9 @@ def run_pico_manager(
             )
             start_combo = bool(a_pressed) and bool(b_pressed) and bool(x_pressed) and bool(y_pressed)
 
-            # A+X remains exclusively the POSE/PLANNER mode gesture.
-            ax_pressed = face_command == "ax"
+            # Consume A+X as save during recording, before evaluating mode changes.
+            save_recording = face_command == "ax" and recorder_is_recording
+            ax_pressed = face_command == "ax" and not save_recording
 
             # B+Y remains the POSE/frozen-upper-body mode gesture.
             by_pressed = face_command == "by"
@@ -2432,13 +2433,13 @@ def run_pico_manager(
                 current_mode = new_mode
 
             # Mode-independent: send manager_state for data exporter
-            toggle_dc = face_command == "xb"
+            toggle_dc = face_command == "xb" or save_recording
             toggle_da = face_command == "ya"
             if toggle_dc:
                 recorder_is_recording = not recorder_is_recording
                 recorder_command_timestamp = time.time()
                 print(
-                    "[Manager] Recorder X+B -> "
+                    f"[Manager] Recorder {'A+X' if save_recording else 'X+B'} -> "
                     f"{'start' if recorder_is_recording else 'stop/save'}"
                 )
             elif toggle_da:

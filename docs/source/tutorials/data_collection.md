@@ -373,9 +373,12 @@ There are two ways to control recording: **PICO VR controllers** (recommended du
 | Input | Action |
 |---|---|
 | **X + B** | **Toggle on release** — starts a new episode, or stops and saves the current one |
+| **A + X** | **Save on release while recording** — stops and saves the current episode, keeping the current teleop mode |
 | **Y + A** | **Discard on release** — saves the active episode flagged for removal during post-processing |
 
-These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent of the mode-switching controls.
+These recording controls work in any manager mode (POSE, PLANNER, etc.). When no
+recording is active, A+X keeps its usual mode-switching behavior. The four-button
+policy start/stop gesture remains separate and does not trigger save or discard.
 
 **Keyboard over ZMQ:**
 
