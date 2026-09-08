@@ -376,13 +376,16 @@ def _switch_camera_source(config: DataCollectionLaunchConfig) -> None:
     ):
         print(f"Camera source already set to {source} on port {config.camera_port}.")
         return
-    print(f"Switching camera source to {source} on port {config.camera_port}...")
-    result = subprocess.run(["sudo", "-n", "systemctl", action, service])
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Could not {action} {service} without a password prompt. "
-            f"Run 'sudo systemctl {action} {service}' once, then launch again."
-        )
+    if currently_active != (action == "start"):
+        print(f"Switching camera source to {source} on port {config.camera_port}...")
+        result = subprocess.run(["sudo", "-n", "systemctl", action, service])
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not {action} {service} without a password prompt. "
+                f"Run 'sudo systemctl {action} {service}' once, then launch again."
+            )
+    else:
+        print(f"Waiting for camera port {config.camera_port} to {'be ready' if expected_listening else 'be free'}...")
 
     deadline = time.monotonic() + (10.0 if config.sim else 60.0)
     while time.monotonic() < deadline:
@@ -391,7 +394,10 @@ def _switch_camera_source(config: DataCollectionLaunchConfig) -> None:
         time.sleep(0.25)
 
     state = "become free" if config.sim else "start listening"
-    raise RuntimeError(f"Camera port {config.camera_port} did not {state} after service {action}")
+    raise RuntimeError(
+        f"Camera port {config.camera_port} did not {state}. "
+        f"Check camera availability and service logs: journalctl -u {service} -n 50 --no-pager"
+    )
 
 
 def _hand_pane(config: DataCollectionLaunchConfig) -> int:
