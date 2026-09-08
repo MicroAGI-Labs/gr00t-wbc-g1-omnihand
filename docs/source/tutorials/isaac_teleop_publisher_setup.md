@@ -105,7 +105,7 @@ Connecting the client starts the body-data stream the streamer is waiting for.
 - On Thor, change **Video Codec** from the default **AV1** to **H.264** or **H.265 (HEVC)**.
 - Return to the client page and click **Connect**
 
-Once connected, stand in the [calibration pose](vr_wholebody_teleop.md#calibration-pose) and press **A+B+X+Y** on the PICO controllers to start the policy; the first press also runs the startup calibration and enters PLANNER (locomotion) mode. Then press **A+X** to switch to POSE mode for whole-body teleop, where your motion maps directly to the robot. See [Complete PICO Controls](vr_wholebody_teleop.md#pico-controls) for the other modes and the emergency stop.
+Once connected, stand in the [calibration pose](vr_wholebody_teleop.md#calibration-pose) and press **A+B+X+Y** on the PICO controllers to start the policy; the first press also runs the startup calibration and enters PLANNER (locomotion) mode. Then press and release **A+X** twice within two seconds to switch to POSE mode for whole-body teleop, where your motion maps directly to the robot. See [Complete PICO Controls](vr_wholebody_teleop.md#pico-controls) for the other modes and the emergency stop.
 
 For quick validation, the same client URL can also be opened in a desktop browser.
 

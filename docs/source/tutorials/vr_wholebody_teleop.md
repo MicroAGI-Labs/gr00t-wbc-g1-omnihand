@@ -115,8 +115,8 @@ When you turn on the visualization, wait for a window to pop up showing a Unitre
 
 1. **Assume the calibration pose** — stand upright, feet together, upper arms at your sides, forearms bent 90° forward (L-shape at each elbow), palms inward. See [Calibration Pose](#calibration-pose) for details.
 2. Press **A + B + X + Y** simultaneously to engage the control policy and run the initial full calibration (`CALIB_FULL`).
-3. Align your arms with the robot's current pose, then press **A + X** to enter full-body SMPL teleop (**POSE** mode). Move your arms and legs — the robot follows.
-4. Press **A + X** again to fall back to **PLANNER** (idle) mode.
+3. Align your arms with the robot's current pose, then press and release **A + X** twice within two seconds to enter full-body SMPL teleop (**POSE** mode). Move your arms and legs — the robot follows.
+4. Repeat the two **A + X** gestures to fall back to **PLANNER** (idle) mode when not recording.
 5. Press **A + B + X + Y** again to stop the robot.
 
 <figure style="margin: 1em 0;">
@@ -156,6 +156,12 @@ The system has **4 operating modes** and **2 calibration types**.
 ### State Machine
 
 There are 4 modes and 2 control chains. Each chain forms a triangle: **A+X** (or **B+Y**) returns to POSE from *both* the planner node and its VR_3PT sub-mode.
+
+Each A+X mode transition below requires two complete press-and-release gestures;
+the second release must occur within two seconds of the first. A completed pair,
+recording activity, another completed face chord, a mode change, or a headset
+reconnect clears the pending first gesture. During recording, one A+X gesture
+saves the take instead. The four-button policy stop still acts immediately.
 
 ```text
   ┌──────────────────────────────────────┐
@@ -236,10 +242,10 @@ Below is an example of **bad calibration practice** — transitioning into VR_3P
 **Recovery from bad VR_3PT calibration:**
 1. Freeze the upper body — switch back via **Left Stick Click**.
 2. Re-align your arms with the robot's current (possibly distorted) pose.
-3. Switch to **POSE** mode (**A+X**) to reset.
+3. When not recording, switch to **POSE** mode with two **A+X** press-and-release gestures within two seconds.
 ```
 
-Below is the **recovery procedure** — if you accidentally enter a badly calibrated VR_3PT state, freeze the upper body (Left Stick Click back), then switch to POSE mode (A+X) to reset safely.
+Below is the **recovery procedure** — if you accidentally enter a badly calibrated VR_3PT state, freeze the upper body (Left Stick Click back), then switch to POSE mode (two A+X gestures within two seconds, when not recording) to reset safely.
 
 <figure style="margin: 1em 0;">
 <video width="100%" autoplay loop muted playsinline style="border-radius: 8px;">
@@ -253,7 +259,7 @@ Below is the **recovery procedure** — if you accidentally enter a badly calibr
 | Action | Button | Notes |
 |---|---|---|
 | **Start / Stop policy** | **A+B+X+Y** | First press: engage + CALIB_FULL. Again: emergency stop → OFF. |
-| **Save recording / Toggle POSE** | **A+X** | During recording, release to save the take and keep the current mode. Otherwise switches between PLANNER ↔ POSE, or from VR_3PT → POSE. |
+| **Save recording / Toggle POSE** | **A+X** | During recording, one press-and-release saves the take. Otherwise, two gestures within two seconds switch PLANNER ↔ POSE, or VR_3PT → POSE. |
 | **Toggle PLANNER_FROZEN_UPPER** | **B+Y** | Switches between POSE ↔ PLANNER_FROZEN_UPPER. OR from VR_3PT (entered via PLANNER_FROZEN_UPPER) → POSE. |
 | **Toggle VR_3PT** | **Left Stick Click** | From any Planner mode → VR_3PT (triggers CALIB). Click again to return. |
 | **Hand grasp** | **Trigger** (per hand) | Controls the corresponding hand's grasp. |
@@ -365,4 +371,4 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager --input-source
 Update the IP in the PICO's XRoboToolKit app to match this machine before starting the default PICO path. For Isaac Teleop, make sure the headset is connected to the in-process CloudXR runtime — see [Isaac Teleop Setup](isaac_teleop_publisher_setup.md).
 ```
 
-Follow the same start sequence: calibration pose → **A+B+X+Y** → **A+X** for POSE mode. See [Complete PICO Controls](#pico-controls) for all available commands.
+Follow the same start sequence: calibration pose → **A+B+X+Y** → two **A+X** press-and-release gestures within two seconds for POSE mode. See [Complete PICO Controls](#pico-controls) for all available commands.
