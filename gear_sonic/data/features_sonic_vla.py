@@ -285,6 +285,16 @@ def get_features_sonic_vla(
             "shape": (num_joints,),
             "names": joint_names,
         },
+        "observation.body_joint_velocity": {
+            "dtype": "float32",
+            "shape": (29,),
+            "names": list(robot_model.supplemental_info.body_actuated_joints),
+        },
+        "observation.base_angular_velocity": {
+            "dtype": "float32",
+            "shape": (3,),
+            "names": ["angular_velocity_x", "angular_velocity_y", "angular_velocity_z"],
+        },
         "observation.eef_state": {
             "dtype": "float64",
             "shape": (14,),
@@ -342,7 +352,12 @@ def get_features_sonic_vla(
         "action.motion_token": {
             "dtype": "float64",
             "shape": (64,),
-            "names": "motion_token",
+            "names": [f"motion_token_{index:02d}" for index in range(64)],
+        },
+        "action.motion_token_valid": {
+            "dtype": "uint8",
+            "shape": (1,),
+            "names": ["motion_token_valid"],
         },
         "teleop.smpl_joints": {
             "dtype": "float32",

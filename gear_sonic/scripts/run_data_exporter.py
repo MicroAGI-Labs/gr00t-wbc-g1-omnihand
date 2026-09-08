@@ -1180,7 +1180,8 @@ class GrootDataCollector:
             self._record_synchronization_gap(target_ns, reasons, now_ns)
             return False
 
-        self._add_data_frame_sonic(t_start, selection)
+        if not self._add_data_frame_sonic(t_start, selection):
+            return False
         self._synchronizer.trim_through(target_ns)
         self._next_target_ns += self.loop_period_ns
         return True
@@ -1192,6 +1193,14 @@ class GrootDataCollector:
     ) -> bool:
         """Build one data frame in Sonic CPP + SMPL mode."""
         proprio = selection.samples["proprio"].value
+        frame_data: dict = {}
+        try:
+            self._add_cpp_state_features(frame_data, proprio)
+        except (TypeError, ValueError) as error:
+            self._record_synchronization_gap(
+                selection.target_ns, [f"invalid robot state: {error}"], time.monotonic_ns()
+            )
+            return False
         image_message = selection.samples["camera"].value
         stream_mode = int(selection.samples["manager"].value["stream_mode"])
         hand_state = (
@@ -1257,13 +1266,9 @@ class GrootDataCollector:
             eef_parts.append(np.concatenate([pos, quat]))
         observation_eef_state = np.concatenate(eef_parts)
 
-        frame_data: dict = {
-            "observation.state": whole_q,
-            "observation.eef_state": observation_eef_state,
-            "action.wbc": whole_action_wbc,
-        }
-
-        self._add_cpp_state_features(frame_data, proprio)
+        frame_data["observation.state"] = whole_q
+        frame_data["observation.eef_state"] = observation_eef_state
+        frame_data["action.wbc"] = whole_action_wbc
 
         sonic_latency_ms = self._add_sonic_pose_features(
             frame_data,
@@ -1356,6 +1361,20 @@ class GrootDataCollector:
             )
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
+        def vector(key: str, width: int, dtype) -> np.ndarray:
+            values = np.asarray(proprio.get(key), dtype=dtype)
+            if values.shape != (width,) or not np.all(np.isfinite(values)):
+                raise ValueError(f"{key} must contain {width} finite values")
+            return values
+
+        for feature, key, width in (
+            ("observation.body_joint_velocity", "body_dq", 29),
+            ("observation.base_angular_velocity", "base_ang_vel", 3),
+        ):
+            # Resumed datasets keep their original schema and required inputs.
+            if feature in self.data_exporter.features:
+                frame_data[feature] = vector(key, width, np.float32)
+
         if "base_quat" in proprio:
             base_quat = np.asarray(proprio["base_quat"], dtype=np.float64)
             frame_data["observation.root_orientation"] = base_quat
@@ -1399,10 +1418,14 @@ class GrootDataCollector:
         else:
             frame_data["teleop.delta_heading"] = np.zeros(1, dtype=np.float64)
 
-        if "token_state" in proprio:
-            frame_data["action.motion_token"] = np.asarray(proprio["token_state"], dtype=np.float64)
-        else:
-            frame_data["action.motion_token"] = np.zeros(64, dtype=np.float64)
+        token = proprio.get("token_state")
+        token_present = token is not None and np.asarray(token).size > 0
+        frame_data["action.motion_token"] = (
+            vector("token_state", 64, np.float64)
+            if token_present else np.zeros(64, dtype=np.float64)
+        )
+        if "action.motion_token_valid" in self.data_exporter.features:
+            frame_data["action.motion_token_valid"] = np.asarray([token_present], dtype=np.uint8)
 
     def _add_sonic_pose_features(
         self,
