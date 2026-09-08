@@ -41,6 +41,7 @@ from gear_sonic.data.episode_finalizer import (
 )
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.features_sonic_vla import (
+    CAPTURE_SOURCE_FIELDS,
     assemble_dataset_configuration,
     get_features_sonic_vla,
     get_g1_robot_model,
@@ -185,6 +186,21 @@ class TimeDeltaException(Exception):
 
 class TeleopInputUnavailable(RuntimeError):
     """PICO input is unavailable while hand feedback remains healthy."""
+
+
+def _capture_scalar(value, scale: int = 1) -> int:
+    """Read optional source metadata; malformed values must not stop recording."""
+    try:
+        array = np.asarray(value)
+        if array.size != 1 or array.dtype.kind not in ("iu" if scale == 1 else "iuf"):
+            return -1
+        scalar = array.item()
+        if not 0 <= scalar <= np.iinfo(np.int64).max / scale or (scale != 1 and scalar == 0):
+            return -1
+        result = int(scalar * scale)
+        return result if result <= np.iinfo(np.int64).max else -1
+    except (TypeError, ValueError, OverflowError):
+        return -1
 
 
 def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
@@ -978,6 +994,7 @@ class GrootDataCollector:
                 "vr_3pt_position": vr_3pt_position,
                 "vr_3pt_orientation": vr_3pt_orientation,
                 "frame_index": frame_index,
+                "timestamp_monotonic": pose_data.get("timestamp_monotonic"),
                 "received_monotonic_ns": received_ns,
             }
             self._synchronizer.observe("sonic", sonic_message, received_ns)
@@ -1336,18 +1353,10 @@ class GrootDataCollector:
             np.asarray([selection.target_ns], dtype=np.int64),
         )
         camera_message = selection.samples["camera"].value
-        sequence = camera_message.get("publisher_sequence")
-        add(
-            "capture.camera_sequence",
-            np.asarray(
-                [
-                    sequence
-                    if isinstance(sequence, int) and not isinstance(sequence, bool)
-                    else -1
-                ],
-                dtype=np.int64,
-            ),
-        )
+        for name, (stream, key, scale) in CAPTURE_SOURCE_FIELDS.items():
+            sample = selection.samples.get(stream)
+            value = None if sample is None else sample.value.get(key)
+            add(f"capture.{name}", np.asarray([_capture_scalar(value, scale)], dtype=np.int64))
         capture_ages = []
         for camera_name in ("ego_view", "left_wrist", "right_wrist"):
             age = None

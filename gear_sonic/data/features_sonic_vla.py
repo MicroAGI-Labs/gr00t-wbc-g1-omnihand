@@ -24,6 +24,18 @@ WRIST_VIEW_HEIGHT: int = 480
 WRIST_VIEW_WIDTH: int = 640
 FPS: int = 50
 
+# Dataset field -> (selected stream, wire field, conversion to stored units).
+CAPTURE_SOURCE_FIELDS = {
+    "robot_state_sequence": ("proprio", "index", 1),
+    "camera_sequence": ("camera", "publisher_sequence", 1),
+    "camera_publish_monotonic_ns": ("camera", "publisher_monotonic_ns", 1),
+    "hand_state_sequence": ("hand", "sequence", 1),
+    "hand_state_source_monotonic_ns": ("hand", "monotonic_ns", 1),
+    "hand_intent_sequence": ("hand", "intent_sequence", 1),
+    "pico_pose_sequence": ("sonic", "frame_index", 1),
+    "pico_pose_sample_monotonic_ns": ("sonic", "timestamp_monotonic", 1_000_000_000),
+}
+
 
 _JOINT_GROUPS_FOR_STATE: list[str] = [
     "left_leg",
@@ -483,10 +495,9 @@ def get_features_sonic_vla(
             "shape": (1,),
             "names": ["sync_target_monotonic_ns"],
         },
-        "capture.camera_sequence": {
-            "dtype": "int64",
-            "shape": (1,),
-            "names": ["camera_sequence"],
+        **{
+            f"capture.{name}": {"dtype": "int64", "shape": (1,), "names": [name]}
+            for name in CAPTURE_SOURCE_FIELDS
         },
         "capture.camera_capture_age_ms": {
             "dtype": "float32",
