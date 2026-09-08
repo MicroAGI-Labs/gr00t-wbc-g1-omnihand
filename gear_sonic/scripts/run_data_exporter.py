@@ -183,6 +183,10 @@ class TimeDeltaException(Exception):
         super().__init__(self.message)
 
 
+class TeleopInputUnavailable(RuntimeError):
+    """PICO input is unavailable while hand feedback remains healthy."""
+
+
 def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
     """Unpack a single-frame packed message from pico_manager_thread_server.
 
@@ -367,6 +371,7 @@ class GrootDataCollector:
         self._next_target_ns: int | None = None
         self._recording_stop_target_ns: int | None = None
         self._synchronization_errors: list[str] = []
+        self._synchronization_warnings: list[str] = []
         self._synchronization_skipped_targets = 0
         self.latest_hand_state = None
 
@@ -565,6 +570,7 @@ class GrootDataCollector:
                 "next_target_monotonic_ns": self._next_target_ns,
                 "skipped_targets": self._synchronization_skipped_targets,
                 "errors": self._synchronization_errors[-5:],
+                "warnings": self._synchronization_warnings[-5:],
                 "buffers": self._synchronizer.status(),
             },
             "finalizer": finalizer,
@@ -646,11 +652,6 @@ class GrootDataCollector:
     ]:
         if hand_state.get("mode") == "fault":
             raise RuntimeError("external hand controller is faulted")
-        if hand_state.get("input_stale") or hand_state.get("intent_sequence") is None:
-            raise RuntimeError("external hand target is missing or stale")
-        for side in ("left", "right"):
-            if hand_state.get("sides", {}).get(side, {}).get("intent_closed") is None:
-                raise RuntimeError(f"external {side} hand has no valid click intent")
         values = []
         for field in ("requested_position_rad", "applied_position_rad", "measured_position_rad"):
             for side in ("left", "right"):
@@ -661,6 +662,12 @@ class GrootDataCollector:
                 if array.shape != (self.hand_profile.width,) or not np.all(np.isfinite(array)):
                     raise RuntimeError(f"external {side} {field} has the wrong shape")
                 values.append(array)
+        # Check feedback first so a PICO interruption cannot hide a hand fault.
+        if hand_state.get("input_stale") or hand_state.get("intent_sequence") is None:
+            raise TeleopInputUnavailable("external hand target is missing or stale")
+        for side in ("left", "right"):
+            if hand_state["sides"][side].get("intent_closed") is None:
+                raise TeleopInputUnavailable(f"external {side} hand has no valid click intent")
         return tuple(values)
 
     def _episode_validation(self, *, discarded: bool, reason: str) -> dict[str, object]:
@@ -682,6 +689,7 @@ class GrootDataCollector:
         return {
             "passed": not discarded and not errors,
             "errors": errors,
+            "warnings": list(self._synchronization_warnings),
             "synchronization": {
                 "delay_ms": self.synchronization_delay_ns / 1e6,
                 "wait_timeout_ms": self.synchronization_wait_timeout_ns / 1e6,
@@ -785,6 +793,7 @@ class GrootDataCollector:
                 self._next_target_ns = started_ns
                 self._recording_stop_target_ns = None
                 self._synchronization_errors = []
+                self._synchronization_warnings = []
                 self._synchronization_skipped_targets = 0
                 self._episode_camera_stats_start = (
                     self._image_subscriber.buffer_stats()
@@ -1097,23 +1106,13 @@ class GrootDataCollector:
                 errors.append(f"camera {camera_name} is {age * 1000:.1f} ms old")
         return errors
 
-    def _selected_hand_errors(self, selection: CausalSelection) -> list[str]:
-        if self.hand_config is None:
-            return []
-        hand = selection.samples.get("hand")
-        if hand is None:
-            return ["hand has no causal sample"]
-        try:
-            self._external_hand_values(hand.value)
-        except RuntimeError as exc:
-            return [str(exc)]
-        return []
-
     def _record_synchronization_gap(
         self,
         target_ns: int,
         reasons: list[str],
         now_ns: int,
+        *,
+        recoverable: bool = False,
     ) -> None:
         relative_ms = (
             0.0
@@ -1121,8 +1120,6 @@ class GrootDataCollector:
             else (target_ns - self._recording_start_target_ns) / 1e6
         )
         detail = f"target {relative_ms:.1f} ms: {'; '.join(reasons)}"
-        if len(self._synchronization_errors) < 100:
-            self._synchronization_errors.append(detail)
         start_ns = self._recording_start_target_ns or target_ns
         earliest_ns = max(target_ns + self.loop_period_ns, now_ns - self.synchronization_delay_ns)
         tick = max(0, (earliest_ns - start_ns + self.loop_period_ns - 1) // self.loop_period_ns)
@@ -1130,6 +1127,12 @@ class GrootDataCollector:
         skipped = max(1, (resynchronized_ns - target_ns) // self.loop_period_ns)
         self._synchronization_skipped_targets += skipped
         self._next_target_ns = resynchronized_ns
+        issues = self._synchronization_warnings if recoverable else self._synchronization_errors
+        if len(issues) < 100:
+            issues.append(
+                f"{detail}; skipped {skipped} target(s) before frame "
+                f"{self.data_exporter.episode_buffer['size']}"
+            )
         print(f"[Synchronization] {detail}; skipped {skipped} target(s)")
 
     def _add_data_frame(self):
@@ -1158,10 +1161,17 @@ class GrootDataCollector:
 
         selection = self._selection_for_target(target_ns)
         sample_errors = []
-        if selection.ready:
+        input_warnings = []
+        if "camera" in selection.samples:
             sample_errors.extend(self._selected_camera_errors(selection))
-            sample_errors.extend(self._selected_hand_errors(selection))
-        if not selection.ready or sample_errors:
+        if self.hand_config is not None and "hand" in selection.samples:
+            try:
+                self._external_hand_values(selection.samples["hand"].value)
+            except TeleopInputUnavailable as exc:
+                input_warnings.append(str(exc))
+            except (RuntimeError, TypeError, ValueError) as exc:
+                sample_errors.append(str(exc))
+        if not selection.ready or sample_errors or input_warnings:
             deadline_ns = (
                 target_ns
                 + self.synchronization_delay_ns
@@ -1177,7 +1187,12 @@ class GrootDataCollector:
             if selection.stale:
                 reasons.append(f"past sample too old: {', '.join(selection.stale)}")
             reasons.extend(sample_errors)
-            self._record_synchronization_gap(target_ns, reasons, now_ns)
+            reasons.extend(input_warnings)
+            unavailable = set(selection.waiting + selection.missing + selection.stale)
+            self._record_synchronization_gap(
+                target_ns, reasons, now_ns,
+                recoverable=not sample_errors and unavailable <= {"manager", "sonic", "planner"},
+            )
             return False
 
         if not self._add_data_frame_sonic(t_start, selection):

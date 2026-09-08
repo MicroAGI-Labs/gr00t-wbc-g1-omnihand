@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import json
 import time
 from types import SimpleNamespace
 
@@ -103,6 +104,7 @@ def _recording_collector():
     collector._next_target_ns = collector._recording_start_target_ns
     collector._recording_stop_target_ns = None
     collector._synchronization_errors = []
+    collector._synchronization_warnings = []
     collector._synchronization_skipped_targets = 0
     collector.latest_image_msg = None
     collector.latest_image_received_at = None
@@ -474,6 +476,82 @@ def test_collector_waits_for_watermarks_then_records_a_bounded_gap(monkeypatch):
     assert collector._synchronization_skipped_targets > 0
     collector._finish_recording(discarded=False, reason="")
     assert collector.episode_finalizer.jobs[0]["discarded"] is True
+
+
+@pytest.mark.parametrize("mode,dropout,failure", [
+    (1, "all", None), (5, "all", None), (1, "pose", None), (5, "pose", None), (5, "hand", None),
+    (5, "all", "camera"), (5, "all", "proprio"), (5, "all", "hand"),
+    (5, "all", "hand_fault"), (5, "all", "hand_invalid"),
+])
+def test_pico_dropout_preserves_take_without_hiding_hardware_failures(
+    tmp_path, monkeypatch, mode, dropout, failure
+):
+    collector = _recording_collector()
+    exporter = Gr00tDataExporter.create(
+        save_root=tmp_path / "dataset", fps=50, task="reconnect",
+        features={"capture.sync_target_monotonic_ns": {"dtype": "int64", "shape": (1,), "names": ["target"]}},
+        modality_config={"state": {}, "action": {}, "video": {}, "annotation": {}},
+    )
+    collector.data_exporter = exporter
+    collector.hand_config = {"session_id": "session"}
+    collector.hand_profile = OMNIHAND_O10
+    base = collector._next_target_ns
+    now = base
+    monkeypatch.setattr("gear_sonic.scripts.run_data_exporter.time.monotonic_ns", lambda: now)
+    recorded = []
+
+    def add_frame(_start, selection):
+        recorded.append(selection.target_ns)
+        exporter.add_frame({"capture.sync_target_monotonic_ns": np.asarray([selection.target_ns], dtype=np.int64)})
+        return True
+
+    collector._add_data_frame_sonic = add_frame
+    active = "sonic" if mode == 1 else "planner"
+    lost = {"all": {"manager", active}, "pose": {active}, "hand": set()}[dropout]
+    for tick in range(81):
+        now = base + tick * collector.loop_period_ns
+        interrupted = 6 <= tick < 56  # PICO stops for exactly one second, then resumes.
+        hand = {
+            "mode": "fault" if interrupted and failure == "hand_fault" else "tracking",
+            "input_stale": interrupted and dropout in {"all", "hand"}, "intent_sequence": tick,
+            "sides": {
+                side: {"valid": True, "connected": not (interrupted and failure == "hand_invalid"),
+                       "intent_closed": False, **{f"{field}_position_rad": np.zeros(10)
+                                                   for field in ("requested", "applied", "measured")}}
+                for side in ("left", "right")
+            },
+        }
+        for stream, value in (
+            ("proprio", {}), ("camera", {}), ("manager", {"stream_mode": mode}),
+            (active, {}), ("hand", hand),
+        ):
+            if not interrupted or stream not in lost | {failure}:
+                collector._synchronizer.observe(stream, value, now)
+        collector._add_data_frame()
+
+    assert recorded[0] == base
+    assert recorded[-1] > base + 1_120_000_000
+    assert not any(base + 400_000_000 <= stamp < base + 1_120_000_000 for stamp in recorded)
+    assert collector.current_episode_index == 0
+    assert collector._synchronization_skipped_targets > 0
+    collector._finish_recording(discarded=False, reason="")
+    [job] = collector.episode_finalizer.jobs
+    assert job["discarded"] is (failure is not None)
+    assert job["validation"]["passed"] is (failure is None)
+    if failure is None:
+        assert job["validation"]["errors"] == []
+        assert "before frame" in job["validation"]["warnings"][0]
+    else:
+        assert job["validation"]["errors"]
+    exporter.save_episode(
+        job["episode_buffer"], video_writers=job["video_writers"],
+        discarded=job["discarded"], validation=job["validation"],
+    )
+    quality = json.loads((exporter.root / "meta/info.json").read_text())["episode_quality"]["0"]
+    assert quality["validation"] == job["validation"]
+    assert quality["discarded"] is (failure is not None)
+    table = pq.read_table(exporter.root / exporter.meta.get_data_file_path(0))
+    assert table["capture.sync_target_monotonic_ns"].to_pylist() == recorded
 
 
 @pytest.mark.parametrize("camera_hz", [30, 60])
