@@ -377,7 +377,8 @@ There are two ways to control recording: **PICO VR controllers** (recommended du
 | **Y + A** | **Discard on release** — saves the active episode flagged for removal during post-processing |
 
 These recording controls work in any manager mode (POSE, PLANNER, etc.). When no
-recording is active, A+X keeps its usual mode-switching behavior. The four-button
+recording is active, switching modes requires two A+X press-and-release gestures
+within two seconds. Saving an active take still takes one gesture. The four-button
 policy start/stop gesture remains separate and does not trigger save or discard.
 
 **Keyboard over ZMQ:**

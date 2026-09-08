@@ -2150,7 +2150,7 @@ def run_pico_manager(
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
-      A+X: Save active recording; otherwise toggle between planner and pose mode
+      A+X: Save active recording; otherwise twice within 2s toggles planner/pose mode
       A+B+X+Y: Toggle policy start/stop
       B+Y: Toggle pose/frozen-upper-body mode
       X+B: Start/stop-success recording
@@ -2223,7 +2223,7 @@ def run_pico_manager(
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
     print(
-        "Manager controls: A+X=save while recording, otherwise toggle mode, "
+        "Manager controls: A+X=save while recording, otherwise twice within 2s to toggle mode, "
         "B+Y=frozen upper body, X+B=record/save, Y+A=discard, "
         "A+B+X+Y=start/stop policy"
     )
@@ -2234,6 +2234,7 @@ def run_pico_manager(
     recorder_is_recording = False
     recorder_command_timestamp = 0.0
     face_chords = FaceChordTracker()
+    ax_first_release_at: float | None = None
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
@@ -2279,6 +2280,7 @@ def run_pico_manager(
                 prev_start_combo = False
                 prev_left_axis_click = False
                 face_chords.reset()
+                ax_first_release_at = None
                 print(
                     "[Manager] Teleop reconnected; policy remains OFF. "
                     "Use A+B+X+Y to recalibrate/start when ready."
@@ -2310,7 +2312,18 @@ def run_pico_manager(
 
             # Consume A+X as save during recording, before evaluating mode changes.
             save_recording = face_command == "ax" and recorder_is_recording
-            ax_pressed = face_command == "ax" and not save_recording
+            ax_pressed = False
+            if recorder_is_recording or start_combo or face_command not in (None, "ax"):
+                ax_first_release_at = None
+            elif face_command == "ax":
+                released_at = time.monotonic()
+                ax_pressed = (
+                    ax_first_release_at is not None
+                    and 0 <= released_at - ax_first_release_at <= 2.0
+                )
+                ax_first_release_at = None if ax_pressed else released_at
+                if not ax_pressed:
+                    print("[Manager] A+X registered; press and release again within 2s to switch mode")
 
             # B+Y remains the POSE/frozen-upper-body mode gesture.
             by_pressed = face_command == "by"
@@ -2376,6 +2389,7 @@ def run_pico_manager(
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
+                ax_first_release_at = None
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
 
