@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import json
 import time
 from types import SimpleNamespace
 
@@ -22,6 +23,7 @@ from gear_sonic.end_effectors.protocol import HAND_STATE_SCHEMA, HAND_STATE_TOPI
 from gear_sonic.scripts.run_camera_web_viewer import CameraWebViewerConfig, RecorderControlHub
 from gear_sonic.scripts.run_data_exporter import GrootDataCollector
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
+from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message
 
 
 class FakeImageSubscriber:
@@ -102,10 +104,11 @@ def _recording_collector():
     collector._next_target_ns = collector._recording_start_target_ns
     collector._recording_stop_target_ns = None
     collector._synchronization_errors = []
+    collector._synchronization_warnings = []
     collector._synchronization_skipped_targets = 0
     collector.latest_image_msg = None
     collector.latest_image_received_at = None
-    collector.sonic_timing_monitor = type("Monitor", (), {"reset": lambda self: None})()
+    collector.sonic_timing_monitor = SimpleNamespace(reset=lambda: None, log_time_delta=lambda _dt: None)
     collector._initial_yaw = 1.0
     collector._recording_message = "Recording episode 0"
     collector._last_finalization = None
@@ -174,6 +177,107 @@ def test_recorded_body_state_round_trips_and_resumes(tmp_path, body_state_collec
         assert table["observation.base_angular_velocity"][0].as_py() == [0.5, -1.0, 2.0]
     np.testing.assert_array_equal(table["action.motion_token"][0].as_py(), np.zeros(64))
     np.testing.assert_array_equal(table["action.motion_token"][-1].as_py(), np.arange(64))
+
+
+@pytest.fixture
+def pose_messages():
+    return {
+        "smpl_msg": {"smpl_joints": np.arange(72).reshape(24, 3), "smpl_pose": np.zeros(63),
+                     "body_quat_w": np.array([1.0, 0.0, 0.0, 0.0])},
+        "planner_msg": {"planner_mode": 0, "planner_speed": 0.5, "planner_height": -1.0,
+                        "vr_3pt_position": np.zeros(9),
+                        "vr_3pt_orientation": np.array([2, 0, 0, 0, 0, -3, 0, 0, 0.5, 0.5, 0.5, 0.5])},
+    }
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_recorded_pose_channels_round_trip_and_resume(tmp_path, body_state_collector, pose_messages, legacy):
+    collector = body_state_collector
+    features = dict(collector.data_exporter.features)
+    new_fields = {"teleop.vr_3pt_orientation_wxyz", "teleop.vr_3pt_valid", "teleop.smpl_valid"}
+    if legacy:
+        for key in new_fields:
+            del collector.data_exporter.features[key]
+    frames = []
+    for mode in (0, 1, 2, 3, 4, 5):
+        collector._add_sonic_pose_features(frame := {}, stream_mode=mode, target_ns=0, **pose_messages)
+        frames.append(frame)
+    kwargs = dict(
+        save_root=tmp_path / "dataset", fps=50, task="poses",
+        features={key: features[key] for key in frames[0]},
+        modality_config={"state": {}, "action": {}, "video": {}, "annotation": {}},
+    )
+    exporter = Gr00tDataExporter.create(**kwargs)
+    for frame in frames:
+        exporter.add_frame(frame)
+    exporter.save_episode()
+    resumed = Gr00tDataExporter.create(**(kwargs | {"features": features}))
+    collector.data_exporter = resumed
+    collector._add_sonic_pose_features(frame := {}, stream_mode=5, target_ns=0, **pose_messages)
+    resumed.add_frame(frame)
+    resumed.save_episode()
+    assert resumed.meta.total_frames == 7
+    table = pq.read_table(resumed.root / resumed.meta.get_data_file_path(0))
+    if legacy:
+        assert not new_fields.intersection(table.column_names)
+    else:
+        assert table["teleop.smpl_valid"].to_pylist() == [0, 1, 0, 0, 0, 0]
+        assert table["teleop.vr_3pt_valid"].to_pylist() == [0, 0, 1, 1, 0, 1]
+        assert table["teleop.vr_3pt_valid"].type.bit_width == 8
+        assert table["teleop.vr_3pt_orientation_wxyz"].type.value_type.bit_width == 32
+        np.testing.assert_array_equal(table["teleop.vr_3pt_orientation_wxyz"][0].as_py(), np.zeros(12))
+        np.testing.assert_array_equal(
+            table["teleop.vr_3pt_orientation_wxyz"][5].as_py(), pose_messages["planner_msg"]["vr_3pt_orientation"]
+        )
+    np.testing.assert_array_equal(table["teleop.smpl_joints"][1].as_py(), np.arange(72))
+    np.testing.assert_array_equal(
+        table["teleop.vr_3pt_orientation"][5].as_py(), [1, 0, 0, 0, 1, 0, 1, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0, 1]
+    )
+
+
+@pytest.mark.parametrize("message,key,width", [
+    ("smpl_msg", "smpl_joints", 72), ("smpl_msg", "smpl_pose", 63), ("smpl_msg", "body_quat_w", 4),
+    ("planner_msg", "vr_3pt_position", 9), ("planner_msg", "vr_3pt_orientation", 12),
+])
+@pytest.mark.parametrize("bad_value", [None, [], [0.0], np.nan, np.inf, "bad"])
+def test_incomplete_pose_is_flagged_and_finite(
+    body_state_collector, pose_messages, message, key, width, bad_value
+):
+    pose_messages[message][key] = np.full(width, bad_value) if np.isscalar(bad_value) else bad_value
+    is_smpl = message == "smpl_msg"
+    frame = {}
+    body_state_collector._add_sonic_pose_features(
+        frame, stream_mode=1 if is_smpl else 5, target_ns=0, **pose_messages
+    )
+    assert frame["teleop.smpl_valid" if is_smpl else "teleop.vr_3pt_valid"].item() == 0
+    assert all(np.all(np.isfinite(value)) for value in frame.values())
+
+
+@pytest.mark.parametrize("message,key,width", [("smpl_msg", "body_quat_w", 4),
+                                               ("planner_msg", "vr_3pt_orientation", 12)])
+def test_zero_quaternion_is_unavailable(body_state_collector, pose_messages, message, key, width):
+    pose_messages[message][key][:4] = 0  # One bad quaternion invalidates the VR orientation vector.
+    frame = {}
+    body_state_collector._add_sonic_pose_features(
+        frame, stream_mode=1 if width == 4 else 5, target_ns=0, **pose_messages
+    )
+    assert frame["teleop.smpl_valid" if width == 4 else "teleop.vr_3pt_valid"].item() == 0
+    assert all(np.all(np.isfinite(value)) for value in frame.values())
+
+
+def test_missing_smpl_pose_on_wire_is_not_a_valid_zero_pose(body_state_collector):
+    collector = body_state_collector
+    raw = pack_pose_message({"smpl_joints": np.ones((1, 24, 3)), "body_quat_w": np.array([[1., 0., 0., 0.]])})
+    collector._handle_pose_message(raw, received_ns=1)
+    collector._handle_pose_message(raw, received_ns=3)
+    selected = collector._synchronizer.select(2, required_streams=("sonic",), max_age_ns={})
+    assert selected.ready
+    message = selected.samples["sonic"].value
+    assert message["smpl_pose"] is None
+    collector._add_sonic_pose_features(frame := {}, stream_mode=1, target_ns=2, smpl_msg=message, planner_msg=None)
+    assert frame["teleop.smpl_valid"].item() == 0
+    np.testing.assert_array_equal(frame["teleop.smpl_joints"], np.ones(72))
+    np.testing.assert_array_equal(frame["teleop.smpl_pose"], np.zeros(63))
 
 
 @pytest.mark.parametrize("key,bad_value", [
@@ -372,6 +476,82 @@ def test_collector_waits_for_watermarks_then_records_a_bounded_gap(monkeypatch):
     assert collector._synchronization_skipped_targets > 0
     collector._finish_recording(discarded=False, reason="")
     assert collector.episode_finalizer.jobs[0]["discarded"] is True
+
+
+@pytest.mark.parametrize("mode,dropout,failure", [
+    (1, "all", None), (5, "all", None), (1, "pose", None), (5, "pose", None), (5, "hand", None),
+    (5, "all", "camera"), (5, "all", "proprio"), (5, "all", "hand"),
+    (5, "all", "hand_fault"), (5, "all", "hand_invalid"),
+])
+def test_pico_dropout_preserves_take_without_hiding_hardware_failures(
+    tmp_path, monkeypatch, mode, dropout, failure
+):
+    collector = _recording_collector()
+    exporter = Gr00tDataExporter.create(
+        save_root=tmp_path / "dataset", fps=50, task="reconnect",
+        features={"capture.sync_target_monotonic_ns": {"dtype": "int64", "shape": (1,), "names": ["target"]}},
+        modality_config={"state": {}, "action": {}, "video": {}, "annotation": {}},
+    )
+    collector.data_exporter = exporter
+    collector.hand_config = {"session_id": "session"}
+    collector.hand_profile = OMNIHAND_O10
+    base = collector._next_target_ns
+    now = base
+    monkeypatch.setattr("gear_sonic.scripts.run_data_exporter.time.monotonic_ns", lambda: now)
+    recorded = []
+
+    def add_frame(_start, selection):
+        recorded.append(selection.target_ns)
+        exporter.add_frame({"capture.sync_target_monotonic_ns": np.asarray([selection.target_ns], dtype=np.int64)})
+        return True
+
+    collector._add_data_frame_sonic = add_frame
+    active = "sonic" if mode == 1 else "planner"
+    lost = {"all": {"manager", active}, "pose": {active}, "hand": set()}[dropout]
+    for tick in range(81):
+        now = base + tick * collector.loop_period_ns
+        interrupted = 6 <= tick < 56  # PICO stops for exactly one second, then resumes.
+        hand = {
+            "mode": "fault" if interrupted and failure == "hand_fault" else "tracking",
+            "input_stale": interrupted and dropout in {"all", "hand"}, "intent_sequence": tick,
+            "sides": {
+                side: {"valid": True, "connected": not (interrupted and failure == "hand_invalid"),
+                       "intent_closed": False, **{f"{field}_position_rad": np.zeros(10)
+                                                   for field in ("requested", "applied", "measured")}}
+                for side in ("left", "right")
+            },
+        }
+        for stream, value in (
+            ("proprio", {}), ("camera", {}), ("manager", {"stream_mode": mode}),
+            (active, {}), ("hand", hand),
+        ):
+            if not interrupted or stream not in lost | {failure}:
+                collector._synchronizer.observe(stream, value, now)
+        collector._add_data_frame()
+
+    assert recorded[0] == base
+    assert recorded[-1] > base + 1_120_000_000
+    assert not any(base + 400_000_000 <= stamp < base + 1_120_000_000 for stamp in recorded)
+    assert collector.current_episode_index == 0
+    assert collector._synchronization_skipped_targets > 0
+    collector._finish_recording(discarded=False, reason="")
+    [job] = collector.episode_finalizer.jobs
+    assert job["discarded"] is (failure is not None)
+    assert job["validation"]["passed"] is (failure is None)
+    if failure is None:
+        assert job["validation"]["errors"] == []
+        assert "before frame" in job["validation"]["warnings"][0]
+    else:
+        assert job["validation"]["errors"]
+    exporter.save_episode(
+        job["episode_buffer"], video_writers=job["video_writers"],
+        discarded=job["discarded"], validation=job["validation"],
+    )
+    quality = json.loads((exporter.root / "meta/info.json").read_text())["episode_quality"]["0"]
+    assert quality["validation"] == job["validation"]
+    assert quality["discarded"] is (failure is not None)
+    table = pq.read_table(exporter.root / exporter.meta.get_data_file_path(0))
+    assert table["capture.sync_target_monotonic_ns"].to_pylist() == recorded
 
 
 @pytest.mark.parametrize("camera_hz", [30, 60])

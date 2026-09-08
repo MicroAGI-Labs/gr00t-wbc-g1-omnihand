@@ -165,7 +165,9 @@ The recorder uses Thor's monotonic clock as its master timeline and runs 100 ms 
 
 Robot state, camera packets, and manager state are always required. Active POSE mode additionally requires a past SONIC pose; active planner modes require a past planner command; and external-hand collection requires a past hand state. POSE_PAUSE requires no advancing SONIC pose because that mode intentionally stops publishing poses. Every selected sample must remain within its stream-specific maximum age.
 
-If a stream has not advanced, the status loop remains responsive while the target waits for up to `--synchronization-wait-timeout`. A timed-out or stale target is skipped, recorded as a synchronization error, and causes the episode to be saved as discarded for inspection. This allows live sources to reconnect without silently accepting a misaligned episode.
+If a stream has not advanced, the status loop remains responsive while the target waits for up to `--synchronization-wait-timeout`. Timed-out or stale targets are skipped. Interruptions of the PICO manager, pose, planner, or hand intent are recorded as warnings: fresh samples resume the same episode, which remains saveable. Stale poses and hand commands are never substituted into the missing frames. Robot/camera stream failures, invalid hand feedback, and physical hand reconnects still invalidate the episode.
+
+Saved quality metadata includes the warnings, skipped-target count, and the frame boundary at each reported gap. The `capture.*` timestamps preserve elapsed capture time across interruptions; the uniform LeRobot timeline alone does not show those gaps.
 
 The canonical LeRobot `timestamp` remains the uniform episode-relative timeline (`frame_index / fps`). Each Parquet row additionally stores the Thor target, selected receive timestamps, non-negative sample ages, camera sequence, and per-camera capture ages under `capture.*` features. A repeated 30 Hz image therefore has the same camera sequence in consecutive 50 Hz rows and a progressively larger causal age.
 
@@ -458,7 +460,7 @@ Key options:
 | `--minimum-camera-rate-hz` | `25.0` | Minimum live camera publish rate admitted while recording |
 | `--finalizer-shutdown-timeout` | `30.0` | Maximum shutdown wait for a pending episode commit |
 | `--synchronization-delay` | `0.1` | Recorder lookback delay used to observe stream watermarks past each target |
-| `--synchronization-wait-timeout` | `0.25` | Additional wait before a missing watermark invalidates and skips a target |
+| `--synchronization-wait-timeout` | `0.25` | Additional wait before skipping a target when a required stream has not advanced |
 | `--proprio-max-age` | `0.1` | Maximum age of the selected past robot-state sample |
 | `--teleop-max-age` | `0.2` | Maximum age of selected past manager, SONIC, or planner samples |
 | `--sonic-zmq-host` | `localhost` | SMPL pose publisher host |
@@ -510,6 +512,9 @@ Each frame contains:
 | `action.motion_token` | `(64,)` | SONIC encoder token; zero-filled when unavailable |
 | `action.motion_token_valid` | `(1,)` | uint8: 1 for a present, finite 64-value token; 0 for missing or empty tokens |
 | `teleop.target_body_orientation` | `(6,)` | Teleop target body rotation |
+| `teleop.smpl_valid` | `(1,)` | uint8: active SMPL stream with complete finite joints, pose, and body quaternion |
+| `teleop.vr_3pt_valid` | `(1,)` | uint8: active planner stream with complete finite VR positions and quaternions |
+| `teleop.vr_3pt_orientation_wxyz` | `(12,)` | Original float32 quaternions for left wrist, right wrist, and neck, each in w/x/y/z order |
 | `task_index` | scalar | Task prompt index into `meta/tasks.jsonl` |
 | `capture.sync_target_monotonic_ns` | `(1,)` | Thor master timestamp selected for this row |
 | `capture.<stream>_received_monotonic_ns` | `(1,)` | Thor receive timestamp of the selected causal sample |
@@ -521,6 +526,13 @@ The velocity channels and token-validity flag are added to new datasets. Resumin
 an older dataset preserves its schema. Missing or malformed velocities, and
 malformed nonempty tokens, mark the episode invalid through the existing quality
 report. A valid all-zero token remains distinguishable from an unavailable token.
+
+New datasets also include the pose-validity flags and original VR quaternions,
+alongside the existing 6D rotations. Inactive, missing, malformed, or non-finite
+pose components use the existing zero/identity defaults and clear the relevant
+flag; each quaternion must be nonzero. Valid components are preserved even when
+another component is unavailable. The flags describe pose payload validity;
+capture timing and episode synchronization checks still apply.
 
 ---
 
