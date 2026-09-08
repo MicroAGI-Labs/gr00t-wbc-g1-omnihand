@@ -520,6 +520,13 @@ Each frame contains:
 | `capture.<stream>_received_monotonic_ns` | `(1,)` | Thor receive timestamp of the selected causal sample |
 | `capture.<stream>_age_ms` | `(1,)` | Target minus selected receive timestamp; `-1` when the stream is inactive |
 | `capture.camera_sequence` | `(1,)` | Camera publisher sequence, repeated when a camera frame is reused |
+| `capture.robot_state_sequence` | `(1,)` | Controller state index |
+| `capture.camera_publish_monotonic_ns` | `(1,)` | Camera publisher's monotonic timestamp |
+| `capture.hand_state_sequence` | `(1,)` | Hand controller state sequence |
+| `capture.hand_state_source_monotonic_ns` | `(1,)` | Hand controller's monotonic state timestamp |
+| `capture.hand_intent_sequence` | `(1,)` | PICO intent sequence accepted by the hand controller |
+| `capture.pico_pose_sequence` | `(1,)` | Frame index from the selected SONIC pose packet |
+| `capture.pico_pose_sample_monotonic_ns` | `(1,)` | PICO reader's reported monotonic sample time, converted from seconds |
 | `capture.camera_capture_age_ms` | `(3,)` | Per-camera capture age at the target for ego, left wrist, and right wrist |
 
 The velocity channels and token-validity flag are added to new datasets. Resuming
@@ -533,6 +540,12 @@ pose components use the existing zero/identity defaults and clear the relevant
 flag; each quaternion must be nonzero. Valid components are preserved even when
 another component is unavailable. The flags describe pose payload validity;
 capture timing and episode synchronization checks still apply.
+
+New datasets preserve these source timestamps and sequences as int64 diagnostics
+from the selected causal samples; unavailable values use `-1`. Source clocks may
+differ from Thor's receive clock, so these values do not drive synchronization or
+episode rejection. Repeated source values can reveal reused samples even when
+receive timestamps advance. Older datasets keep their existing schema on resume.
 
 ---
 

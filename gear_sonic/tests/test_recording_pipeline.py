@@ -16,12 +16,12 @@ from gear_sonic.data.causal_sync import (
     TimedSample,
 )
 from gear_sonic.data.exporter import Gr00tDataExporter
-from gear_sonic.data.features_sonic_vla import get_features_sonic_vla
+from gear_sonic.data.features_sonic_vla import CAPTURE_SOURCE_FIELDS, get_features_sonic_vla
 from gear_sonic.data.robot_model.supplemental_info.g1.g1_supplemental_info import G1SupplementalInfo
 from gear_sonic.end_effectors.profiles import OMNIHAND_O10
 from gear_sonic.end_effectors.protocol import HAND_STATE_SCHEMA, HAND_STATE_TOPIC, encode
 from gear_sonic.scripts.run_camera_web_viewer import CameraWebViewerConfig, RecorderControlHub
-from gear_sonic.scripts.run_data_exporter import GrootDataCollector
+from gear_sonic.scripts.run_data_exporter import GrootDataCollector, _capture_scalar
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message
 
@@ -408,6 +408,82 @@ def test_synchronization_metadata_records_nonnegative_selected_ages():
     assert frame["capture.camera_capture_age_ms"].tolist() == [15.0, -1.0, -1.0]
     assert frame["capture.sonic_received_monotonic_ns"].item() == -1
     assert frame["capture.sonic_age_ms"].item() == -1.0
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_source_timing_round_trips_selected_samples_and_resumes(tmp_path, body_state_collector, legacy):
+    collector = body_state_collector
+    features = dict(collector.data_exporter.features)
+    if legacy:
+        for name in CAPTURE_SOURCE_FIELDS.keys() - {"camera_sequence"}:
+            del collector.data_exporter.features[f"capture.{name}"]
+    base = 2_000_000_000
+    messages = {
+        "proprio": {"index": 2**53 + 17},
+        "camera": {"publisher_sequence": 11, "publisher_monotonic_ns": 17_000_000_000},
+        "hand": {"sequence": 23, "monotonic_ns": 19_000_000_000, "intent_sequence": 42},
+    }
+    for tick in range(3):
+        received = base + tick * 20_000_000
+        for stream, message in messages.items():
+            value = message if tick < 2 else {key: 999 for key in message}
+            collector._synchronizer.observe(stream, value, received)
+        collector._handle_pose_message(pack_pose_message({
+            "smpl_joints": np.zeros((1, 24, 3)),
+            "frame_index": np.asarray([7 if tick < 2 else 999], dtype=np.int64),
+            "timestamp_monotonic": np.asarray([1234.5 if tick < 2 else 9999.0], dtype=np.float64),
+        }), received_ns=received)
+    frames = []
+    for target in (base + 10_000_000, base + 30_000_000):
+        selection = collector._synchronizer.select(
+            target, required_streams=("proprio", "camera", "hand", "sonic"), max_age_ns={}
+        )
+        assert selection.ready
+        collector._add_synchronization_features(frame := {}, selection)
+        frames.append(frame)
+    kwargs = dict(
+        save_root=tmp_path / "dataset", fps=50, task="source timing",
+        features={key: features[key] for key in frames[0]},
+        modality_config={"state": {}, "action": {}, "video": {}, "annotation": {}},
+    )
+    exporter = Gr00tDataExporter.create(**kwargs)
+    for frame in frames:
+        exporter.add_frame(frame)
+    exporter.save_episode()
+    resumed = Gr00tDataExporter.create(**(kwargs | {"features": features}))
+    collector.data_exporter = resumed
+    collector._add_synchronization_features(frame := {}, selection)
+    resumed.add_frame(frame)
+    resumed.save_episode()
+    assert resumed.meta.total_frames == 3
+    table = pq.read_table(resumed.root / resumed.meta.get_data_file_path(0))
+    expected = {
+        "robot_state_sequence": 2**53 + 17, "camera_sequence": 11,
+        "camera_publish_monotonic_ns": 17_000_000_000, "hand_state_sequence": 23,
+        "hand_state_source_monotonic_ns": 19_000_000_000, "hand_intent_sequence": 42,
+        "pico_pose_sequence": 7, "pico_pose_sample_monotonic_ns": 1_234_500_000_000,
+    }
+    for name, value in expected.items():
+        key = f"capture.{name}"
+        if legacy and name != "camera_sequence":
+            assert key not in table.column_names
+        else:
+            assert table[key].to_pylist() == [value, value]
+            assert table[key].type.bit_width == 64
+    assert table["capture.sonic_received_monotonic_ns"].to_pylist() == [base, base + 20_000_000]
+    assert table["capture.sonic_age_ms"].to_pylist() == [10.0, 10.0]
+
+
+@pytest.mark.parametrize("value,scale,expected", [
+    (None, 1, -1), ([], 1, -1), ([1, 2], 1, -1), ([[1], [2, 3]], 1, -1),
+    (True, 1, -1), (False, 1_000_000_000, -1), ("123", 1, -1), (-1, 1, -1),
+    (1.5, 1, -1), (np.nan, 1_000_000_000, -1), (np.inf, 1_000_000_000, -1),
+    (1e300, 1_000_000_000, -1), (2**63, 1, -1), (np.uint64(2**64 - 1), 1, -1),
+    (0.0, 1_000_000_000, -1), (0, 1, 0), (np.asarray([17]), 1, 17),
+    (2**63 - 1, 1, 2**63 - 1), (np.asarray([1.25]), 1_000_000_000, 1_250_000_000),
+])
+def test_source_metadata_uses_int64_or_unknown_without_lossy_sequence_conversion(value, scale, expected):
+    assert _capture_scalar(value, scale) == expected
 
 
 def test_collector_emits_target_only_after_future_watermarks_without_using_them(
