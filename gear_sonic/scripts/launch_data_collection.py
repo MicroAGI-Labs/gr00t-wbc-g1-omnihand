@@ -523,6 +523,8 @@ def main(config: DataCollectionLaunchConfig):
             f"--camera-port {config.camera_port} "
             f"--http-port {config.remote_ui_port}"
         )
+        if config.hand_backend == "omnihand":
+            viewer_cmd += " --hand-controls"
         print(f"Starting browser viewer on loopback port {config.remote_ui_port} (pane 3)...")
         _send_to_pane(3, viewer_cmd, wait=2.0)
     elif config.camera_viewer:

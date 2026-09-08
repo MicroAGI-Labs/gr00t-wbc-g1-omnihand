@@ -521,6 +521,9 @@ class GrootDataCollector:
         if self.hand_config is not None:
             hand_ready = bool(
                 self.latest_hand_state
+                and time.monotonic_ns() - self.latest_hand_state.get("received_monotonic_ns", 0)
+                <= self.hand_state_max_age * 1e9
+                and self.latest_hand_state.get("mode") != "fault"
                 and not self.latest_hand_state.get("input_stale", True)
                 and self.latest_hand_state.get("intent_sequence") is not None
                 and all(
@@ -609,7 +612,11 @@ class GrootDataCollector:
                 continue
             received_ns = time.monotonic_ns()
             state["received_monotonic_ns"] = received_ns
+            previous = self.latest_hand_state
             self.latest_hand_state = state
+            if previous is not None and state.get("connection_id") != previous.get("connection_id"):
+                if self._next_target_ns is not None and len(self._synchronization_errors) < 100:
+                    self._synchronization_errors.append("hand reconnected during recording")
             self._synchronizer.observe("hand", state, received_ns)
 
     def _external_hand_values(

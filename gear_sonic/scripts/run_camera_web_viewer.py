@@ -23,6 +23,13 @@ import tyro
 import zmq
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema, SensorClient
+from gear_sonic.end_effectors.protocol import (
+    HAND_CONTROL_SCHEMA,
+    HAND_CONTROL_TOPIC,
+    HAND_STATE_TOPIC,
+    decode_state,
+    encode,
+)
 
 _INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -45,6 +52,7 @@ _INDEX_HTML = """<!doctype html>
     .recorder { width: min(1100px, 100%); display: flex; align-items: center;
                 gap: 12px; padding: 12px 14px; box-sizing: border-box;
                 background: #1b222b; border: 1px solid #303a46; border-radius: 8px; }
+    .recorder[hidden] { display: none; }
     #record-state { min-width: 96px; padding: 6px 10px; text-align: center;
                     font-weight: 700; border-radius: 999px; background: #303a46; }
     #record-state.recording { background: #b4232f; color: white; animation: pulse 1.2s infinite; }
@@ -74,6 +82,10 @@ _INDEX_HTML = """<!doctype html>
       <button id="record-toggle" disabled>Start Recording</button>
       <button id="record-discard" class="discard" disabled>Discard</button>
     </section>
+    <section id="hand-controls" class="recorder" hidden>
+      <div class="recorder-info" id="hand-status">Waiting for hand controller…</div>
+      <button id="hand-reconnect">Reconnect Hands</button>
+    </section>
   </main>
   <script>
     const cameraStatus = document.getElementById('camera-status');
@@ -83,6 +95,39 @@ _INDEX_HTML = """<!doctype html>
     const recordToggle = document.getElementById('record-toggle');
     const recordDiscard = document.getElementById('record-discard');
     let commandPending = false;
+    const handControls = document.getElementById('hand-controls');
+    const handStatus = document.getElementById('hand-status');
+    const handReconnect = document.getElementById('hand-reconnect');
+
+    async function updateHandStatus() {
+      try {
+        const status = await (await fetch('/hands/status', {cache: 'no-store'})).json();
+        handControls.hidden = !status.enabled;
+        const mode = status.mode === 'fault' ? 'FAULT' : (status.connected ? 'CONNECTED' : 'OFFLINE / RECOVERING');
+        const age = status.last_status_age_s == null
+          ? 'unknown' : `${Math.round(status.last_status_age_s * 1000)} ms`;
+        handStatus.textContent = `Hands: ${mode} · status age ${age}`
+          + (status.connection_error ? ` · ${status.connection_error}` : '');
+      } catch (_) {
+        handStatus.textContent = 'Hand status unavailable';
+      }
+    }
+
+    handReconnect.addEventListener('click', async () => {
+      handReconnect.disabled = true;
+      try {
+        const response = await fetch('/hands/reconnect', {
+          method: 'POST', headers: {'X-Sonic-Command': 'reconnect'}
+        });
+        const result = await response.json();
+        if (!response.ok || !result.accepted) throw new Error(result.error || 'Reconnect request failed');
+        handStatus.textContent = 'Hand reconnect requested…';
+      } catch (error) {
+        handStatus.textContent = error.message;
+      } finally {
+        setTimeout(() => { handReconnect.disabled = false; }, 1000);
+      }
+    });
 
     async function updateCameraStatus() {
       try {
@@ -159,6 +204,8 @@ _INDEX_HTML = """<!doctype html>
     updateCameraStatus(); updateRecorderStatus();
     setInterval(updateCameraStatus, 1500);
     setInterval(updateRecorderStatus, 500);
+    updateHandStatus();
+    setInterval(updateHandStatus, 500);
   </script>
 </body>
 </html>
@@ -198,6 +245,13 @@ class CameraWebViewerConfig:
 
     recording_status_port: int = 5581
     """ZMQ SUB port used to receive recorder status."""
+
+    hand_controls: bool = False
+    """Show status and reconnect controls for the external hand controller."""
+
+    hand_state_endpoint: str = "tcp://localhost:5570"
+    hand_control_endpoint: str = "tcp://127.0.0.1:5572"
+    hand_state_max_age: float = 0.2
 
 
 class CameraFrameHub:
@@ -281,6 +335,8 @@ class RecorderControlHub:
         self._lock = threading.Lock()
         self._status: dict[str, object] | None = None
         self._status_received_at = 0.0
+        self._hand_status: dict | None = None
+        self._hand_received_at = 0.0
         self._running = True
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -306,6 +362,36 @@ class RecorderControlHub:
         payload["last_status_age_s"] = round(age, 3) if age is not None else None
         return payload
 
+    def hands_status(self) -> dict:
+        with self._lock:
+            payload = dict(self._hand_status or {})
+            age = max(0.0, time.monotonic() - self._hand_received_at) if payload else None
+        sides = payload.get("sides", {})
+        payload.update(
+            enabled=self.config.hand_controls,
+            connected=age is not None
+            and age <= self.config.hand_state_max_age
+            and bool(sides)
+            and all(side.get("valid") and side.get("connected") for side in sides.values()),
+            last_status_age_s=age,
+        )
+        return payload
+
+    def reconnect_hands(self) -> dict:
+        if not self.config.hand_controls:
+            return {"accepted": False, "error": "Hand controls are disabled"}
+        # Each HTTP request owns its socket; no ZMQ socket crosses threads.
+        with zmq.Context() as context, context.socket(zmq.REQ) as request:
+            request.setsockopt(zmq.LINGER, 0)
+            request.setsockopt(zmq.SNDTIMEO, 500)
+            request.setsockopt(zmq.RCVTIMEO, 500)
+            request.connect(self.config.hand_control_endpoint)
+            try:
+                request.send(encode(HAND_CONTROL_TOPIC, {"schema": HAND_CONTROL_SCHEMA, "action": "reconnect"}))
+                return request.recv_json()
+            except zmq.Again:
+                return {"accepted": False, "error": "Hand controller did not acknowledge; check hand status"}
+
     def _run(self) -> None:
         context = zmq.Context()
         command_socket = context.socket(zmq.PUB)
@@ -319,6 +405,12 @@ class RecorderControlHub:
         )
         poller = zmq.Poller()
         poller.register(status_socket, zmq.POLLIN)
+        hand_socket = context.socket(zmq.SUB)
+        hand_socket.setsockopt(zmq.SUBSCRIBE, HAND_STATE_TOPIC)
+        hand_socket.setsockopt(zmq.RCVHWM, 4)
+        if self.config.hand_controls:
+            hand_socket.connect(self.config.hand_state_endpoint)
+            poller.register(hand_socket, zmq.POLLIN)
         self._ready.set()
         try:
             while self._running:
@@ -327,14 +419,24 @@ class RecorderControlHub:
                         command_socket.send_string(self._commands.get_nowait())
                 except queue.Empty:
                     pass
-                if status_socket in dict(poller.poll(50)):
+                readable = dict(poller.poll(50))
+                if status_socket in readable:
                     payload = status_socket.recv_json()
                     with self._lock:
                         self._status = payload
                         self._status_received_at = time.monotonic()
+                if hand_socket in readable:
+                    try:
+                        payload = decode_state(hand_socket.recv())
+                    except ValueError:
+                        continue
+                    with self._lock:
+                        self._hand_status = payload
+                        self._hand_received_at = time.monotonic()
         finally:
             command_socket.close(linger=0)
             status_socket.close(linger=0)
+            hand_socket.close(linger=0)
             context.term()
 
 
@@ -416,6 +518,8 @@ def make_handler(
             elif path == "/recording/status":
                 payload = json.dumps(recorder_hub.status()).encode("utf-8")
                 self._send_bytes("application/json", payload)
+            elif path == "/hands/status":
+                self._send_bytes("application/json", json.dumps(recorder_hub.hands_status()).encode())
             elif path == "/snapshot.jpg":
                 _, jpeg = frame_hub.wait_for_jpeg(-1, timeout=2.0)
                 if jpeg is None:
@@ -433,6 +537,13 @@ def make_handler(
                 recorder_hub.send("c")
             elif path == "/recording/discard":
                 recorder_hub.send("x")
+            elif path == "/hands/reconnect":
+                if self.headers.get("X-Sonic-Command") != "reconnect":
+                    self.send_error(HTTPStatus.BAD_REQUEST, "Missing hand command header")
+                    return
+                result = recorder_hub.reconnect_hands()
+                self._send_bytes("application/json", json.dumps(result).encode())
+                return
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return

@@ -15,6 +15,8 @@ HAND_INTENT_SCHEMA = "sonic.hand_intent.v1"
 HAND_CONFIG_SCHEMA = "sonic.hand_config.v1"
 HAND_STATE_SCHEMA = "sonic.hand_state.v1"
 HAND_SIM_FEEDBACK_SCHEMA = "sonic.hand_sim_feedback.v1"
+HAND_CONTROL_TOPIC = b"hand_control"
+HAND_CONTROL_SCHEMA = "sonic.hand_control.v1"
 
 
 class HandProtocolError(ValueError):
@@ -40,6 +42,13 @@ def decode(raw: bytes, topic: bytes | str, schema: str) -> dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("schema") != schema:
         actual = payload.get("schema") if isinstance(payload, dict) else None
         raise HandProtocolError(f"expected schema {schema}, got {actual!r}")
+    return payload
+
+
+def decode_control(raw: bytes) -> dict[str, Any]:
+    payload = decode(raw, HAND_CONTROL_TOPIC, HAND_CONTROL_SCHEMA)
+    if payload.get("action") != "reconnect":
+        raise HandProtocolError("unsupported hand control action")
     return payload
 
 

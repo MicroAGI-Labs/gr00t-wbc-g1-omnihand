@@ -15,8 +15,8 @@ import numpy as np
 import zmq
 
 from .backends.base import HandBackend
-from .backends.mujoco import MuJoCoHandTransport, MuJoCoSimHandBackend
-from .backends.omnihand import OmniHandBackend, vendor_output_to_stderr
+from .backends.mujoco import MuJoCoHandTransport, MuJoCoHandTransportError, MuJoCoSimHandBackend
+from .backends.omnihand import OmniHandBackend, OmniHandHardwareError, vendor_output_to_stderr
 from .profiles import HandProfile, HandSide, get_hand_profile
 from .protocol import (
     HAND_CONFIG_SCHEMA,
@@ -24,6 +24,8 @@ from .protocol import (
     HAND_INTENT_TOPIC,
     HAND_STATE_SCHEMA,
     HAND_STATE_TOPIC,
+    HandProtocolError,
+    decode_control,
     decode_intent,
     encode,
 )
@@ -292,7 +294,15 @@ def _make_devices(
             context=context,
         )
         return {side: MuJoCoSimHandBackend(side, profile.side(side), transport) for side in sides}
-    return {side: _make_hardware_device(args, side, profile) for side in sides}
+    devices: dict[str, HandBackend] = {}
+    try:
+        for side in sides:
+            devices[side] = _make_hardware_device(args, side, profile)
+        return devices
+    except Exception:
+        for device in devices.values():
+            device.close()
+        raise
 
 
 def probe(args: argparse.Namespace) -> int:
@@ -358,18 +368,48 @@ def run(args: argparse.Namespace) -> int:
     subscriber.connect(args.intent_endpoint)
     publisher = context.socket(zmq.PUB)
     publisher.setsockopt(zmq.SNDHWM, 2)
+    publisher.setsockopt(zmq.LINGER, 0)
     publisher.bind(args.state_endpoint)
+    control = context.socket(zmq.REP)
+    connection_id: str | None = None
+    state_sequence = 0
+
+    def publish(topic: bytes, payload: dict) -> None:
+        nonlocal state_sequence
+        payload = dict(payload, connection_id=connection_id)
+        if topic == HAND_STATE_TOPIC:
+            # Wire sequences belong to the server session, not SDK connections.
+            state_sequence += 1
+            payload["sequence"] = state_sequence
+        try:
+            publisher.send(encode(topic, payload), flags=zmq.NOBLOCK)
+        except zmq.Again:
+            pass  # A slow status consumer must not block hand I/O.
+
     selected_sides = _selected_sides(args.sides)
     session_id = uuid.uuid4().hex
     controller: SafeHandController | None = None
     next_reconnect_at = 0.0
     last_error: str | None = None
     try:
+        control.bind(args.control_endpoint)
         period = 1.0 / args.frequency
         last_config = -math.inf
         while True:
             started = time.monotonic()
             just_connected = False
+            if control.poll(0):
+                try:
+                    decode_control(control.recv())
+                except HandProtocolError as exc:
+                    control.send_json({"accepted": False, "error": str(exc)})
+                else:
+                    # Acknowledge the request, not completion of SDK reconnect.
+                    control.send_json({"accepted": True})
+                    if controller is not None:
+                        controller.close()
+                        controller = None
+                    next_reconnect_at = started
             if controller is None and started >= next_reconnect_at:
                 devices: dict[str, HandBackend] = {}
                 try:
@@ -383,6 +423,7 @@ def run(args: argparse.Namespace) -> int:
                         transition_duration_s=args.transition_duration,
                         session_id=session_id,
                     )
+                    connection_id = uuid.uuid4().hex
                     last_error = None
                     last_config = -math.inf
                     # A reconnect is admitted from measured feedback only. Drop
@@ -394,8 +435,11 @@ def run(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     for device in devices.values():
                         device.close()
+                    controller = None
                     last_error = str(exc)
-                    next_reconnect_at = started + args.reconnect_interval
+                    retryable = isinstance(exc, (OmniHandHardwareError, MuJoCoHandTransportError))
+                    next_reconnect_at = started + args.reconnect_interval if retryable else math.inf
+                    print(f"[Hands] Connection failed: {exc}", flush=True)
 
             if controller is not None:
                 try:
@@ -409,39 +453,46 @@ def run(args: argparse.Namespace) -> int:
                         while subscriber.poll(0):
                             latest_raw = subscriber.recv(zmq.NOBLOCK)
                         if latest_raw is not None:
-                            controller.accept_intent(decode_intent(latest_raw), now=started)
+                            try:
+                                intent = decode_intent(latest_raw)
+                            except HandProtocolError as exc:
+                                print(f"[Hands] Rejected intent: {exc}")
+                            else:
+                                controller.accept_intent(intent, now=started)
                     state = controller.step(now=started)
-                    publisher.send(encode(HAND_STATE_TOPIC, state))
+                    publish(HAND_STATE_TOPIC, state)
                     if started - last_config >= 2.0:
-                        publisher.send(encode(HAND_CONFIG_TOPIC, controller.config_payload()))
+                        publish(HAND_CONFIG_TOPIC, controller.config_payload())
                         last_config = started
                 except Exception as exc:
                     last_error = str(exc)
+                    retryable = not controller.fault_latched and isinstance(
+                        exc, (OmniHandHardwareError, MuJoCoHandTransportError)
+                    )
                     controller.close()
                     controller = None
-                    next_reconnect_at = started + args.reconnect_interval
-            else:
-                publisher.send(
-                    encode(
-                        HAND_STATE_TOPIC,
-                        {
-                            "schema": HAND_STATE_SCHEMA,
-                            "session_id": session_id,
-                            "sequence": 0,
-                            "monotonic_ns": int(started * 1e9),
-                            "backend": args.backend,
-                            "profile": profile.name,
-                            "mode": "disconnected",
-                            "target_source": "pico_open_close",
-                            "intent_sequence": None,
-                            "input_stale": True,
-                            "input_age_s": None,
-                            "sides": {
-                                side: {"valid": False, "connected": False, "error": last_error}
-                                for side in selected_sides
-                            },
+                    next_reconnect_at = started + args.reconnect_interval if retryable else math.inf
+                    print(f"[Hands] Connection lost: {exc}", flush=True)
+            if controller is None:
+                publish(
+                    HAND_STATE_TOPIC,
+                    {
+                        "schema": HAND_STATE_SCHEMA,
+                        "session_id": session_id,
+                        "monotonic_ns": int(started * 1e9),
+                        "backend": args.backend,
+                        "profile": profile.name,
+                        "mode": "fault" if math.isinf(next_reconnect_at) else "disconnected",
+                        "connection_error": last_error,
+                        "target_source": "pico_open_close",
+                        "intent_sequence": None,
+                        "input_stale": True,
+                        "input_age_s": None,
+                        "sides": {
+                            side: {"valid": False, "connected": False, "error": last_error}
+                            for side in selected_sides
                         },
-                    )
+                    },
                 )
             remaining = period - (time.monotonic() - started)
             if remaining > 0:
@@ -453,6 +504,7 @@ def run(args: argparse.Namespace) -> int:
             controller.close()
         subscriber.close(linger=0)
         publisher.close(linger=0)
+        control.close(linger=0)
         context.term()
 
 
@@ -469,6 +521,7 @@ def build_parser() -> argparse.ArgumentParser:
     runner = sub.choices["run"]
     runner.add_argument("--intent-endpoint", default="tcp://localhost:5556")
     runner.add_argument("--state-endpoint", default="tcp://*:5570")
+    runner.add_argument("--control-endpoint", default="tcp://127.0.0.1:5572")
     runner.add_argument("--frequency", type=float, default=50.0)
     runner.add_argument("--target-timeout", type=float, default=0.5)
     runner.add_argument("--transition-duration", type=float, default=1.0)

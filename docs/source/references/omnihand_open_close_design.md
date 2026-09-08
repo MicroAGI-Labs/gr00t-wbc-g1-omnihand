@@ -24,10 +24,11 @@ were missing or ambiguous:
 - **Clock domains need an explicit rule.** Remote `monotonic_ns` values are
   provenance only; watchdog age is measured from local receive time because
   monotonic clocks are not comparable across hosts.
-- **Reconnect session semantics were unclear.** Transport reconnects retain the
-  controller process session ID, discard the old target, seed a new measured
-  hold, and require an intent received after reconnect. Process restart creates
-  a new session ID and the collector must relock before another episode.
+- **Reconnect session semantics.** The hand server retains its session ID across
+  reconnects; each successful connection gets a new `connection_id`, discards old
+  targets, establishes a measured hold, and requires a post-connect intent. The
+  collector invalidates an episode spanning a reconnect. Restarting the process
+  creates a new session and requires restarting the collector to relock.
 - **“Exact SDK names” assumes the Python binding exposes names.** Product and
   active-DOF identity are mandatory. Exact name/order comparison is also made
   when `get_joint_names()` exists; otherwise the pinned SDK/API order is the
@@ -81,6 +82,33 @@ GR00T joint output (future) ---------------+                             ^
 executable. Process isolation keeps the Python-only OmniHand SDK and its
 reconnect lifecycle out of the body controller. Dex3 remains in the legacy C++
 owner until a separately reviewed external backend exists.
+
+### In-process hand reconnect and status
+
+`launch_data_collection.py --hand-backend omnihand --remote-ui` runs one hand
+server (`controller run`). That process owns SDK connections, public state on
+port `5570`, and a loopback reconnect endpoint on `5572` (`--control-endpoint`).
+There is no child worker, process supervisor, or independent status relay.
+
+Backend-reported failures retry after `--reconnect-interval` (one second by
+default). Known motor faults, controller safety-check failures, and unexpected
+errors require an explicit reconnect. **Reconnect Hands** closes and reopens
+the SDK handles inside the same process. Its acknowledgement means the request
+was accepted, not that connection succeeded. It can reset a controller fault
+latch; startup feedback checks still apply. Body teleop, camera, and recorder
+processes are unaffected.
+
+State is published by the control loop; disconnected states are explicitly
+invalid. Browser status becomes stale after 200 ms without a message. The
+collector retains its receive-time causal selection and freshness rules, and
+rejects episodes spanning a change of `connection_id`. Published state sequence
+numbers increase throughout the server session, including disconnected states,
+and do not reset on reconnect. Existing consumers need no special reset handling.
+
+This handles SDK operations that return errors, not native hangs or crashes.
+An SDK call that never returns blocks reconnect and state publication until the
+operator restarts the hand server. No physical close-scale, command-cadence,
+profile, or command-enable acknowledgement changes are introduced.
 
 ### Ownership modes in C++
 
