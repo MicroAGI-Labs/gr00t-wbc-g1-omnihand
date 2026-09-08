@@ -48,6 +48,11 @@ from gear_sonic.data.features_sonic_vla import (
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
 )
+from gear_sonic.data.hub_uploader import (
+    DATASET_CONFIG_PREFIX,
+    EpisodeHubUploader,
+    validate_dataset_config,
+)
 from gear_sonic.end_effectors.profiles import HandProfile, get_hand_profile
 from gear_sonic.end_effectors.protocol import (
     HAND_CONFIG_TOPIC,
@@ -83,6 +88,9 @@ class SonicDataExporterConfig:
 
     task_prompt: str = "demo"
     """Language task prompt."""
+
+    require_hub_upload: bool = False
+    """Require a dataset selection in the browser before recording."""
 
     root_output_dir: str = "outputs"
     """Root output directory."""
@@ -320,6 +328,7 @@ class GrootDataCollector:
         synchronization_wait_timeout: float = 0.25,
         proprio_max_age: float = 0.1,
         teleop_max_age: float = 0.2,
+        require_hub_upload: bool = False,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -363,7 +372,11 @@ class GrootDataCollector:
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
-        self.episode_finalizer = EpisodeFinalizer(data_exporter, max_pending=1)
+        self.require_hub_upload = require_hub_upload
+        self.hub_uploader = EpisodeHubUploader(data_exporter)
+        self.episode_finalizer = EpisodeFinalizer(
+            data_exporter, max_pending=1, hub_uploader=self.hub_uploader
+        )
         self._last_finalization: EpisodeFinalizationResult | None = None
         self._recording_message = "Ready to record"
         self._recording_status_ctx = zmq.Context()
@@ -555,6 +568,7 @@ class GrootDataCollector:
                 "buffers": self._synchronizer.status(),
             },
             "finalizer": finalizer,
+            "hub": {**self.hub_uploader.status(), "required": self.require_hub_upload},
             "last_finalization": (
                 None
                 if self._last_finalization is None
@@ -726,6 +740,21 @@ class GrootDataCollector:
         """Check keyboard + ZMQ toggle flags for recording commands."""
         key = self._keyboard_listener.read_msg()
 
+        if isinstance(key, str) and key.startswith(DATASET_CONFIG_PREFIX):
+            try:
+                config = validate_dataset_config(json.loads(key[len(DATASET_CONFIG_PREFIX):]))
+                if self._episode_state.get_state() != self._episode_state.IDLE:
+                    raise RuntimeError("stop or discard the active episode first")
+                if self.data_exporter.episode_buffer.get("size", 0):
+                    raise RuntimeError("cannot change task while frames are buffered")
+                if not self.episode_finalizer.can_accept():
+                    raise RuntimeError("wait for local episode finalization")
+                self.hub_uploader.configure(config)
+                self._recording_message = f"Dataset selected: {config['repo_id']}"
+            except (ValueError, RuntimeError, OSError) as exc:
+                self._recording_message = f"Dataset configuration rejected: {exc}"
+            return
+
         if self._manager_toggle_da:
             key = "x"
             self._manager_toggle_da = False
@@ -736,6 +765,9 @@ class GrootDataCollector:
         state = self._episode_state.get_state()
         if key == "c":
             if state == self._episode_state.IDLE:
+                if self.require_hub_upload and not self.hub_uploader.status()["ready"]:
+                    self._recording_message = "Choose a Hugging Face dataset in the browser first"
+                    return
                 if not self.episode_finalizer.can_accept():
                     self._recording_message = (
                         "Cannot start: previous episode is still finalizing or failed"
@@ -1543,6 +1575,11 @@ class GrootDataCollector:
         except Exception as e:
             self._print_and_say(f"Error finalizing episode: {e}", blocking=True)
 
+        try:
+            self.hub_uploader.close(timeout=5.0)
+        except Exception as exc:
+            print(f"[Hub] Upload shutdown: {exc}; local dataset is preserved")
+
         for writer in self.data_exporter.video_writers.values():
             try:
                 if self.data_exporter.episode_buffer.get("size", 0):
@@ -1714,6 +1751,7 @@ def main(config: SonicDataExporterConfig):
         hand_state_port=config.hand_state_port,
         hand_state_max_age=config.hand_state_max_age,
         recording_status_port=config.recording_status_port,
+        require_hub_upload=config.require_hub_upload,
     )
     data_collector.run()
 

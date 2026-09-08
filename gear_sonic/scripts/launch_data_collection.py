@@ -152,6 +152,9 @@ class DataCollectionLaunchConfig:
     task_prompt: str = "demo"
     """Language task prompt for the data exporter."""
 
+    require_hub_upload: bool = False
+    """Require browser dataset selection before recording (use with --remote-ui)."""
+
     dataset_name: str = ""
     """Dataset name for the data exporter. Leave empty to auto-generate from timestamp."""
 
@@ -552,6 +555,8 @@ def main(config: DataCollectionLaunchConfig):
         exporter_cmd += f" --dataset-name '{config.dataset_name}'"
     if config.record_wrist_cameras:
         exporter_cmd += " --record-wrist-cameras"
+    if config.require_hub_upload:
+        exporter_cmd += " --require-hub-upload"
     if not config.text_to_speech:
         exporter_cmd += " --no-text-to-speech"
 

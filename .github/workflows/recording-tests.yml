@@ -40,6 +40,7 @@ jobs:
             gear_sonic/tests/test_causal_sync.py \
             gear_sonic/tests/test_episode_finalizer.py \
             gear_sonic/tests/test_exporter.py \
+            gear_sonic/tests/test_hub_uploader.py \
             gear_sonic/tests/test_recording_pipeline.py \
             gear_sonic/tests/test_video_writer.py \
             gear_sonic/tests/test_zed_camera.py \
