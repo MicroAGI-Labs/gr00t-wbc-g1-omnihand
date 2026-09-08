@@ -23,6 +23,7 @@ import tyro
 import zmq
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema, SensorClient
+from gear_sonic.data.hub_uploader import DATASET_CONFIG_PREFIX, prepare_repository, validate_dataset_config
 from gear_sonic.end_effectors.protocol import (
     HAND_CONTROL_SCHEMA,
     HAND_CONTROL_TOPIC,
@@ -67,6 +68,11 @@ _INDEX_HTML = """<!doctype html>
     button.stop { background: #b4232f; }
     button.discard { background: #59636f; }
     button:disabled { cursor: not-allowed; opacity: .4; }
+    #dataset-form { width: min(1100px, 100%); }
+    #dataset-fields { display: flex; flex-wrap: wrap; gap: 12px; border: 0; padding: 12px 0; }
+    #dataset-fields label { display: flex; align-items: center; gap: 6px; }
+    input { padding: 8px; border: 1px solid #59636f; border-radius: 4px; }
+    #dataset-status { font-size: 13px; color: #9eabb8; }
   </style>
 </head>
 <body>
@@ -86,6 +92,19 @@ _INDEX_HTML = """<!doctype html>
       <div class="recorder-info" id="hand-status">Waiting for hand controller…</div>
       <button id="hand-reconnect">Reconnect Hands</button>
     </section>
+    <form id="dataset-form">
+      <details>
+        <summary>Hugging Face dataset</summary>
+        <fieldset id="dataset-fields" disabled>
+          <label>Dataset <input id="dataset-repo" placeholder="namespace/dataset" required></label>
+          <label>Task <input id="dataset-prompt" maxlength="1000" required></label>
+          <label><input id="dataset-private" type="checkbox" checked> Private</label>
+          <button type="submit">Select &amp; enable uploads</button>
+        </fieldset>
+      </details>
+      <div id="dataset-status">Uploads disabled · episodes are saved locally</div>
+      <div id="dataset-feedback" role="status"></div>
+    </form>
   </main>
   <script>
     const cameraStatus = document.getElementById('camera-status');
@@ -98,6 +117,35 @@ _INDEX_HTML = """<!doctype html>
     const handControls = document.getElementById('hand-controls');
     const handStatus = document.getElementById('hand-status');
     const handReconnect = document.getElementById('hand-reconnect');
+    const datasetFields = document.getElementById('dataset-fields');
+    const datasetStatus = document.getElementById('dataset-status');
+    const datasetFeedback = document.getElementById('dataset-feedback');
+    let datasetPending = false;
+    let selectedRepo = null;
+
+    document.getElementById('dataset-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      datasetPending = true;
+      datasetFields.disabled = true;
+      datasetFeedback.textContent = 'Checking dataset access…';
+      try {
+        const response = await fetch('/recording/dataset', {
+          method: 'POST', headers: {'Content-Type': 'application/json', 'X-Sonic-Command': 'dataset'},
+          body: JSON.stringify({
+            repo_id: document.getElementById('dataset-repo').value,
+            prompt: document.getElementById('dataset-prompt').value,
+            private: document.getElementById('dataset-private').checked
+          })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Dataset selection failed');
+        datasetFeedback.textContent = 'Selection sent. Check the recorder status for confirmation.';
+      } catch (error) {
+        datasetFeedback.textContent = error.message;
+      } finally {
+        datasetPending = false;
+      }
+    });
 
     async function updateHandStatus() {
       try {
@@ -147,6 +195,21 @@ _INDEX_HTML = """<!doctype html>
       try {
         const response = await fetch('/recording/status', {cache: 'no-store'});
         const status = await response.json();
+        const hub = status.hub || {};
+        datasetFields.disabled = datasetPending || !status.connected || status.recording
+          || status.saving || status.total_episodes > 0;
+        if (hub.ready && hub.repo_id !== selectedRepo) {
+          selectedRepo = hub.repo_id;
+          document.getElementById('dataset-repo').value = hub.repo_id;
+          document.getElementById('dataset-prompt').value = hub.prompt;
+          document.getElementById('dataset-private').checked = hub.private;
+        }
+        datasetStatus.textContent = hub.ready
+          ? `${hub.repo_id} · ${hub.pending} upload(s) pending · `
+            + (hub.last_uploaded_episode == null
+              ? 'nothing uploaded yet' : `uploaded through episode ${hub.last_uploaded_episode}`)
+            + (hub.error ? ` · ${hub.error}` : '')
+          : (hub.required ? 'Choose a dataset before recording' : 'Uploads disabled · episodes are saved locally');
         if (!status.connected) {
           recordState.textContent = 'OFFLINE';
           recordState.className = '';
@@ -181,10 +244,12 @@ _INDEX_HTML = """<!doctype html>
           ? 'Draining…'
           : (status.recording ? 'Stop & Save' : 'Start Recording');
         recordToggle.className = status.recording ? 'stop' : '';
-        recordToggle.disabled = commandPending || status.saving || (!status.recording && !ready);
+        recordToggle.disabled = commandPending || status.saving
+          || (!status.recording && (!ready || (hub.required && !hub.ready)));
         recordDiscard.disabled = commandPending || (!status.recording && !status.draining);
       } catch (_) {
         recordMessage.textContent = 'Recorder status request failed';
+        datasetFields.disabled = true;
       }
     }
 
@@ -353,6 +418,16 @@ class RecorderControlHub:
         if command not in {"c", "x"}:
             raise ValueError(f"unsupported recorder command: {command}")
         self._commands.put(command)
+
+    def configure_dataset(self, payload: object) -> None:
+        config = validate_dataset_config(payload)
+        status = self.status()
+        if not status.get("connected"):
+            raise ValueError("recorder is offline")
+        if status.get("recording") or status.get("saving") or status.get("total_episodes", 0):
+            raise ValueError("select the dataset and task before recording the first episode")
+        prepare_repository(config)
+        self._commands.put(DATASET_CONFIG_PREFIX + json.dumps(config))
 
     def status(self) -> dict[str, object]:
         with self._lock:
@@ -537,6 +612,18 @@ def make_handler(
                 recorder_hub.send("c")
             elif path == "/recording/discard":
                 recorder_hub.send("x")
+            elif path == "/recording/dataset":
+                try:
+                    size = int(self.headers.get("Content-Length", "0"))
+                    if self.headers.get("X-Sonic-Command") != "dataset" or not 0 < size <= 4096:
+                        self.close_connection = True
+                        raise ValueError("invalid dataset request")
+                    recorder_hub.configure_dataset(json.loads(self.rfile.read(size)))
+                except Exception as exc:
+                    self._send_bytes(
+                        "application/json", json.dumps({"error": str(exc)}).encode(), HTTPStatus.BAD_REQUEST
+                    )
+                    return
             elif path == "/hands/reconnect":
                 if self.headers.get("X-Sonic-Command") != "reconnect":
                     self.send_error(HTTPStatus.BAD_REQUEST, "Missing hand command header")
@@ -549,8 +636,8 @@ def make_handler(
                 return
             self._send_bytes("application/json", b'{"accepted":true}')
 
-        def _send_bytes(self, content_type: str, payload: bytes) -> None:
-            self.send_response(HTTPStatus.OK)
+        def _send_bytes(self, content_type: str, payload: bytes, status: int = HTTPStatus.OK) -> None:
+            self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")

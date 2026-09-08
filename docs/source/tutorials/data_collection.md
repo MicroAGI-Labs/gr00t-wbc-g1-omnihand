@@ -392,6 +392,40 @@ Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). T
 
 ---
 
+## Background Hugging Face uploads
+
+The browser viewer's **Hugging Face dataset** form accepts a `namespace/name`,
+task prompt, and visibility (private by default). Select these before recording
+the first episode. Selection enables automatic uploads for that local dataset;
+without a selection, recording remains local. Add `--require-hub-upload` to the
+launcher with `--remote-ui`, or to the exporter, to require selection before
+recording can start. This requires the host's existing Hugging Face login to have
+write access to the chosen namespace; credentials are never entered in the browser.
+
+Selection checks or creates an empty remote repository before forwarding the
+configuration to the recorder. Network or access errors appear in the browser.
+The recorder confirms selection in its status and locks the destination and task
+after the first saved episode. Every upload rechecks repository ownership; only
+an empty repository or one uploaded from this same local dataset is accepted.
+Existing repository visibility is never changed; a mismatch is reported as an error.
+
+After each local save, the finalizer copies metadata and hard-links the completed
+episode files into an upload snapshot. A separate process uploads that snapshot
+while recording continues. There is at most one active upload and one pending
+snapshot; newer saves replace the pending snapshot with a cumulative copy. Saved
+episodes flagged as discarded retain their flags in the uploaded metadata.
+Capture timing, dataset features, and episode validation are unchanged.
+
+The browser distinguishes local save completion from upload progress and errors.
+Network failures retry with delays up to 30 seconds. Snapshot staging failures
+leave the local save successful and retry on the next save or recorder restart.
+Shutdown allows five seconds for pending uploads, then stops the upload worker.
+To retry later, start the exporter with the same `--dataset-name` and
+`--root-output-dir`: `.hub_upload.json` restores the selection and the latest
+committed dataset is queued again. Keep this file with the local dataset; it also
+identifies which remote repository belongs to it. Never run two recorders against
+the same local dataset directory.
+
 ## Camera Viewer
 
 A standalone camera viewer is available for monitoring camera feeds and recording raw video independently of the data exporter.

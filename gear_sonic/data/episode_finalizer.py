@@ -13,6 +13,7 @@ import time
 from typing import Any
 
 from gear_sonic.data.exporter import Gr00tDataExporter
+from gear_sonic.data.hub_uploader import EpisodeHubUploader
 from gear_sonic.data.video_writer import VideoWriter
 
 
@@ -46,6 +47,7 @@ class EpisodeFinalizer:
         *,
         max_pending: int = 2,
         writer_stop_timeout_s: float = 5.0,
+        hub_uploader: EpisodeHubUploader | None = None,
     ):
         if max_pending <= 0:
             raise ValueError("max_pending must be positive")
@@ -54,6 +56,7 @@ class EpisodeFinalizer:
         self.data_exporter = data_exporter
         self.max_pending = max_pending
         self.writer_stop_timeout_s = writer_stop_timeout_s
+        self.hub_uploader = hub_uploader
         self._queue: queue.Queue[EpisodeFinalizationJob | None] = queue.Queue()
         self._condition = threading.Condition()
         self._outstanding = 0
@@ -196,6 +199,8 @@ class EpisodeFinalizer:
                 )
                 with self._condition:
                     self._last_finalized_episode = job.episode_index
+                if self.hub_uploader is not None:
+                    self.hub_uploader.enqueue(job.episode_index)
             except Exception as exc:
                 writer_errors = self._stop_job_writers(job)
                 try:
