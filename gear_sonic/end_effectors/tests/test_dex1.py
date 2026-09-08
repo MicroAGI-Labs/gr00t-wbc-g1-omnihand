@@ -63,8 +63,8 @@ def motor(fake_worker, tmp_path, monkeypatch):
     stable_port.symlink_to(port)
     log = tmp_path / "motor.log"
     monkeypatch.setenv("DEX1_TEST_MOTOR_LOG", str(log))
-    monkeypatch.setitem(dex1.USB_PORTS, "right", str(stable_port))
-    backend = dex1.Dex1Backend(HandSide.RIGHT, DEX1.right, worker=fake_worker, command_enabled=True)
+    monkeypatch.setitem(dex1.USB_PORTS, "left", str(stable_port))
+    backend = dex1.Dex1Backend(HandSide.LEFT, DEX1.left, worker=fake_worker, command_enabled=True)
     assert backend._process.args[1] == port
     try:
         yield backend, log
@@ -85,13 +85,46 @@ def intent(sequence, *, closed=True, hold=False):
     return {
         "sequence": sequence,
         "hold": hold,
-        "right": {"valid": True, "closed": closed},
+        "left": {"valid": True, "closed": closed},
     }
 
 
 def assert_stopped(log):
     modes = [int(line.split()[0]) for line in log.read_text().splitlines()]
     assert modes[-3:] == [0, 0, 0]
+
+
+@pytest.mark.parametrize(
+    "side,adapter,motor_id,lower,upper,closed,opened",
+    [
+        ("left", "FTBQ776H", 0, -0.10, 5.75, 0.12, 5.30),
+        ("right", "FTBWJBC1", 1, -2.60, 3.10, -2.36, 2.84),
+    ],
+)
+def test_physical_side_keeps_adapter_id_and_calibration_together(
+    fake_worker, monkeypatch, side, adapter, motor_id, lower, upper, closed, opened
+):
+    assert dex1.USB_PORTS[side].endswith(f"{adapter}-if00-port0")
+    master, slave = os.openpty()
+    backend = None
+    try:
+        port = os.ttyname(slave)
+        monkeypatch.setitem(dex1.USB_PORTS, side, port)
+        backend = dex1.Dex1Backend(side, DEX1.side(side), worker=fake_worker, command_enabled=True)
+        assert backend._process.args[1:5] == [port, str(motor_id), str(lower), str(upper)]
+        assert backend.read_health()["motor_id"] == motor_id
+        controller = SafeHandController(DEX1, {side: backend}, backend_name="dex1")
+        for sequence, (is_closed, target) in enumerate(((True, closed), (False, opened)), start=1):
+            controller.accept_intent(
+                {"sequence": sequence, "hold": False, side: {"valid": True, "closed": is_closed}}
+            )
+            controller.step()
+            assert backend._target == pytest.approx(target)
+    finally:
+        if backend is not None:
+            backend.close()
+        os.close(slave)
+        os.close(master)
 
 
 def test_contact_holds_at_capped_torque_and_accepts_release(motor):
@@ -134,7 +167,7 @@ def test_parent_pipe_eof_stops_motor(motor):
 
 def test_stale_teleop_cancels_motion_at_measured_position(motor):
     backend, _ = motor
-    controller = SafeHandController(DEX1, {"right": backend}, backend_name="dex1", target_timeout_s=0.1)
+    controller = SafeHandController(DEX1, {"left": backend}, backend_name="dex1", target_timeout_s=0.1)
     controller.accept_intent(intent(1))
     controller.step()
     time.sleep(0.12)
@@ -142,13 +175,13 @@ def test_stale_teleop_cancels_motion_at_measured_position(motor):
     time.sleep(0.04)
     state = controller.step()
     assert state["mode"] == "hold"
-    assert state["sides"]["right"]["applied_position_rad"] == pytest.approx([2.5])
+    assert state["sides"]["left"]["applied_position_rad"] == pytest.approx([2.5])
     controller.accept_intent(intent(2, closed=False))
     controller.step()
     controller.accept_intent(intent(3, hold=True))
     controller.step()
     time.sleep(0.04)
-    assert controller.step()["sides"]["right"]["applied_position_rad"] == pytest.approx([2.5])
+    assert controller.step()["sides"]["left"]["applied_position_rad"] == pytest.approx([2.5])
 
 
 @pytest.mark.parametrize("packet", [b"C 0 1 2.5\n", b"C 1 1 nan\n", b"C 1 1 8\n", b"C 1 9 2.5\n"])
@@ -172,7 +205,7 @@ def test_opening_obstruction_latches_fault(motor):
 def test_second_worker_cannot_claim_same_serial_port(motor, fake_worker):
     backend, _ = motor
     with pytest.raises(dex1.Dex1SafetyError):
-        dex1.Dex1Backend(HandSide.RIGHT, DEX1.right, worker=fake_worker)
+        dex1.Dex1Backend(HandSide.LEFT, DEX1.left, worker=fake_worker)
     assert backend._process.poll() is None
 
 
@@ -199,9 +232,9 @@ def test_dex1_dataset_uses_two_native_channels_and_correct_offsets():
     assert features["control.hand_applied_position"]["shape"] == (2,)
     assert features["observation.dex1_left_raw"]["shape"] == (1,)
     assert "observation.omnihand_left_raw" not in features
-    joints = assemble_dataset_configuration(model, np.arange(29), [-2.36], [0.12], DEX1)
-    assert joints[22] == pytest.approx(-2.36)
-    assert joints[30] == pytest.approx(0.12)
+    joints = assemble_dataset_configuration(model, np.arange(29), DEX1.left.closed_rad, DEX1.right.closed_rad, DEX1)
+    assert joints[22] == pytest.approx(0.12)
+    assert joints[30] == pytest.approx(-2.36)
     assert get_modality_config_sonic_vla(model, DEX1)["state"]["right_hand"] == {"start": 30, "end": 31}
     assert dataset_robot_type(DEX1) == "unitree_g1_dex1_sonic"
     assert resolve_hand_profile("auto", {"profile": "dex1.v1"}) is DEX1
@@ -267,7 +300,7 @@ def test_browser_displays_dex1_state_and_sends_reconnect(motor):
     from gear_sonic.scripts.run_camera_web_viewer import CameraWebViewerConfig, HandControlHub, make_handler
 
     backend, _ = motor
-    controller = SafeHandController(DEX1, {"right": backend}, backend_name="dex1")
+    controller = SafeHandController(DEX1, {"left": backend}, backend_name="dex1")
     context = zmq.Context()
     publisher = context.socket(zmq.PUB)
     state_port = publisher.bind_to_random_port("tcp://127.0.0.1")

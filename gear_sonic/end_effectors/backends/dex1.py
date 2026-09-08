@@ -18,9 +18,10 @@ from ..profiles import HandSide, SideProfile
 SDK_COMMIT = "2986d26eefa4136d4777493e6fd0b8bac7a4c6ae"
 DEFAULT_WORKER = Path(__file__).resolve().parents[3] / "build/dex1/dex1_worker"
 USB_PORTS = {
-    "left": "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBWJBC1-if00-port0",
-    "right": "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBQ776H-if00-port0",
+    "left": "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBQ776H-if00-port0",
+    "right": "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBWJBC1-if00-port0",
 }
+MOTOR_IDS = {"left": 0, "right": 1}
 
 
 class Dex1SafetyError(RuntimeError):
@@ -43,6 +44,7 @@ class Dex1Backend:
     ) -> None:
         self.side, self.profile = HandSide(side), profile
         self.port = USB_PORTS[self.side.value]
+        self.motor_id = MOTOR_IDS[self.side.value]
         self._command_enabled = command_enabled
         self._mode = "hold"
         self._target: float | None = None
@@ -62,7 +64,7 @@ class Dex1Backend:
             [
                 str(worker),
                 serial_device,  # libserialport expects the canonical tty device.
-                "1" if self.side is HandSide.LEFT else "0",
+                str(self.motor_id),
                 str(profile.lower_rad[0]),
                 str(profile.upper_rad[0]),
                 str(transition_duration),
@@ -187,7 +189,7 @@ class Dex1Backend:
             "velocity_rad_s": [sample["dq"]],
             "feedback_age_s": (time.monotonic_ns() - sample["monotonic_ns"]) / 1e9,
             "serial_port": self.port,
-            "motor_id": 1 if self.side is HandSide.LEFT else 0,
+            "motor_id": self.motor_id,
         }
 
     def close(self) -> None:

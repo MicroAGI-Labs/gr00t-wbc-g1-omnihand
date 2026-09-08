@@ -8,10 +8,11 @@ existing 0.60/0.40 hysteresis and pause/idle behavior.
 
 ## Start
 
-On the prepared Thor worktree, run this single command:
+On the prepared Thor checkout, run:
 
 ```bash
-bash /home/unitree/worktrees/gr00t-wbc-g1-dex1-teleop/tools/teleop_dex1.sh
+cd /home/unitree/repos/gr00t-wbc-g1-omnihand
+python gear_sonic/scripts/launch_data_collection.py --hand-backend dex1 --remote-ui
 ```
 
 It starts the existing tmux dashboard with SONIC in `external` hand mode,
@@ -49,9 +50,10 @@ radians**, including the existing encoder offsets:
 
 | Hand | USB adapter, interface | Motor ID | Closed | Open | Position guard |
 |---|---|---:|---:|---:|---|
-| Right | FTBQ776H, 00 | 0 | 0.12 | 5.30 | -0.10 to 5.75 |
-| Left | FTBWJBC1, 00 | 1 | -2.36 | 2.84 | -2.60 to 3.10 |
+| Left | FTBQ776H, 00 | 0 | 0.12 | 5.30 | -0.10 to 5.75 |
+| Right | FTBWJBC1, 00 | 1 | -2.36 | 2.84 | -2.60 to 3.10 |
 
+Left and right are from the robot's perspective.
 Serial paths use `/dev/serial/by-id`, so USB enumeration cannot swap the hands.
 Changing grippers or adapters requires measuring and updating the profile;
 these values are not universal factory calibration. No calibration is written.
@@ -108,8 +110,8 @@ and recorder regression tests, launcher command checks, and an HTTP/ZMQ UI
 status/reconnect test. The fake motor exercises contact, release, watchdogs,
 invalid commands, pause, port ownership, and shutdown without motor I/O.
 
-The prior standalone tool demonstrated bilateral open/close motion on this
-pair. **The integrated teleop path still needs its first supervised hardware
-run.** Start with clear jaws, confirm each side and direction, then verify
-pause/reconnect and a low-force grasp. DEX 1 MuJoCo integration is not included;
+The operator's initial integrated teleop run identified reversed left/right
+mapping; the profile above includes that correction. After relaunching, confirm
+each side and direction with clear jaws, then verify pause/reconnect and a
+low-force grasp. DEX 1 MuJoCo integration is not included;
 the launcher rejects `--sim --hand-backend dex1`.
