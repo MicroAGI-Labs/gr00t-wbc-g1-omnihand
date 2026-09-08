@@ -237,7 +237,7 @@ _INDEX_HTML = """<!doctype html>
           + `${status.frame_count} frames · ${cameraDetail} · ${syncDetail} · `
           + `${status.dataset_root} · `
           + `${ready ? 'sources ready' : 'source missing'} · `
-          + 'headset: release X+B to record/save, release Y+A to discard';
+          + 'headset: release X+B to record/save, A+X to save while recording, Y+A to discard';
         recordToggle.textContent = status.draining
           ? 'Draining…'
           : (status.recording ? 'Stop & Save' : 'Start Recording');
