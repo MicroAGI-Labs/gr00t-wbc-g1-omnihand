@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import socket
 import threading
 import time
@@ -36,12 +37,13 @@ from gear_sonic.end_effectors.protocol import (
 )
 
 
-def _intent(sequence: int, *, left_closed: bool, right_closed: bool, valid: bool = True):
+def _intent(sequence: int, *, left_closed: bool, right_closed: bool, valid: bool = True, hold: bool = False):
     return {
         "schema": HAND_INTENT_SCHEMA,
         "sequence": sequence,
         "monotonic_ns": sequence,
         "source": "pico",
+        "hold": hold,
         "left": {"valid": valid, "closed": left_closed, "trigger": 0.8 if left_closed else 0.2},
         "right": {"valid": valid, "closed": right_closed, "trigger": 0.8 if right_closed else 0.2},
     }
@@ -81,7 +83,7 @@ def test_o10_profile_has_exact_bilateral_contract():
 def test_protocol_rejects_unknown_schema_and_bad_trigger():
     good = encode(HAND_INTENT_TOPIC, _intent(1, left_closed=False, right_closed=True))
     assert decode_intent(good)["right"]["closed"] is True
-    bad_schema = dict(_intent(1, left_closed=False, right_closed=False), schema="sonic.hand_intent.v2")
+    bad_schema = dict(_intent(1, left_closed=False, right_closed=False), schema="sonic.hand_intent.v99")
     with pytest.raises(HandProtocolError):
         decode_intent(encode(HAND_INTENT_TOPIC, bad_schema))
     bad_trigger = _intent(2, left_closed=False, right_closed=False)
@@ -186,6 +188,9 @@ def test_controller_rejects_replayed_sequence_and_watchdog_holds():
     assert controller.accept_intent(_intent(2, left_closed=True, right_closed=False), now=0.0)
     assert not controller.accept_intent(_intent(2, left_closed=False, right_closed=False), now=0.1)
     assert not controller.accept_intent(_intent(3, left_closed=False, right_closed=False, valid=False), now=0.4)
+    assert controller.last_intent_sequence == 2
+    assert controller.last_intent_monotonic_ns == 2
+    assert not controller.accept_intent(_intent(3, left_closed=False, right_closed=False), now=0.4)
     now[0] = 0.6
     before = controller.applied["left"].copy()
     state = controller.step(now=now[0])
@@ -197,7 +202,7 @@ def test_controller_rejects_replayed_sequence_and_watchdog_holds():
 def test_startup_feedback_far_outside_limits_fails_closed():
     backend = SimHandBackend(OMNIHAND_O10.right)
     backend._positions[0] = OMNIHAND_O10.right.upper_rad[0] + 0.02
-    with pytest.raises(HandControllerError, match="startup feedback"):
+    with pytest.raises(HandControllerError, match="feedback exceeds admitted limits"):
         SafeHandController(OMNIHAND_O10, {"right": backend}, backend_name="sim")
 
 
@@ -402,10 +407,14 @@ def test_partial_connection_closes_opened_hand(monkeypatch):
 
 def test_server_reconnects_in_process_and_preserves_fault_latch(monkeypatch):
     stop, disconnected, fault = (threading.Event() for _ in range(3))
+    block_read, reading, resume_read = (threading.Event() for _ in range(3))
     devices, results = [], []
 
     class Backend(SimHandBackend):
         def read_positions(self):
+            if block_read.is_set():
+                reading.set()
+                assert resume_read.wait(5)
             if disconnected.is_set():
                 raise OmniHandHardwareError("test disconnect")
             return super().read_positions()
@@ -461,15 +470,18 @@ def test_server_reconnects_in_process_and_preserves_fault_latch(monkeypatch):
         server = threading.Thread(target=lambda: results.append(controller_module.run(args)), daemon=True)
         server.start()
         last_sequence = 0
+        last_publish_sequence = 0
 
         def receive(predicate):
-            nonlocal last_sequence
+            nonlocal last_sequence, last_publish_sequence
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 if state.poll(50):
                     payload = decode_state(state.recv())
-                    assert payload["sequence"] > last_sequence
+                    assert payload["sequence"] >= last_sequence
+                    assert payload["publish_sequence"] > last_publish_sequence
                     last_sequence = payload["sequence"]
+                    last_publish_sequence = payload["publish_sequence"]
                     if predicate(payload):
                         return payload
             pytest.fail("hand server did not publish expected state")
@@ -487,6 +499,17 @@ def test_server_reconnects_in_process_and_preserves_fault_latch(monkeypatch):
             assert unchanged["connection_id"] == first["connection_id"]
             intent.send(encode(HAND_INTENT_TOPIC, _intent(1, left_closed=True, right_closed=False)))
             receive(lambda message: message["mode"] == "tracking")
+            block_read.set()
+            assert reading.wait(2)
+            held = receive(lambda message: message["state_age_s"] > 0.1)
+            aged = receive(lambda message: message["state_age_s"] > 0.3)
+            assert aged["sequence"] == held["sequence"]
+            assert aged["monotonic_ns"] == held["monotonic_ns"]
+            assert aged["sides"]["left"]["feedback_age_s"] > 0.3
+            assert aged["publish_sequence"] > held["publish_sequence"]
+            block_read.clear()
+            resume_read.set()
+            receive(lambda message: message["sequence"] > aged["sequence"] and message["state_age_s"] < 0.1)
             reconnect()
             second = receive(lambda message: message["connection_id"] != first["connection_id"])
             assert second["session_id"] == first["session_id"]
@@ -512,7 +535,114 @@ def test_server_reconnects_in_process_and_preserves_fault_latch(monkeypatch):
             assert recovered["session_id"] == first["session_id"]
         finally:
             stop.set()
+            resume_read.set()
             server.join(timeout=2)
             assert not server.is_alive()
         assert results == [0]
-        assert all(device.closed for device in devices)
+    assert all(device.closed for device in devices)
+
+
+@pytest.mark.parametrize("value", [None, 1, "false"])
+def test_hold_protocol_requires_an_explicit_boolean(value):
+    payload = _intent(1, left_closed=False, right_closed=False)
+    payload["hold"] = value
+    with pytest.raises(HandProtocolError, match="hold"):
+        decode_intent(encode(HAND_INTENT_TOPIC, payload))
+
+
+def test_hold_uses_new_measurements_once_and_resumes_each_side_only_with_valid_input():
+    devices = {side: SimHandBackend(OMNIHAND_O10.side(side)) for side in ("left", "right")}
+    controller = SafeHandController(OMNIHAND_O10, devices, backend_name="sim", clock=lambda: 0)
+    controller.accept_intent(_intent(1, left_closed=True, right_closed=True), now=0)
+    controller.step(now=0.1)
+    # Simulate lag/drift after the last controller read; the hold must use this
+    # measured pose, not the old measurement or the outstanding close target.
+    measured = {side: OMNIHAND_O10.side(side).target(True, 0.1) for side in devices}
+    for side, device in devices.items():
+        device._positions = measured[side].copy()
+    stop = _intent(2, left_closed=True, right_closed=True, valid=False, hold=True)
+    assert controller.accept_intent(stop, now=0.2)
+    state = controller.step(now=0.2)
+    for side, device in devices.items():
+        np.testing.assert_array_equal(device.commands[-1], measured[side])
+        assert state["sides"][side]["hold"]
+    counts = {side: len(device.commands) for side, device in devices.items()}
+    stop["sequence"] = 3
+    controller.accept_intent(stop, now=0.3)
+    controller.step(now=0.3)
+    invalid_resume = _intent(4, left_closed=True, right_closed=True, valid=False)
+    assert not controller.accept_intent(invalid_resume, now=0.4)
+    state = controller.step(now=0.6)
+    assert state["input_stale"]  # Repeated stop messages do not refresh PICO input.
+    assert counts == {side: len(device.commands) for side, device in devices.items()}
+    resume = _intent(5, left_closed=True, right_closed=True)
+    resume["right"]["valid"] = False
+    controller.accept_intent(resume, now=0.7)
+    state = controller.step(now=0.7)
+    assert len(devices["left"].commands) == counts["left"] + 1
+    assert len(devices["right"].commands) == counts["right"]
+    assert not state["sides"]["left"]["hold"] and state["sides"]["right"]["hold"]
+    assert state["intent_monotonic_ns"] == 5
+    assert state["intent_received_monotonic_ns"] == 700_000_000
+
+
+@pytest.mark.parametrize("failure", ["motor", "nan", "limits"])
+def test_hold_validates_both_sides_before_any_write(failure):
+    devices = {side: SimHandBackend(OMNIHAND_O10.side(side)) for side in ("left", "right")}
+    controller = SafeHandController(OMNIHAND_O10, devices, backend_name="sim", clock=lambda: 0)
+    if failure == "motor":
+        devices["right"].read_health = lambda: {"error_masks": [1] * 10}
+    else:
+        devices["right"]._positions[0] = np.nan if failure == "nan" else 100
+    controller.accept_intent(_intent(1, left_closed=False, right_closed=False, hold=True), now=0.1)
+    if failure == "motor":
+        assert controller.step(now=0.1)["mode"] == "fault"
+    else:
+        with pytest.raises(HandControllerError):
+            controller.step(now=0.1)
+    assert all(len(device.commands) == 1 for device in devices.values())
+
+
+def test_repeated_settled_targets_do_not_write_but_feedback_is_still_polled():
+    backend = SimHandBackend(OMNIHAND_O10.left)
+    controller = SafeHandController(OMNIHAND_O10, {"left": backend}, backend_name="sim", clock=lambda: 0)
+    for step in range(1, 6):
+        controller.accept_intent(_intent(step, left_closed=False, right_closed=False), now=step / 10)
+        state = controller.step(now=step / 10)
+    assert len(backend.commands) == 1
+    assert state["sequence"] == 5 and state["mode"] == "tracking"
+
+
+@pytest.mark.parametrize("failure", [None, "drift", "motor", "startup", "second_connect"])
+def test_zero_delta_hold_diagnostic_closes_devices_and_reports_failures(monkeypatch, capsys, failure):
+    devices = {}
+
+    def connect(_args, side, _profile):
+        if side == "right" and failure == "second_connect":
+            raise OmniHandHardwareError("cannot connect")
+        devices[side] = SimHandBackend(OMNIHAND_O10.side(side))
+        if side == "right" and failure == "startup":
+            devices[side]._positions[0] = 100
+        return devices[side]
+
+    def settle(_):
+        if failure == "drift":
+            devices["right"]._positions[0] += 0.03
+        elif failure == "motor":
+            devices["right"].read_health = lambda: {"error_masks": [1] * 10}
+
+    monkeypatch.setattr(controller_module, "_make_hardware_device", connect)
+    monkeypatch.setattr(controller_module.time, "sleep", settle)
+    result = controller_module.main(["hold", "--backend", "omnihand", "--enable-command"])
+    assert result == (0 if failure is None else 1)
+    assert json.loads(capsys.readouterr().out)["passed"] is (failure is None)
+    assert all(device.closed for device in devices.values())
+    expected_writes = 0 if failure in {"startup", "second_connect"} else 1
+    assert all(len(device.commands) == expected_writes for device in devices.values())
+
+
+@pytest.mark.parametrize("args", [["hold"], ["hold", "--backend", "omnihand"]])
+def test_zero_delta_hold_requires_explicit_physical_commands(monkeypatch, args):
+    monkeypatch.setattr(controller_module, "_make_hardware_device", lambda *_: pytest.fail("hardware opened"))
+    with pytest.raises(HandControllerError, match="enable-command"):
+        controller_module.main(args)

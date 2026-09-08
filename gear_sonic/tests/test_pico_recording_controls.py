@@ -8,6 +8,7 @@ import msgpack
 import numpy as np
 import pytest
 
+from gear_sonic.end_effectors.protocol import decode_intent
 from gear_sonic.scripts import pico_manager_thread_server as manager
 from gear_sonic.scripts.run_data_exporter import unpack_pose_message
 
@@ -18,9 +19,9 @@ def run_manager(monkeypatch):
         steps = iter(steps)
         statuses = deque()
         frame = {}
-        pub = Mock()
+        pub, hand_pub = Mock(), Mock()
         sub = Mock(poll=lambda _: bool(statuses), recv_json=statuses.popleft)
-        context = Mock(socket=Mock(side_effect=[pub, sub]))
+        context = Mock(socket=Mock(side_effect=[pub, hand_pub, sub]))
         reader = Mock(spec=manager.PicoReader, disconnected=False, get_latest=lambda: None)
         reader.reconnect.side_effect = lambda: setattr(reader, "disconnected", False)
         monkeypatch.setattr(manager.zmq, "Context", lambda: context)
@@ -33,7 +34,7 @@ def run_manager(monkeypatch):
             monkeypatch.setattr(manager, name, Mock())
         if calibration_results is not None:
             manager.PlannerStreamer.return_value.recalibrate_for_vr3pt.side_effect = calibration_results
-        monkeypatch.setattr(manager, "get_controller_inputs", lambda _: (False, 0, 0, 0, 0))
+        monkeypatch.setattr(manager, "get_controller_inputs", lambda _: (frame.get("pause", False), 0, 0, 0, 0))
         monkeypatch.setattr(manager, "get_axis_clicks", lambda _: (frame.get("stick", False), False))
 
         def buttons(_):
@@ -53,6 +54,14 @@ def run_manager(monkeypatch):
         payloads = [call.args[0] for call in pub.send.call_args_list]
         states = [unpack_pose_message(raw, topic="manager_state")
                   for raw in payloads if raw.startswith(b"manager_state")]
+        assert not any(raw.startswith(b"hand_intent") for raw in payloads)
+        pub.bind.assert_called_once_with("tcp://*:5556")
+        hand_pub.bind.assert_called_once_with(f"tcp://*:{manager.HAND_INTENT_PORT}")
+        hand_calls = manager.HandIntentStream.return_value.publish.call_args_list
+        assert len(hand_calls) == len(states)
+        for call, state in zip(hand_calls, states):
+            assert call.args == (hand_pub, reader)
+            assert call.kwargs["hold"] == (state["stream_mode"].item() in {0, 4})
         commands = [raw for raw in payloads if raw.startswith(b"command")]
         return states, commands
     return run
@@ -103,6 +112,77 @@ def test_policy_stop_does_not_leak_save_or_discard_on_partial_release(run_manage
     assert states[-1]["stream_mode"].item() == 0
     assert commands[-1] == manager.build_command_message(start=False, stop=True, planner=True)
     assert not any(s["toggle_data_collection"].item() or s["toggle_data_abort"].item() for s in states)
+
+
+def test_pause_and_policy_off_hold_hands_until_resume(run_manager):
+    states, _ = run_manager(enter_mode(1) + [
+        {"pause": True}, {"pause": True}, {}, {"buttons": "abxy"}, {},
+    ])
+    assert [s["stream_mode"].item() for s in states[-5:]] == [4, 4, 1, 0, 0]
+
+
+def test_hand_intent_keeps_stale_headset_samples_invalid_during_hold(monkeypatch):
+    socket = Mock()
+    reader = Mock(get_timestamp_ns=Mock(side_effect=[10, 10, 11]))
+    monkeypatch.setattr(manager, "get_controller_inputs", lambda _: (False, 0, 0.8, 0.9, 0))
+    stream = manager.HandIntentStream()
+    for hold in (False, True, False):
+        stream.publish(socket, reader, hold=hold)
+    first, held, resumed = [decode_intent(call.args[0]) for call in socket.send.call_args_list]
+    assert first["left"]["closed"] and first["right"]["closed"]
+    assert held["hold"] and not held["left"]["valid"] and not held["right"]["valid"]
+    assert not resumed["hold"] and resumed["left"]["valid"] and resumed["right"]["valid"]
+    assert first["sequence"] < held["sequence"] < resumed["sequence"]
+
+
+def test_standalone_pose_streamer_publishes_hands_on_its_own_port(monkeypatch):
+    body, hands = Mock(), Mock()
+    context = Mock(socket=Mock(side_effect=[body, hands]))
+    reader = Mock(get_timestamp_ns=lambda: 10)
+    monkeypatch.setattr(manager.zmq, "Context", lambda: context)
+    monkeypatch.setattr(manager, "_init_input_source", lambda *_: reader)
+    monkeypatch.setattr(manager, "ThreePointPose", Mock())
+    streamer = Mock(run_once=Mock(side_effect=[None, KeyboardInterrupt]))
+    monkeypatch.setattr(manager, "PoseStreamer", Mock(return_value=streamer))
+    monkeypatch.setattr(manager, "get_controller_inputs", lambda _: (False, 0, 0, 0, 0))
+    monkeypatch.setattr(manager.time, "sleep", lambda _: None)
+    manager.run_pico(input_source="isaac", hand_intent_port=15669)
+    hands.bind.assert_called_once_with("tcp://*:15669")
+    body.bind.assert_called_once_with("tcp://*:5556")
+    assert not decode_intent(hands.send.call_args.args[0])["hold"]
+    assert not any(call.args[0].startswith(b"hand_intent") for call in body.send.call_args_list)
+    hands.close.assert_called_once()
+    context.term.assert_called_once()
+
+
+@pytest.mark.parametrize("entrypoint", [manager.run_pico, manager.run_pico_manager])
+@pytest.mark.parametrize("port", [5556, 0, 65536])
+def test_invalid_hand_ports_fail_before_starting_the_headset(monkeypatch, entrypoint, port):
+    monkeypatch.setattr(manager, "_init_input_source", lambda *_: pytest.fail("headset started"))
+    with pytest.raises(ValueError, match="hand intent port"):
+        entrypoint(hand_intent_port=port)
+
+
+@pytest.mark.parametrize("pico_manager", [True, False])
+def test_launcher_wires_matching_custom_hand_ports_without_launching_processes(monkeypatch, pico_manager):
+    from gear_sonic.scripts import launch_data_collection as launcher
+
+    sent = {}
+    monkeypatch.setattr(launcher, "_check_prerequisites", lambda _: None)
+    monkeypatch.setattr(launcher, "_get_local_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr(launcher, "_kill_existing_session", lambda: None)
+    monkeypatch.setattr(launcher, "_switch_camera_source", lambda _: None)
+    monkeypatch.setattr(launcher, "_create_tmux_session", lambda _: None)
+    monkeypatch.setattr(launcher, "_send_to_pane", lambda pane, command, **_: sent.update({pane: command}))
+    monkeypatch.setattr(launcher.subprocess, "run", Mock())
+    monkeypatch.setattr(launcher.time, "sleep", lambda _: None)
+    config = launcher.DataCollectionLaunchConfig(
+        sim=True, hand_backend="omnihand", hand_intent_port=15669, pico_manager=pico_manager,
+    )
+    launcher.main(config)
+    assert "--hand-intent-port 15669" in sent[1]
+    assert (" --manager" in sent[1]) == pico_manager
+    assert "--intent-endpoint tcp://localhost:15669" in sent[launcher._hand_pane(config)]
 
 
 @pytest.mark.parametrize("status", [None, False, True])

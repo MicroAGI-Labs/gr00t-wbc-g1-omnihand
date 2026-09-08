@@ -32,6 +32,10 @@ CAPTURE_SOURCE_FIELDS = {
     "hand_state_sequence": ("hand", "sequence", 1),
     "hand_state_source_monotonic_ns": ("hand", "monotonic_ns", 1),
     "hand_intent_sequence": ("hand", "intent_sequence", 1),
+    "hand_intent_source_monotonic_ns": ("hand", "intent_monotonic_ns", 1),
+    "hand_intent_received_monotonic_ns": ("hand", "intent_received_monotonic_ns", 1),
+    "hand_publish_sequence": ("hand", "publish_sequence", 1),
+    "hand_publish_monotonic_ns": ("hand", "published_monotonic_ns", 1),
     "pico_pose_sequence": ("sonic", "frame_index", 1),
     "pico_pose_sample_monotonic_ns": ("sonic", "timestamp_monotonic", 1_000_000_000),
 }

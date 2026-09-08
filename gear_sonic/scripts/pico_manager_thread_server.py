@@ -38,6 +38,7 @@ import zmq
 
 from gear_sonic.end_effectors.controller import TriggerHysteresis
 from gear_sonic.end_effectors.protocol import (
+    HAND_INTENT_PORT,
     HAND_INTENT_SCHEMA,
     HAND_INTENT_TOPIC,
     encode as encode_hand_message,
@@ -202,7 +203,7 @@ class HandIntentStream:
         self.last_source_timestamp_ns: int | None = None
         self.hysteresis = TriggerHysteresis()
 
-    def publish(self, socket, reader) -> None:
+    def publish(self, socket, reader, *, hold: bool = False) -> None:
         _, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(reader)
         try:
             source_timestamp_ns = int(reader.get_timestamp_ns())
@@ -228,6 +229,7 @@ class HandIntentStream:
                     "sequence": self.sequence,
                     "monotonic_ns": time.monotonic_ns(),
                     "source": "pico",
+                    "hold": hold,
                     "left": {
                         "valid": valid,
                         "closed": left_closed,
@@ -1039,6 +1041,7 @@ class PicoReader:
 
 def _pose_stream_common(
     socket,
+    hand_socket,
     buffer_size: int,
     num_frames_to_send: int,
     target_fps: int,
@@ -1092,7 +1095,7 @@ def _pose_stream_common(
     try:
         while not stop_event.is_set():
             streamer.run_once()
-            hand_intent.publish(socket, reader)
+            hand_intent.publish(hand_socket, reader)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1844,12 +1847,15 @@ def run_pico(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    hand_intent_port: int = HAND_INTENT_PORT,
 ):
     """Run body tracking with real-time visualization and ZMQ streaming."""
+    _validate_hand_intent_port(hand_intent_port, port)
     reader = _init_input_source(input_source, buffer_size)
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
+    hand_socket = _bind_hand_intent(context, hand_intent_port)
     time.sleep(0.1)
     print(f"ZMQ socket bound to port {port}")
     if build_command_message is not None and build_planner_message is not None:
@@ -1861,6 +1867,7 @@ def run_pico(
     try:
         _pose_stream_common(
             socket=socket,
+            hand_socket=hand_socket,
             buffer_size=buffer_size,
             num_frames_to_send=num_frames_to_send,
             target_fps=target_fps,
@@ -1880,6 +1887,7 @@ def run_pico(
         if input_source == "xrt":
             _close_xrt()
         socket.close()
+        hand_socket.close()
         context.term()
         print("Threads stopped, ZMQ socket closed")
 
@@ -2131,6 +2139,23 @@ class PlannerStreamer:
         self.last_send = time.time()
 
 
+def _validate_hand_intent_port(port: int, body_port: int) -> None:
+    if not 1 <= port <= 65535 or port == body_port:
+        raise ValueError("hand intent port must be in [1, 65535] and differ from the body port")
+
+
+def _bind_hand_intent(context, port: int):
+    socket = context.socket(zmq.PUB)
+    socket.setsockopt(zmq.SNDHWM, 1)
+    socket.setsockopt(zmq.LINGER, 0)
+    try:
+        socket.bind(f"tcp://*:{port}")
+    except Exception:
+        socket.close()
+        raise
+    return socket
+
+
 def run_pico_manager(
     port: int = 5556,
     buffer_size: int = 15,
@@ -2148,6 +2173,7 @@ def run_pico_manager(
     input_source: str = "xrt",
     recording_status_host: str = "localhost",
     recording_status_port: int = 5581,
+    hand_intent_port: int = HAND_INTENT_PORT,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2158,11 +2184,13 @@ def run_pico_manager(
       X+B: Start/stop-success recording
       Y+A: Discard active recording
     """
+    _validate_hand_intent_port(hand_intent_port, port)
     reader = _init_input_source(input_source, buffer_size)
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
+    hand_socket = _bind_hand_intent(context, hand_intent_port)
     recording_status_socket = context.socket(zmq.SUB)
     recording_status_socket.setsockopt_string(zmq.SUBSCRIBE, "")
     recording_status_socket.setsockopt(zmq.CONFLATE, 1)
@@ -2264,6 +2292,7 @@ def run_pico_manager(
                             topic="manager_state",
                         )
                     )
+                    hand_intent.publish(hand_socket, reader, hold=True)
                     time.sleep(0.05)
 
                 if isinstance(reader, PicoReader):
@@ -2472,11 +2501,10 @@ def run_pico_manager(
                 )
             )
 
-            # Keep this last on the shared PUB socket. The hand controller uses
-            # a conflating subscriber, so publishing hand intent last prevents
-            # unrelated manager/pose messages from starving its filtered topic.
-            # Stalled headset timestamps remain invalid rather than implying open.
-            hand_intent.publish(socket, reader)
+            hand_intent.publish(
+                hand_socket, reader,
+                hold=current_mode in {StreamMode.OFF, StreamMode.POSE_PAUSE},
+            )
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
@@ -2484,9 +2512,7 @@ def run_pico_manager(
             prev_left_axis_click = left_axis_click
 
             # Active pose/planner streamers pace their own loops. OFF and
-            # POSE_PAUSE do not, so pace them here to avoid flooding the shared
-            # PUB socket with repeated headset timestamps and starving the
-            # freshness-qualified hand-intent frames.
+            # POSE_PAUSE do not, so pace their state and hold publications here.
             if new_mode in {StreamMode.OFF, StreamMode.POSE_PAUSE}:
                 time.sleep(1.0 / max(target_fps, 1))
 
@@ -2500,6 +2526,7 @@ def run_pico_manager(
         three_point.close()
         recording_status_socket.close()
         socket.close()
+        hand_socket.close()
         context.term()
         print("[Manager] Shutdown complete")
 
@@ -2511,6 +2538,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--buffer_size", type=int, default=15, help="Sliding window buffer size")
     parser.add_argument("--port", type=int, default=5556, help="ZMQ server port (default: 5556)")
+    parser.add_argument("--hand-intent-port", type=int, default=HAND_INTENT_PORT)
     parser.add_argument(
         "--num_frames_to_send", type=int, default=5, help="Number of frames to send (default: 200)"
     )
@@ -2638,6 +2666,7 @@ if __name__ == "__main__":
     if args.manager:
         run_pico_manager(
             port=args.port,
+            hand_intent_port=args.hand_intent_port,
             buffer_size=args.buffer_size,
             num_frames_to_send=args.num_frames_to_send,
             target_fps=args.target_fps,
@@ -2659,6 +2688,7 @@ if __name__ == "__main__":
         run_pico(
             buffer_size=args.buffer_size,
             port=args.port,
+            hand_intent_port=args.hand_intent_port,
             num_frames_to_send=args.num_frames_to_send,
             target_fps=args.target_fps,
             use_cuda=args.cuda,

@@ -16,6 +16,7 @@ from .protocol import (
     HAND_STATE_TOPIC,
     decode_state,
     encode,
+    feedback_age_s,
 )
 
 BODY_JOINT_NAMES = (
@@ -134,6 +135,9 @@ class OmniHandMuJoCoDriver:
             return
         if payload.get("mode") in {"disconnected", "fault"}:
             return
+        age = feedback_age_s(payload)
+        if age > self.state_timeout_s:
+            return
         session_id = payload.get("session_id")
         sequence = payload.get("sequence")
         if not isinstance(session_id, str) or isinstance(sequence, bool) or not isinstance(sequence, int):
@@ -164,7 +168,7 @@ class OmniHandMuJoCoDriver:
             candidates[side] = values
         self.targets = candidates
         self._state_sequence = sequence
-        self._state_received_at = time.monotonic()
+        self._state_received_at = time.monotonic() - age
 
     def _drain_state(self) -> None:
         while self._state_socket.poll(0):

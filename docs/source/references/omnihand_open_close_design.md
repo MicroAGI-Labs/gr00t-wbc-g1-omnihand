@@ -182,17 +182,31 @@ versions.
 
 ### PICO to controller
 
-Reuse the PICO PUB socket on port `5556`, topic `hand_intent`. The controller
-SUB uses `RCVHWM=1` and `CONFLATE=1`.
+PICO publishes only `hand_intent` on dedicated port `5569`; body/planner/manager
+topics stay on `5556`. The hand SUB uses `CONFLATE=1` to consume the latest intent
+after slow SDK calls. Mixed topics must not share this endpoint: conflation can
+otherwise retain an unrelated topic and starve hand input.
 
-`sonic.hand_intent.v1` fields:
+`sonic.hand_intent.v2` fields:
 
 ```text
-schema, sequence, monotonic_ns, source="pico"
+schema, sequence, monotonic_ns, source="pico", hold
 left/right: {valid, closed, trigger}
 ```
 
 There are deliberately no hardware names or joint vectors here.
+The manager sets `hold=true` in OFF and POSE_PAUSE; active modes retain grip and
+trigger control. A hold reads current measured positions for both selected sides,
+validates feedback and health before any write, then writes each held position
+once. Repeated holds do not keep writing. An invalid headset sample may request
+a hold but cannot resume motion or refresh input validity; resuming each side
+requires fresh valid input. The standalone pose streamer always sends `hold=false`.
+
+The launcher wires both endpoints using `--hand-intent-port` (default `5569`).
+For separate processes, pass `--hand-intent-port PORT` to the PICO script and
+`--intent-endpoint tcp://HOST:PORT` to the hand controller. Upgrade both producers
+and consumers together; v1 packets are rejected rather than interpreted as a
+resume command. Hand travel and transition-speed defaults are unchanged.
 
 ### Controller to collector
 
@@ -207,12 +221,32 @@ Controller PUB port `5570`:
   and current.
 
 Unselected sides are absent/null, never fake feedback.
+One spawned publisher process maintains the configured cadence (default 50 Hz)
+while the controller owns hardware I/O and in-process reconnects. Its one-slot
+mailbox never blocks hardware I/O. `sequence` and `monotonic_ns` identify the
+controller snapshot and stay unchanged when that snapshot is repeated;
+`publish_sequence` and `published_monotonic_ns` identify each publication.
+`state_age_s` and per-side `feedback_age_s` increase while SDK reads are stalled.
+The source timestamp marks the start of the controller cycle, so age conservatively
+includes time spent in health and feedback reads. `controller_step_duration_s`
+reports that cycle's elapsed time. Config also reports SDK request/receive timing.
+
+The collector and browser add source feedback age to local receive age. Repeated
+status cannot keep stale hardware feedback healthy. Source and publication clocks
+are compared only inside the hand host; receive-clock causal selection remains
+unchanged. Brief PICO gaps with healthy hand feedback still skip unavailable
+targets and preserve the take. Hardware feedback loss and reconnects still fail
+episode validation. A publisher process is not an external hardware supervisor.
 
 ## Controller safety contract
 
-Provide two distinct commands, not a teleoperation “dry-run backend”:
+Commands:
 
 - `probe`: structurally read-only interface/device/identity/feedback diagnostics.
+- `hold --backend omnihand --enable-command`: explicitly enabled physical
+  diagnostic. Validates all selected hands, writes their measured pose once,
+  waits 250 ms, then fails on a motor fault or following error above 0.02 rad.
+  It closes every opened device on success or failure and prints a JSON report.
 - `run`: real controller, entered through the launcher's real-robot confirmation.
 
 Mock devices are internal to tests/simulation only.

@@ -421,7 +421,11 @@ def test_source_timing_round_trips_selected_samples_and_resumes(tmp_path, body_s
     messages = {
         "proprio": {"index": 2**53 + 17},
         "camera": {"publisher_sequence": 11, "publisher_monotonic_ns": 17_000_000_000},
-        "hand": {"sequence": 23, "monotonic_ns": 19_000_000_000, "intent_sequence": 42},
+        "hand": {
+            "sequence": 23, "monotonic_ns": 19_000_000_000, "intent_sequence": 42,
+            "intent_monotonic_ns": 18_000_000_000, "intent_received_monotonic_ns": 18_500_000_000,
+            "publish_sequence": 100, "published_monotonic_ns": 19_500_000_000,
+        },
     }
     for tick in range(3):
         received = base + tick * 20_000_000
@@ -461,6 +465,9 @@ def test_source_timing_round_trips_selected_samples_and_resumes(tmp_path, body_s
         "robot_state_sequence": 2**53 + 17, "camera_sequence": 11,
         "camera_publish_monotonic_ns": 17_000_000_000, "hand_state_sequence": 23,
         "hand_state_source_monotonic_ns": 19_000_000_000, "hand_intent_sequence": 42,
+        "hand_intent_source_monotonic_ns": 18_000_000_000,
+        "hand_intent_received_monotonic_ns": 18_500_000_000,
+        "hand_publish_sequence": 100, "hand_publish_monotonic_ns": 19_500_000_000,
         "pico_pose_sequence": 7, "pico_pose_sample_monotonic_ns": 1_234_500_000_000,
     }
     for name, value in expected.items():
@@ -557,7 +564,7 @@ def test_collector_waits_for_watermarks_then_records_a_bounded_gap(monkeypatch):
 @pytest.mark.parametrize("mode,dropout,failure", [
     (1, "all", None), (5, "all", None), (1, "pose", None), (5, "pose", None), (5, "hand", None),
     (5, "all", "camera"), (5, "all", "proprio"), (5, "all", "hand"),
-    (5, "all", "hand_fault"), (5, "all", "hand_invalid"),
+    (5, "all", "hand_fault"), (5, "all", "hand_invalid"), (5, "all", "hand_stale"),
 ])
 def test_pico_dropout_preserves_take_without_hiding_hardware_failures(
     tmp_path, monkeypatch, mode, dropout, failure
@@ -589,6 +596,7 @@ def test_pico_dropout_preserves_take_without_hiding_hardware_failures(
         interrupted = 6 <= tick < 56  # PICO stops for exactly one second, then resumes.
         hand = {
             "mode": "fault" if interrupted and failure == "hand_fault" else "tracking",
+            "state_age_s": 0.3 if interrupted and failure == "hand_stale" else 0.0,
             "input_stale": interrupted and dropout in {"all", "hand"}, "intent_sequence": tick,
             "sides": {
                 side: {"valid": True, "connected": not (interrupted and failure == "hand_invalid"),
@@ -628,6 +636,22 @@ def test_pico_dropout_preserves_take_without_hiding_hardware_failures(
     assert quality["discarded"] is (failure is not None)
     table = pq.read_table(exporter.root / exporter.meta.get_data_file_path(0))
     assert table["capture.sync_target_monotonic_ns"].to_pylist() == recorded
+
+
+def test_hand_freshness_combines_source_age_with_causal_receive_age():
+    collector = _recording_collector()
+    collector.hand_profile = OMNIHAND_O10
+    state = {
+        "mode": "tracking", "state_age_s": 0.15, "input_stale": False, "intent_sequence": 1,
+        "sides": {
+            side: {"valid": True, "connected": True, "intent_closed": False,
+                   **{f"{field}_position_rad": np.zeros(10) for field in ("requested", "applied", "measured")}}
+            for side in ("left", "right")
+        },
+    }
+    assert len(collector._external_hand_values(state, receive_age_s=0.04)) == 6
+    with pytest.raises(RuntimeError, match="hardware feedback is stale"):
+        collector._external_hand_values(state, receive_age_s=0.06)
 
 
 @pytest.mark.parametrize("camera_hz", [30, 60])
@@ -718,6 +742,11 @@ def test_hand_ui_reports_stale_status_without_a_relay(monkeypatch):
     hub._hand_status = {"sides": {"left": {"valid": True, "connected": True}}}
     monkeypatch.setattr(time, "monotonic", lambda: 10.1)
     assert hub.hands_status()["connected"]
+    hub._hand_status["state_age_s"] = 0.2
+    assert not hub.hands_status()["connected"]
+    assert hub.hands_status()["last_status_age_s"] == pytest.approx(0.1)
+    assert hub.hands_status()["feedback_age_s"] == pytest.approx(0.3)
+    hub._hand_status.pop("state_age_s")
     monkeypatch.setattr(time, "monotonic", lambda: 10.3)
     assert not hub.hands_status()["connected"]
     hub.config.hand_controls = False

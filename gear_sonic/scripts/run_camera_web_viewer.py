@@ -30,6 +30,7 @@ from gear_sonic.end_effectors.protocol import (
     HAND_STATE_TOPIC,
     decode_state,
     encode,
+    feedback_age_s,
 )
 
 _INDEX_HTML = """<!doctype html>
@@ -152,9 +153,9 @@ _INDEX_HTML = """<!doctype html>
         const status = await (await fetch('/hands/status', {cache: 'no-store'})).json();
         handControls.hidden = !status.enabled;
         const mode = status.mode === 'fault' ? 'FAULT' : (status.connected ? 'CONNECTED' : 'OFFLINE / RECOVERING');
-        const age = status.last_status_age_s == null
-          ? 'unknown' : `${Math.round(status.last_status_age_s * 1000)} ms`;
-        handStatus.textContent = `Hands: ${mode} · status age ${age}`
+        const age = status.feedback_age_s == null
+          ? 'unknown' : `${Math.round(status.feedback_age_s * 1000)} ms`;
+        handStatus.textContent = `Hands: ${mode} · feedback age ${age}`
           + (status.connection_error ? ` · ${status.connection_error}` : '');
       } catch (_) {
         handStatus.textContent = 'Hand status unavailable';
@@ -443,10 +444,11 @@ class RecorderControlHub:
         payload.update(
             enabled=self.config.hand_controls,
             connected=age is not None
-            and age <= self.config.hand_state_max_age
+            and age + feedback_age_s(payload) <= self.config.hand_state_max_age
             and bool(sides)
             and all(side.get("valid") and side.get("connected") for side in sides.values()),
             last_status_age_s=age,
+            feedback_age_s=None if age is None else age + feedback_age_s(payload),
         )
         return payload
 

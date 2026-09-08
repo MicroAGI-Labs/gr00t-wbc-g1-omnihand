@@ -5,11 +5,12 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
+import pytest
 import zmq
 
 from gear_sonic.end_effectors.mujoco_driver import OmniHandMuJoCoDriver
 from gear_sonic.end_effectors.profiles import OMNIHAND_O10
-from gear_sonic.end_effectors.protocol import HAND_STATE_SCHEMA, HAND_STATE_TOPIC, encode
+from gear_sonic.end_effectors.protocol import HAND_STATE_SCHEMA, HAND_STATE_TOPIC, decode_state, encode
 
 REPO = Path(__file__).resolve().parents[3]
 ASSET_ROOT = REPO / "gear_sonic/data/robot_model/model_data/g1_omnihand"
@@ -37,6 +38,28 @@ def _controller_state(left: list[float], right: list[float]) -> bytes:
             },
         },
     )
+
+
+def test_republished_feedback_does_not_refresh_the_simulator_watchdog(monkeypatch):
+    driver = OmniHandMuJoCoDriver.__new__(OmniHandMuJoCoDriver)
+    driver.state_timeout_s = 0.2
+    driver._session_id = driver._state_sequence = driver._state_received_at = None
+    driver.targets = {}
+    payload = decode_state(_controller_state(
+        OMNIHAND_O10.left.target(True, 0.35).tolist(), OMNIHAND_O10.right.open_rad,
+    ))
+    payload["state_age_s"] = 0.3
+    driver._accept_state(encode(HAND_STATE_TOPIC, payload))
+    assert driver.targets == {} and driver._state_received_at is None
+    monkeypatch.setattr("gear_sonic.end_effectors.mujoco_driver.time.monotonic", lambda: 10.0)
+    payload["state_age_s"] = 0.05
+    driver._accept_state(encode(HAND_STATE_TOPIC, payload))
+    assert driver._state_received_at == pytest.approx(9.95)
+    assert driver._state_sequence == 1
+    payload["state_age_s"] = 0.0
+    payload["publish_sequence"] = 100
+    driver._accept_state(encode(HAND_STATE_TOPIC, payload))
+    assert driver._state_received_at == pytest.approx(9.95)
 
 
 def test_atlas_combined_asset_has_body_active_passive_and_contact_contract():

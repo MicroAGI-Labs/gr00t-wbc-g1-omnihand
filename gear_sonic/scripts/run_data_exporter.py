@@ -60,6 +60,7 @@ from gear_sonic.end_effectors.protocol import (
     HAND_STATE_TOPIC,
     decode_config,
     decode_state,
+    feedback_age_s,
 )
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
@@ -555,8 +556,9 @@ class GrootDataCollector:
         if self.hand_config is not None:
             hand_ready = bool(
                 self.latest_hand_state
-                and time.monotonic_ns() - self.latest_hand_state.get("received_monotonic_ns", 0)
-                <= self.hand_state_max_age * 1e9
+                and feedback_age_s(self.latest_hand_state)
+                + max(0.0, (time.monotonic_ns() - self.latest_hand_state.get("received_monotonic_ns", 0)) / 1e9)
+                <= self.hand_state_max_age
                 and self.latest_hand_state.get("mode") != "fault"
                 and not self.latest_hand_state.get("input_stale", True)
                 and self.latest_hand_state.get("intent_sequence") is not None
@@ -658,6 +660,8 @@ class GrootDataCollector:
     def _external_hand_values(
         self,
         hand_state: dict,
+        *,
+        receive_age_s: float = 0.0,
     ) -> tuple[
         np.ndarray,
         np.ndarray,
@@ -668,6 +672,8 @@ class GrootDataCollector:
     ]:
         if hand_state.get("mode") == "fault":
             raise RuntimeError("external hand controller is faulted")
+        if feedback_age_s(hand_state) + receive_age_s > self.hand_state_max_age:
+            raise RuntimeError("external hand hardware feedback is stale")
         values = []
         for field in ("requested_position_rad", "applied_position_rad", "measured_position_rad"):
             for side in ("left", "right"):
@@ -1183,7 +1189,10 @@ class GrootDataCollector:
             sample_errors.extend(self._selected_camera_errors(selection))
         if self.hand_config is not None and "hand" in selection.samples:
             try:
-                self._external_hand_values(selection.samples["hand"].value)
+                sample = selection.samples["hand"]
+                self._external_hand_values(
+                    sample.value, receive_age_s=(target_ns - sample.timestamp_ns) / 1e9,
+                )
             except TeleopInputUnavailable as exc:
                 input_warnings.append(str(exc))
             except (RuntimeError, TypeError, ValueError) as exc:

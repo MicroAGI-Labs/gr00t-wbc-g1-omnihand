@@ -70,6 +70,8 @@ _bootstrap_venv()
 
 import tyro  # noqa: E402
 
+from gear_sonic.end_effectors.protocol import HAND_INTENT_PORT  # noqa: E402
+
 
 def _get_local_ip() -> str:
     """Best-effort detection of the PC's LAN IP address."""
@@ -116,6 +118,9 @@ class DataCollectionLaunchConfig:
 
     hand_backend: Literal["dex3", "omnihand", "none"] = "dex3"
     """Hand owner. OmniHand uses the external controller in sim and hardware."""
+
+    hand_intent_port: int = HAND_INTENT_PORT
+    """Dedicated PICO-to-hand intent port; must differ from body and status ports."""
 
     omnihand_close_scale: float = 0.35
     """Fraction of the provisional O10 closed pose admitted for hardware motion."""
@@ -212,6 +217,10 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
         errors.append("--remote-ui-port must be between 1 and 65535")
     if not 1 <= config.camera_port <= 65535:
         errors.append("--camera-port must be between 1 and 65535")
+    if not 1 <= config.hand_intent_port <= 65535 or config.hand_intent_port in {
+        5556, 5557, 5570, 5571, 5572, 5580, 5581, config.remote_ui_port, config.camera_port,
+    }:
+        errors.append("--hand-intent-port must be a distinct port between 1 and 65535")
 
     repo_root = Path(__file__).resolve().parent.parent.parent
 
@@ -467,7 +476,7 @@ def main(config: DataCollectionLaunchConfig):
     # --- Pane 1 (top-right): Teleop Streamer ---
     pico_process_cmd = (
         "python gear_sonic/scripts/pico_manager_thread_server.py "
-        f"--input-source {config.pico_input_source}"
+        f"--input-source {config.pico_input_source} --hand-intent-port {config.hand_intent_port}"
     )
     if config.pico_manager:
         pico_process_cmd += " --manager"
@@ -506,6 +515,7 @@ def main(config: DataCollectionLaunchConfig):
             f"cd {repo_root} && source {hand_venv}/bin/activate && "
             f"python -m gear_sonic.end_effectors.controller run "
             f"--backend {hand_backend} --sides both "
+            f"--intent-endpoint tcp://localhost:{config.hand_intent_port} "
             f"--left-interface {config.omnihand_left_interface} "
             f"--right-interface {config.omnihand_right_interface} "
             f"--close-scale {close_scale} "

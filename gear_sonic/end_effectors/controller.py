@@ -20,17 +20,17 @@ from .backends.omnihand import OmniHandBackend, OmniHandHardwareError, vendor_ou
 from .profiles import HandProfile, HandSide, get_hand_profile
 from .protocol import (
     HAND_CONFIG_SCHEMA,
-    HAND_CONFIG_TOPIC,
+    HAND_INTENT_PORT,
     HAND_INTENT_TOPIC,
     HAND_STATE_SCHEMA,
-    HAND_STATE_TOPIC,
     HandProtocolError,
     decode_control,
     decode_intent,
-    encode,
 )
+from .publisher import HandStatePublisher
 
 STARTUP_FEEDBACK_TOLERANCE_RAD = 0.01
+HOLD_ERROR_LIMIT_RAD = 0.02
 HARD_MOTOR_ERROR_MASK = 0x0F
 
 
@@ -91,6 +91,9 @@ class SafeHandController:
         self.session_id = uuid.uuid4().hex if session_id is None else session_id
         self.sequence = 0
         self.last_intent_sequence: int | None = None
+        self._last_seen_intent_sequence: int | None = None
+        self.last_intent_monotonic_ns: int | None = None
+        self.last_intent_received_ns: int | None = None
         self.last_intent_at: float | None = None
         self.last_valid_intent_at: dict[str, float | None] = {side: None for side in self.devices}
         self.last_step_at = clock()
@@ -104,19 +107,25 @@ class SafeHandController:
         self.intent_closed: dict[str, bool | None] = {side: None for side in self.devices}
         self.errors: dict[str, str | None] = {side: None for side in self.devices}
         self.fault_latched = False
+        self.explicit_hold = {side: False for side in self.devices}
+        self._hold_pending: set[str] = set()
         self._connect_hold()
+
+    def _measured_hold(self, side: str) -> np.ndarray:
+        side_profile = self.profile.side(side)
+        measured = np.asarray(self.devices[side].read_positions(), dtype=np.float64).reshape(-1)
+        if measured.shape != (side_profile.width,) or not np.all(np.isfinite(measured)):
+            raise HandControllerError(f"{side} measured hold feedback is invalid")
+        bounded = np.clip(measured, side_profile.lower_rad, side_profile.upper_rad)
+        if np.any(np.abs(bounded - measured) > STARTUP_FEEDBACK_TOLERANCE_RAD):
+            raise HandControllerError(f"{side} measured hold feedback exceeds admitted limits")
+        return bounded
 
     def _connect_hold(self) -> None:
         startup_positions: dict[str, np.ndarray] = {}
         startup_health: dict[str, dict[str, Any]] = {}
         for side, device in self.devices.items():
-            side_profile = self.profile.side(side)
-            measured = np.asarray(device.read_positions(), dtype=np.float64).reshape(-1)
-            if measured.shape != (side_profile.width,) or not np.all(np.isfinite(measured)):
-                raise HandControllerError(f"{side} startup feedback is invalid")
-            bounded = np.clip(measured, side_profile.lower_rad, side_profile.upper_rad)
-            if np.any(np.abs(bounded - measured) > STARTUP_FEEDBACK_TOLERANCE_RAD):
-                raise HandControllerError(f"{side} startup feedback exceeds admitted limits")
+            bounded = self._measured_hold(side)
             health = device.read_health()
             if _has_hard_motor_error(health.get("error_masks", ())):
                 raise HandControllerError(f"{side} reported a startup motor error")
@@ -137,7 +146,7 @@ class SafeHandController:
 
     def accept_intent(self, payload: Mapping[str, Any], *, now: float | None = None) -> bool:
         sequence = int(payload["sequence"])
-        if self.last_intent_sequence is not None and sequence <= self.last_intent_sequence:
+        if self._last_seen_intent_sequence is not None and sequence <= self._last_seen_intent_sequence:
             return False
         if self.fault_latched:
             return False
@@ -145,23 +154,36 @@ class SafeHandController:
         received_at = self.clock() if now is None else now
         for side in self.devices:
             side_intent = payload[side]
+            if payload["hold"]:
+                # A stop is safe even when the PICO sample is invalid. It must
+                # not refresh input validity or let an invalid resume move us.
+                if not self.explicit_hold[side]:
+                    self._hold_pending.add(side)
+                self.explicit_hold[side] = True
+                accepted = True
             if not side_intent["valid"]:
                 continue
-            side_profile = self.profile.side(side)
-            target = side_profile.target(bool(side_intent["closed"]), self.close_scale)
-            if not np.array_equal(target, self.requested[side]):
-                self.requested[side] = target
-                if self.transition_duration_s is not None:
-                    base_velocity = np.asarray(side_profile.velocity_rad_s, dtype=np.float64)
-                    nominal_duration = float(np.max(np.abs(target - self.applied[side]) / base_velocity))
-                    self.velocity_scale[side] = nominal_duration / self.transition_duration_s
+            if not payload["hold"]:
+                self.explicit_hold[side] = False
+                self._hold_pending.discard(side)
+                side_profile = self.profile.side(side)
+                target = side_profile.target(bool(side_intent["closed"]), self.close_scale)
+                if not np.array_equal(target, self.requested[side]):
+                    self.requested[side] = target
+                    if self.transition_duration_s is not None:
+                        base_velocity = np.asarray(side_profile.velocity_rad_s, dtype=np.float64)
+                        nominal_duration = float(np.max(np.abs(target - self.applied[side]) / base_velocity))
+                        self.velocity_scale[side] = nominal_duration / self.transition_duration_s
             self.intent_closed[side] = bool(side_intent["closed"])
             self.last_valid_intent_at[side] = received_at
-            accepted = True
-        self.last_intent_sequence = sequence
-        if accepted:
             self.last_intent_at = received_at
-            self.mode = "tracking"
+            accepted = True
+        self._last_seen_intent_sequence = sequence
+        if accepted:
+            self.last_intent_sequence = sequence
+            self.last_intent_monotonic_ns = payload["monotonic_ns"]
+            self.last_intent_received_ns = int(received_at * 1e9)
+            self.mode = "hold" if all(self.explicit_hold.values()) else "tracking"
         return accepted
 
     def step(self, *, now: float | None = None) -> dict[str, Any]:
@@ -174,7 +196,7 @@ class SafeHandController:
         stale = any(stale_by_side.values())
         if all(stale_by_side.values()) and not self.fault_latched:
             self.mode = "hold"
-        poll_health = checked_at - self.last_health_at >= 0.2
+        poll_health = bool(self._hold_pending) or checked_at - self.last_health_at >= 0.2
         if poll_health:
             # Health is a bilateral gate: discover all selected-side faults
             # before allowing a write to either hand in this cycle.
@@ -184,14 +206,26 @@ class SafeHandController:
                     self.fault_latched = True
                     self.mode = "fault"
                     self.errors[side] = "non-zero motor error mask (latched)"
+        # Capture current feedback for every selected side before any hold write.
+        # Cached feedback can lag behind the previous command while a hand moves.
+        holds = (
+            {side: self._measured_hold(side) for side in self.devices}
+            if self._hold_pending and not self.fault_latched else {}
+        )
         for side, device in self.devices.items():
             side_profile = self.profile.side(side)
-            if not stale_by_side[side] and self.mode == "tracking" and not self.fault_latched:
+            if side in self._hold_pending and not self.fault_latched:
+                device.write_positions(holds[side])
+                self.requested[side] = holds[side].copy()
+                self.applied[side] = holds[side].copy()
+                self._hold_pending.remove(side)
+            elif not stale_by_side[side] and not self.explicit_hold[side] and not self.fault_latched:
                 target = np.clip(self.requested[side], side_profile.lower_rad, side_profile.upper_rad)
                 maximum = np.asarray(side_profile.velocity_rad_s) * self.velocity_scale[side] * dt
                 safe = self.applied[side] + np.clip(target - self.applied[side], -maximum, maximum)
-                device.write_positions(safe)
-                self.applied[side] = safe
+                if not np.array_equal(safe, self.applied[side]):
+                    device.write_positions(safe)
+                    self.applied[side] = safe
             self.measured[side] = np.asarray(device.read_positions(), dtype=np.float64).copy()
             if self.measured[side].shape != (side_profile.width,) or not np.all(np.isfinite(self.measured[side])):
                 raise HandControllerError(f"{side} feedback became invalid")
@@ -214,6 +248,8 @@ class SafeHandController:
                 "closed_rad": list(p.closed_rad),
                 "sdk_version": device.sdk_version,
                 "sdk_commit": device.sdk_commit,
+                "request_interval_ms": getattr(device, "request_interval_ms", None),
+                "frame_recv_timeout_ms": getattr(device, "frame_recv_timeout_ms", None),
             }
         return {
             "schema": HAND_CONFIG_SCHEMA,
@@ -239,6 +275,8 @@ class SafeHandController:
             "mode": self.mode,
             "target_source": "pico_open_close",
             "intent_sequence": self.last_intent_sequence,
+            "intent_monotonic_ns": self.last_intent_monotonic_ns,
+            "intent_received_monotonic_ns": self.last_intent_received_ns,
             "input_stale": stale,
             "input_age_s": None if self.last_intent_at is None else max(0.0, now - self.last_intent_at),
             "sides": {
@@ -250,6 +288,7 @@ class SafeHandController:
                     "connected": True,
                     "error": self.errors[side],
                     "intent_closed": self.intent_closed[side],
+                    "hold": self.explicit_hold[side],
                     "input_stale": stale_by_side[side],
                     "input_age_s": (
                         None
@@ -353,48 +392,95 @@ def probe(args: argparse.Namespace) -> int:
             device.close()
 
 
+def hold(args: argparse.Namespace) -> int:
+    """Write the measured pose once and report drift after a short settle."""
+    if args.backend != "omnihand" or not args.enable_command:
+        raise HandControllerError("hold requires --backend omnihand --enable-command")
+    profile = get_hand_profile("omnihand_o10.v1")
+    devices: dict[str, HandBackend] = {}
+    try:
+        with vendor_output_to_stderr():
+            for side in _selected_sides(args.sides):
+                devices[side] = _make_hardware_device(args, side, profile)
+            controller = SafeHandController(profile, devices, backend_name="omnihand")
+            time.sleep(0.25)
+            state = controller.step()
+        errors = {
+            side: float(np.max(np.abs(
+                np.asarray(value["measured_position_rad"]) - value["applied_position_rad"]
+            )))
+            for side, value in state["sides"].items()
+        }
+        passed = state["mode"] != "fault" and all(error <= HOLD_ERROR_LIMIT_RAD for error in errors.values())
+        print(json.dumps({
+            "passed": passed, "operation": "zero_delta_hold", "profile": profile.name,
+            "following_error_rad": errors, "limit_rad": HOLD_ERROR_LIMIT_RAD, "sides": state["sides"],
+        }, indent=2))
+        return 0 if passed else 1
+    except Exception as exc:
+        print(json.dumps({"passed": False, "operation": "zero_delta_hold", "error": str(exc)}, indent=2))
+        return 1
+    finally:
+        for device in devices.values():
+            device.close()
+
+
 def run(args: argparse.Namespace) -> int:
     if args.backend == "omnihand" and not args.enable_command:
         raise HandControllerError("--enable-command is required for physical OmniHand writes")
     profile = get_hand_profile("omnihand_o10.v1")
+    publisher = HandStatePublisher(args.state_endpoint, args.frequency, args.target_timeout)
     context = zmq.Context()
     subscriber = context.socket(zmq.SUB)
-    # This endpoint is shared with pose/planner/manager topics. SUB filtering
-    # leaves only hand intent, while a small HWM bounds latency. ZMQ_CONFLATE
-    # is deliberately avoided because it can retain an unrelated last message
-    # before topic filtering and intermittently starve this subscriber.
-    subscriber.setsockopt(zmq.RCVHWM, 4)
-    subscriber.setsockopt(zmq.SUBSCRIBE, HAND_INTENT_TOPIC)
-    subscriber.connect(args.intent_endpoint)
-    publisher = context.socket(zmq.PUB)
-    publisher.setsockopt(zmq.SNDHWM, 2)
-    publisher.setsockopt(zmq.LINGER, 0)
-    publisher.bind(args.state_endpoint)
     control = context.socket(zmq.REP)
     connection_id: str | None = None
     state_sequence = 0
 
-    def publish(topic: bytes, payload: dict) -> None:
+    def publish(payload: dict, config: dict | None = None) -> None:
         nonlocal state_sequence
         payload = dict(payload, connection_id=connection_id)
-        if topic == HAND_STATE_TOPIC:
-            # Wire sequences belong to the server session, not SDK connections.
-            state_sequence += 1
-            payload["sequence"] = state_sequence
-        try:
-            publisher.send(encode(topic, payload), flags=zmq.NOBLOCK)
-        except zmq.Again:
-            pass  # A slow status consumer must not block hand I/O.
+        # Source sequences belong to the server session, not SDK connections.
+        state_sequence += 1
+        payload["sequence"] = state_sequence
+        if config is not None:
+            config = dict(config, connection_id=connection_id)
+        publisher.publish(payload, config)
 
     selected_sides = _selected_sides(args.sides)
     session_id = uuid.uuid4().hex
     controller: SafeHandController | None = None
     next_reconnect_at = 0.0
     last_error: str | None = None
+
+    def disconnected_state(now: float) -> dict:
+        return {
+            "schema": HAND_STATE_SCHEMA,
+            "session_id": session_id,
+            "monotonic_ns": int(now * 1e9),
+            "backend": args.backend,
+            "profile": profile.name,
+            "mode": "fault" if math.isinf(next_reconnect_at) else "disconnected",
+            "connection_error": last_error,
+            "target_source": "pico_open_close",
+            "intent_sequence": None,
+            "input_stale": True,
+            "input_age_s": None,
+            "sides": {
+                side: {"valid": False, "connected": False, "error": last_error}
+                for side in selected_sides
+            },
+        }
+
     try:
+        # Only hand intent is allowed here, so conflation cannot retain an
+        # unrelated pose/planner message and starve hand input.
+        subscriber.setsockopt(zmq.CONFLATE, 1)
+        subscriber.setsockopt(zmq.SUBSCRIBE, HAND_INTENT_TOPIC)
+        subscriber.connect(args.intent_endpoint)
         control.bind(args.control_endpoint)
+        publish(disconnected_state(time.monotonic()))
         period = 1.0 / args.frequency
-        last_config = -math.inf
+        config = None
         while True:
             started = time.monotonic()
             just_connected = False
@@ -411,6 +497,7 @@ def run(args: argparse.Namespace) -> int:
                         controller = None
                     next_reconnect_at = started
             if controller is None and started >= next_reconnect_at:
+                publish(disconnected_state(started))
                 devices: dict[str, HandBackend] = {}
                 try:
                     devices = _make_devices(args, profile, context)
@@ -425,7 +512,7 @@ def run(args: argparse.Namespace) -> int:
                     )
                     connection_id = uuid.uuid4().hex
                     last_error = None
-                    last_config = -math.inf
+                    config = controller.config_payload()
                     # A reconnect is admitted from measured feedback only. Drop
                     # anything queued while disconnected and require a target
                     # published after this hold was established.
@@ -444,11 +531,7 @@ def run(args: argparse.Namespace) -> int:
             if controller is not None:
                 try:
                     if not just_connected:
-                        # A shared high-rate publisher can leave a backlog
-                        # across streamer reconnects. Drain it in one cycle
-                        # and apply only the newest intent; otherwise stale
-                        # pre-restart sequences can take minutes to clear one
-                        # message at a time while the hands remain in hold.
+                        # Only the newest intent may command this cycle.
                         latest_raw = None
                         while subscriber.poll(0):
                             latest_raw = subscriber.recv(zmq.NOBLOCK)
@@ -460,10 +543,8 @@ def run(args: argparse.Namespace) -> int:
                             else:
                                 controller.accept_intent(intent, now=started)
                     state = controller.step(now=started)
-                    publish(HAND_STATE_TOPIC, state)
-                    if started - last_config >= 2.0:
-                        publish(HAND_CONFIG_TOPIC, controller.config_payload())
-                        last_config = started
+                    state["controller_step_duration_s"] = max(0.0, time.monotonic() - started)
+                    publish(state, config)
                 except Exception as exc:
                     last_error = str(exc)
                     retryable = not controller.fault_latched and isinstance(
@@ -474,26 +555,7 @@ def run(args: argparse.Namespace) -> int:
                     next_reconnect_at = started + args.reconnect_interval if retryable else math.inf
                     print(f"[Hands] Connection lost: {exc}", flush=True)
             if controller is None:
-                publish(
-                    HAND_STATE_TOPIC,
-                    {
-                        "schema": HAND_STATE_SCHEMA,
-                        "session_id": session_id,
-                        "monotonic_ns": int(started * 1e9),
-                        "backend": args.backend,
-                        "profile": profile.name,
-                        "mode": "fault" if math.isinf(next_reconnect_at) else "disconnected",
-                        "connection_error": last_error,
-                        "target_source": "pico_open_close",
-                        "intent_sequence": None,
-                        "input_stale": True,
-                        "input_age_s": None,
-                        "sides": {
-                            side: {"valid": False, "connected": False, "error": last_error}
-                            for side in selected_sides
-                        },
-                    },
-                )
+                publish(disconnected_state(started))
             remaining = period - (time.monotonic() - started)
             if remaining > 0:
                 time.sleep(remaining)
@@ -503,7 +565,7 @@ def run(args: argparse.Namespace) -> int:
         if controller is not None:
             controller.close()
         subscriber.close(linger=0)
-        publisher.close(linger=0)
+        publisher.close()
         control.close(linger=0)
         context.term()
 
@@ -511,7 +573,7 @@ def run(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("probe", "run"):
+    for name in ("probe", "hold", "run"):
         command = sub.add_parser(name)
         command.add_argument("--backend", choices=("sim", "omnihand"), default="sim")
         command.add_argument("--sides", choices=("left", "right", "both"), default="both")
@@ -519,7 +581,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--right-interface", default="can10")
         command.add_argument("--enable-command", action="store_true")
     runner = sub.choices["run"]
-    runner.add_argument("--intent-endpoint", default="tcp://localhost:5556")
+    runner.add_argument("--intent-endpoint", default=f"tcp://localhost:{HAND_INTENT_PORT}")
     runner.add_argument("--state-endpoint", default="tcp://*:5570")
     runner.add_argument("--control-endpoint", default="tcp://127.0.0.1:5572")
     runner.add_argument("--frequency", type=float, default=50.0)
@@ -535,7 +597,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return probe(args) if args.command == "probe" else run(args)
+    return {"probe": probe, "hold": hold, "run": run}[args.command](args)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 from typing import Any
 
 import msgpack
@@ -11,7 +12,8 @@ HAND_INTENT_TOPIC = b"hand_intent"
 HAND_CONFIG_TOPIC = b"hand_config"
 HAND_STATE_TOPIC = b"hand_state"
 HAND_SIM_FEEDBACK_TOPIC = b"hand_sim_feedback"
-HAND_INTENT_SCHEMA = "sonic.hand_intent.v1"
+HAND_INTENT_PORT = 5569
+HAND_INTENT_SCHEMA = "sonic.hand_intent.v2"
 HAND_CONFIG_SCHEMA = "sonic.hand_config.v1"
 HAND_STATE_SCHEMA = "sonic.hand_state.v1"
 HAND_SIM_FEEDBACK_SCHEMA = "sonic.hand_sim_feedback.v1"
@@ -59,6 +61,8 @@ def decode_intent(raw: bytes) -> dict[str, Any]:
             raise HandProtocolError(f"{field} must be an integer")
     if payload.get("source") != "pico":
         raise HandProtocolError("hand intent source must be 'pico'")
+    if not isinstance(payload.get("hold"), bool):
+        raise HandProtocolError("hold must be a boolean")
     for side in ("left", "right"):
         value = payload.get(side)
         if not isinstance(value, dict):
@@ -77,6 +81,18 @@ def decode_config(raw: bytes) -> dict[str, Any]:
 
 def decode_state(raw: bytes) -> dict[str, Any]:
     return decode(raw, HAND_STATE_TOPIC, HAND_STATE_SCHEMA)
+
+
+def feedback_age_s(payload: Mapping[str, Any]) -> float:
+    """Conservative source age at publication; legacy states have no added age."""
+    ages = [payload.get("state_age_s", 0.0)]
+    ages.extend(side.get("feedback_age_s", 0.0) for side in payload.get("sides", {}).values())
+    if any(
+        isinstance(age, bool) or not isinstance(age, (int, float)) or not math.isfinite(age) or age < 0
+        for age in ages
+    ):
+        return math.inf
+    return max(ages)
 
 
 def decode_sim_feedback(raw: bytes) -> dict[str, Any]:
