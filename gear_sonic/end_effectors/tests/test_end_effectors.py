@@ -590,13 +590,19 @@ def test_hold_uses_new_measurements_once_and_resumes_each_side_only_with_valid_i
 def test_hold_validates_both_sides_before_any_write(failure):
     devices = {side: SimHandBackend(OMNIHAND_O10.side(side)) for side in ("left", "right")}
     controller = SafeHandController(OMNIHAND_O10, devices, backend_name="sim", clock=lambda: 0)
+    health_reads = []
     if failure == "motor":
-        devices["right"].read_health = lambda: {"error_masks": [1] * 10}
+        def read_health():
+            health_reads.append(True)
+            return {"error_masks": [1] * 10}
+        devices["right"].read_health = read_health
     else:
         devices["right"]._positions[0] = np.nan if failure == "nan" else 100
     controller.accept_intent(_intent(1, left_closed=False, right_closed=False, hold=True), now=0.1)
     if failure == "motor":
         assert controller.step(now=0.1)["mode"] == "fault"
+        assert controller.step(now=0.11)["mode"] == "fault"
+        assert len(health_reads) == 1  # The rejected hold does not force repeated CAN health reads.
     else:
         with pytest.raises(HandControllerError):
             controller.step(now=0.1)

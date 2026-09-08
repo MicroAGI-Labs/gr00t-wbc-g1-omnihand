@@ -206,6 +206,8 @@ class SafeHandController:
                     self.fault_latched = True
                     self.mode = "fault"
                     self.errors[side] = "non-zero motor error mask (latched)"
+            if self.fault_latched:
+                self._hold_pending.clear()
         # Capture current feedback for every selected side before any hold write.
         # Cached feedback can lag behind the previous command while a hand moves.
         holds = (
