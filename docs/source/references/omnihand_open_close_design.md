@@ -193,6 +193,12 @@ left/right: {valid, closed, trigger}
 ```
 
 There are deliberately no hardware names or joint vectors here.
+The optional boolean `hold` requests the existing measured-position hold in OFF,
+POSE_PAUSE and the headset reconnect stop loop. Both selected hands pass feedback
+and health admission before any write; repeated holds do not reissue commands.
+Invalid input can stop motion but cannot resume it or refresh input validity.
+Each hand resumes from its held position when its next valid open/close intent
+arrives. Older producers omit `hold` and retain their existing behavior.
 
 ### Controller to collector
 

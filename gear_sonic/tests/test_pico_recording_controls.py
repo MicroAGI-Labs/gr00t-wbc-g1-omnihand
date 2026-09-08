@@ -33,7 +33,7 @@ def run_manager(monkeypatch):
             monkeypatch.setattr(manager, name, Mock())
         if calibration_results is not None:
             manager.PlannerStreamer.return_value.recalibrate_for_vr3pt.side_effect = calibration_results
-        monkeypatch.setattr(manager, "get_controller_inputs", lambda _: (False, 0, 0, 0, 0))
+        monkeypatch.setattr(manager, "get_controller_inputs", lambda _: (frame.get("pause", False), 0, 0, 0, 0))
         monkeypatch.setattr(manager, "get_axis_clicks", lambda _: (frame.get("stick", False), False))
 
         def buttons(_):
@@ -53,6 +53,8 @@ def run_manager(monkeypatch):
         payloads = [call.args[0] for call in pub.send.call_args_list]
         states = [unpack_pose_message(raw, topic="manager_state")
                   for raw in payloads if raw.startswith(b"manager_state")]
+        holds = [call.kwargs["hold"] for call in manager.HandIntentStream.return_value.publish.call_args_list]
+        assert holds == [state["stream_mode"].item() in {0, 4} for state in states]
         commands = [raw for raw in payloads if raw.startswith(b"command")]
         return states, commands
     return run
@@ -92,6 +94,11 @@ def test_idle_ax_switches_mode_only_after_two_completed_gestures(run_manager, mo
     assert states[-3]["stream_mode"].item() == mode
     assert states[-1]["stream_mode"].item() == destination
     assert not any(s["toggle_data_collection"].item() or s["toggle_data_abort"].item() for s in states)
+
+
+def test_pausing_pose_requests_hand_hold_until_resume(run_manager):
+    states, _ = run_manager(enter_mode(1) + [{"pause": True}, {}, {"buttons": "abxy"}])
+    assert [state["stream_mode"].item() for state in states[-3:]] == [4, 1, 0]
 
 
 @pytest.mark.parametrize("buttons", ["ax", "xa"])

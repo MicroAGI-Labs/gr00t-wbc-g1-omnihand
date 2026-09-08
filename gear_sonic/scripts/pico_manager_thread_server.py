@@ -202,7 +202,7 @@ class HandIntentStream:
         self.last_source_timestamp_ns: int | None = None
         self.hysteresis = TriggerHysteresis()
 
-    def publish(self, socket, reader) -> None:
+    def publish(self, socket, reader, *, hold: bool = False) -> None:
         _, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(reader)
         try:
             source_timestamp_ns = int(reader.get_timestamp_ns())
@@ -228,6 +228,7 @@ class HandIntentStream:
                     "sequence": self.sequence,
                     "monotonic_ns": time.monotonic_ns(),
                     "source": "pico",
+                    "hold": hold,
                     "left": {
                         "valid": valid,
                         "closed": left_closed,
@@ -2264,6 +2265,7 @@ def run_pico_manager(
                             topic="manager_state",
                         )
                     )
+                    hand_intent.publish(socket, reader, hold=True)
                     time.sleep(0.05)
 
                 if isinstance(reader, PicoReader):
@@ -2476,7 +2478,9 @@ def run_pico_manager(
             # a conflating subscriber, so publishing hand intent last prevents
             # unrelated manager/pose messages from starving its filtered topic.
             # Stalled headset timestamps remain invalid rather than implying open.
-            hand_intent.publish(socket, reader)
+            hand_intent.publish(
+                socket, reader, hold=current_mode in {StreamMode.OFF, StreamMode.POSE_PAUSE},
+            )
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
