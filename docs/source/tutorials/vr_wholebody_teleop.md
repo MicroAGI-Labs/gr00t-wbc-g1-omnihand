@@ -223,6 +223,12 @@ Launch the teleop script with `--vis_vr3pt` to see the robot's reference pose in
 
 Each time you enter `VR_3PT` via **Left Stick Click**, the system re-calibrates both wrists against the robot's **current** pose. Always align your arms with the robot before clicking.
 
+The switch requires a new feedback packet containing all 29 finite measured joint
+positions. The manager discards any packet already queued and waits up to 100 ms
+for a new valid packet. If none arrives, it keeps the current mode and held targets;
+it does not calibrate from an assumed all-zero pose. Restore robot feedback, then
+release and click the left stick again to retry.
+
 Below is an example of **bad calibration practice** — transitioning into VR_3PT without aligning your arms to the robot's current pose. The robot may not jump immediately, but will exhibit erratic and dangerous motion as soon as you move.
 
 <figure style="margin: 1em 0;">

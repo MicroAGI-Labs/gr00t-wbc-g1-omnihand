@@ -4,6 +4,8 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import msgpack
+import numpy as np
 import pytest
 
 from gear_sonic.scripts import pico_manager_thread_server as manager
@@ -12,7 +14,7 @@ from gear_sonic.scripts.run_data_exporter import unpack_pose_message
 
 @pytest.fixture
 def run_manager(monkeypatch):
-    def run(steps):
+    def run(steps, *, calibration_results=None):
         steps = iter(steps)
         statuses = deque()
         frame = {}
@@ -29,6 +31,8 @@ def run_manager(monkeypatch):
         monkeypatch.setattr(manager, "_init_input_source", lambda *_: reader)
         for name in ("ThreePointPose", "PoseStreamer", "PlannerStreamer", "HandIntentStream"):
             monkeypatch.setattr(manager, name, Mock())
+        if calibration_results is not None:
+            manager.PlannerStreamer.return_value.recalibrate_for_vr3pt.side_effect = calibration_results
         monkeypatch.setattr(manager, "get_controller_inputs", lambda _: (False, 0, 0, 0, 0))
         monkeypatch.setattr(manager, "get_axis_clicks", lambda _: (frame.get("stick", False), False))
 
@@ -56,8 +60,10 @@ def run_manager(monkeypatch):
 
 def enter_mode(mode):
     steps = [{"buttons": "abxy"}, {}]  # OFF -> PLANNER
-    if mode == 1:
+    if mode in (1, 3):
         steps += [{"buttons": "ax"}, {}] * 2  # PLANNER -> POSE
+    if mode == 3:
+        steps += [{"buttons": "by"}, {}]  # POSE -> FROZEN_UPPER_BODY
     elif mode == 5:
         steps += [{"stick": True}, {}]  # PLANNER -> VR_3PT
     return steps
@@ -171,3 +177,86 @@ def test_reconnect_requires_a_new_ax_pair_after_policy_restart(run_manager):
     assert any(s["stream_mode"].item() == 0 for s in states)
     assert states[-1]["stream_mode"].item() == 2
     assert not any(s["toggle_data_collection"].item() or s["toggle_data_abort"].item() for s in states)
+
+
+def feedback_packet(body):
+    return msgpack.packb({
+        "body_q_measured": body, "left_hand_q_measured": [0.1] * 7,
+        "right_hand_q_measured": [0.2] * 7,
+    }, use_bin_type=True)
+
+
+@pytest.fixture
+def calibration(monkeypatch):
+    packets = deque()
+    clock = SimpleNamespace(now=0.0)
+
+    def get_data():
+        return packets.popleft()[1] if packets and packets[0][0] <= clock.now else None
+
+    monkeypatch.setattr(manager, "ZMQPoller", lambda **_: SimpleNamespace(get_data=get_data))
+    monkeypatch.setattr(manager, "time", SimpleNamespace(
+        monotonic=lambda: clock.now, sleep=lambda dt: setattr(clock, "now", clock.now + dt),
+    ))
+    streamer = manager.PlannerStreamer.__new__(manager.PlannerStreamer)
+    streamer.feedback_reader = manager.FeedbackReader()
+    streamer.three_point = Mock()
+    return streamer, packets, clock
+
+
+@pytest.mark.parametrize("body", [[0.0] * 29, np.linspace(-0.2, 0.2, 29).tolist()])
+def test_vr3pt_calibrates_from_new_measured_feedback_not_queued_packet(calibration, body):
+    streamer, packets, clock = calibration
+    packets.extend([(0.0, feedback_packet([1.0] * 29)), (0.02, feedback_packet(body))])
+    assert streamer.recalibrate_for_vr3pt()
+    streamer.three_point.reset_with_measured_q.assert_called_once()
+    np.testing.assert_array_equal(streamer.three_point.reset_with_measured_q.call_args.args[0], body)
+    np.testing.assert_array_equal(
+        streamer.feedback_reader.upper_body_position_target,
+        np.asarray(body)[streamer.feedback_reader.upper_body_joint_indices],
+    )
+    assert clock.now == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize("packet", [
+    None, b"\xc1", msgpack.packb(None), msgpack.packb([]), msgpack.packb({}),
+    feedback_packet([0.0] * 28), feedback_packet([[0.0] * 29]),
+    feedback_packet([float("nan")] * 29), feedback_packet([float("inf")] * 29),
+    feedback_packet(["invalid"] * 29),
+])
+def test_missing_or_invalid_vr3pt_feedback_preserves_held_targets_and_allows_retry(calibration, packet):
+    streamer, packets, clock = calibration
+    feedback = streamer.feedback_reader
+    packets.append((0.0, feedback_packet([0.1] * 29)))
+    assert feedback.poll_feedback()
+    held = (feedback.upper_body_position_target, feedback.left_hand_position_target,
+            feedback.right_hand_position_target, feedback.full_body_q_measured)
+    packets.extend([(0.0, feedback_packet([0.5] * 29)), (0.01, packet)])
+    assert not streamer.recalibrate_for_vr3pt()
+    streamer.three_point.reset_with_measured_q.assert_not_called()
+    for actual, expected in zip((feedback.upper_body_position_target, feedback.left_hand_position_target,
+                                feedback.right_hand_position_target, feedback.full_body_q_measured), held):
+        assert actual is expected
+    assert clock.now == pytest.approx(0.1)
+    packets.append((clock.now + 0.02, feedback_packet([0.2] * 29)))
+    assert streamer.recalibrate_for_vr3pt()
+    np.testing.assert_array_equal(streamer.three_point.reset_with_measured_q.call_args.args[0], [0.2] * 29)
+
+
+@pytest.mark.parametrize("parent", [2, 3])
+def test_rejected_vr3pt_switch_keeps_current_mode_until_explicit_retry(run_manager, parent):
+    steps = enter_mode(parent)
+    states, commands = run_manager(steps + [
+        {"stick": True, "recording": True}, {}, {"stick": True}, {}, {"stick": True}, {},
+    ], calibration_results=[False, True])
+    assert [s["stream_mode"].item() for s in states[-6:]] == [parent, parent, 5, 5, parent, parent]
+    assert len(commands) == (3 if parent == 2 else 5)
+    assert not any(s["toggle_data_collection"].item() or s["toggle_data_abort"].item() for s in states)
+
+
+def test_policy_stop_still_works_after_rejected_vr3pt_switch(run_manager):
+    states, commands = run_manager(enter_mode(2) + [
+        {"stick": True}, {}, {"buttons": "abxy"}, {},
+    ], calibration_results=[False])
+    assert states[-1]["stream_mode"].item() == 0
+    assert commands[-1] == manager.build_command_message(start=False, stop=True, planner=True)
