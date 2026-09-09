@@ -400,15 +400,25 @@ for balance, a negative elbow offset produces the 110-degree bend with the
 forearms pointing forward, and neutral wrists keep the hands parallel to the
 forearms while the palms face each other). The operator
 physically matches that robot pose and confirms **A+X** again; only then does
-the manager calibrate the operator against the robot's measured pose and enter
+the manager calibrate the operator and enter
 teleoperation. **B+Y** reverses the same flow, first returning to base pose and
 then interpolating back to idle. Locomotion is forced idle and hand intent is
 held during both interpolations.
 
-Arm interpolation starts from the active commanded pose: the planner reference
-in VR mode, or the last sent arm override in base-pose/IK mode. It does not jump
-back to measured joint positions before returning. Measured positions still
-seed operator calibration; the waist remains controlled by the planner.
+In `vr3pt`, base return starts from the last sent wrist/head VR target. It
+interpolates wrist positions and orientations to the base target over two
+seconds, with zero endpoint velocity and acceleration, while holding the head
+target. Pico body motion and sticks are ignored throughout return and base hold.
+The manager sends VR targets throughout this flow, without joint overrides;
+SONIC stays on its VR control path. Returning from base to idle also keeps a
+held VR target, with joystick locomotion available again after the return.
+
+Every confirmed **A+X** entry (two presses within two seconds) captures fresh Pico
+calibration against the held VR target, including its head pose. The first
+teleop packet preserves that target; subsequent packets follow Pico movement
+relative to the new calibration. Measured joint tracking error does not change
+the calibration reference. In `ik-upper`, interpolation uses the last sent arm
+override and calibration continues to use measured joints.
 
 Fresh 29-DOF robot feedback is required before an interpolation or calibration.
 If it is unavailable, the manager stays in its current stable state instead of

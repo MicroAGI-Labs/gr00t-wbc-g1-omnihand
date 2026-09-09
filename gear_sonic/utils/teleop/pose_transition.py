@@ -1,8 +1,46 @@
-"""Smooth joint-space transitions used by the teleoperation mode manager."""
+"""Smooth joint and VR-target transitions used by the teleoperation mode manager."""
 
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.spatial.transform import Rotation
+
+
+def validate_vr_pose(pose: np.ndarray) -> np.ndarray:
+    """Copy a finite [left wrist, right wrist, head] XYZ + wxyz target."""
+    result = np.asarray(pose, dtype=np.float64).copy()
+    if result.shape != (3, 7) or not np.all(np.isfinite(result)):
+        raise ValueError("VR target must be a finite (3, 7) pose")
+    norms = np.linalg.norm(result[:, 3:], axis=1)
+    if np.any(norms < 1e-8):
+        raise ValueError("VR target has a zero quaternion")
+    result[:, 3:] /= norms[:, None]
+    return result
+
+
+class VRPoseTransition:
+    """Frozen Cartesian endpoints with quintic timing and shortest rotation paths."""
+
+    def __init__(self, start, goal, *, started_at: float, duration_s: float):
+        self.start = validate_vr_pose(start)
+        self.goal = validate_vr_pose(goal)
+        self.progress = JointPoseTransition(
+            np.zeros(1), np.ones(1), started_at=started_at, duration_s=duration_s
+        )
+        self.rotation = Rotation.from_quat(self.start[:, 3:], scalar_first=True)
+        end_rotation = Rotation.from_quat(self.goal[:, 3:], scalar_first=True)
+        self.rotation_delta = (end_rotation * self.rotation.inv()).as_rotvec()
+
+    def sample(self, now: float) -> tuple[np.ndarray, bool]:
+        progress = self.progress.sample(now)
+        blend = float(progress.position[0])
+        pose = self.start.copy()
+        pose[:, :3] += blend * (self.goal[:, :3] - self.start[:, :3])
+        pose[:, 3:] = (
+            Rotation.from_rotvec(blend * self.rotation_delta) * self.rotation
+        ).as_quat(scalar_first=True)
+        return pose, progress.complete
+
 
 UPPER_BODY_WIDTH = 17
 IDLE_BASE_SHOULDER_PITCH_RAD = np.deg2rad(20.0)

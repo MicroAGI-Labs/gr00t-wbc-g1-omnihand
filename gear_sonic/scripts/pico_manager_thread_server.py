@@ -62,6 +62,8 @@ from gear_sonic.utils.teleop.pose_transition import (
     IDLE_BASE_UPPER_BODY_RAD,
     UPPER_BODY_WIDTH,
     JointPoseTransition,
+    VRPoseTransition,
+    validate_vr_pose,
 )
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
@@ -1214,6 +1216,7 @@ class ThreePointPose:
         self._calibration_rwrist_rot_offset: sRot | None = None
         # Override robot q for FK during recalibration (e.g. measured joints for VR 3PT)
         self._override_robot_q: np.ndarray | None = None
+        self._calibration_head_reference: np.ndarray | None = None
 
     @property
     def is_pending(self) -> bool:
@@ -1399,7 +1402,36 @@ class ThreePointPose:
             np.array([0, 0, self.TORSO_LINK_OFFSET_Z]) + self.NECK_LINK_LENGTH * neck_z
         ).astype(np.float32)
 
+        if self._calibration_head_reference is not None:
+            reference = self._calibration_head_reference
+            head_rotation = sRot.from_quat(reference[3:], scalar_first=True) * sRot.from_quat(
+                calibrated[2, 3:], scalar_first=True
+            )
+            calibrated[2, 3:] = head_rotation.as_quat(scalar_first=True)
+            reference_z = sRot.from_quat(reference[3:], scalar_first=True).apply([0, 0, 1])
+            calibrated[2, :3] = reference[:3] + self.NECK_LINK_LENGTH * (
+                head_rotation.apply([0, 0, 1]) - reference_z
+            )
+
         return calibrated
+
+    def calibrate_to_vr_target(self, body_poses_np: np.ndarray, target: np.ndarray) -> None:
+        """Map this Pico sample to the exact held VR target on every entry."""
+        target = validate_vr_pose(target)
+        raw = validate_vr_pose(_process_3pt_pose(body_poses_np))
+        neck_inverse = sRot.from_quat(raw[2, 3:], scalar_first=True).inv()
+        self._calibration_neck_quat_inv = neck_inverse.as_quat(scalar_first=True)
+        self._calibration_lwrist_offset = neck_inverse.apply(raw[0, :3]) - target[0, :3]
+        self._calibration_rwrist_offset = neck_inverse.apply(raw[1, :3]) - target[1, :3]
+        self._calibration_lwrist_rot_offset = sRot.from_quat(target[0, 3:], scalar_first=True) * (
+            neck_inverse * sRot.from_quat(raw[0, 3:], scalar_first=True)
+        ).inv()
+        self._calibration_rwrist_rot_offset = sRot.from_quat(target[1, 3:], scalar_first=True) * (
+            neck_inverse * sRot.from_quat(raw[1, 3:], scalar_first=True)
+        ).inv()
+        self._calibration_head_reference = target[2].copy()
+        self._override_robot_q = None
+        self._calibration_pending = False
 
     def _clear_calibration(self):
         """Clear all calibration state."""
@@ -1409,6 +1441,7 @@ class ThreePointPose:
         self._calibration_lwrist_rot_offset = None
         self._calibration_rwrist_rot_offset = None
         self._override_robot_q = None
+        self._calibration_head_reference = None
 
     def reset(self) -> None:
         """Reset calibration. Next process_smpl_pose() call will recalibrate."""
@@ -1422,6 +1455,7 @@ class ThreePointPose:
         Next process_smpl_pose() will recompute wrist offsets against FK of these joints."""
         # Preserve neck calibration — only clear wrist offsets
         self._calibration_lwrist_offset = None
+        self._calibration_head_reference = None
         self._calibration_rwrist_offset = None
         self._calibration_lwrist_rot_offset = None
         self._calibration_rwrist_rot_offset = None
@@ -1937,6 +1971,7 @@ class FeedbackReader:
         self.upper_body_position_target = None
         self.upper_body_planner_target = None
         self.upper_body_last_action: np.ndarray | None = None
+        self.vr_pose: np.ndarray | None = None
         self.left_hand_position_target = None
         self.right_hand_position_target = None
         # Full body joint configuration (29 DOFs) as measured from robot,
@@ -1987,6 +2022,14 @@ class FeedbackReader:
             return None, None, None, None, None, None
 
         unpacked = msgpack.unpackb(data, raw=False)
+        self.vr_pose = None
+        try:
+            self.vr_pose = validate_vr_pose(np.column_stack((
+                np.asarray(unpacked["vr_3point_position"]).reshape(3, 3),
+                np.asarray(unpacked["vr_3point_orientation"]).reshape(3, 4),
+            )))
+        except (KeyError, ValueError, TypeError):
+            pass
         full_body_q = None
         if "body_q_measured" in unpacked:
             candidate = np.asarray(unpacked["body_q_measured"], dtype=np.float64)
@@ -2064,6 +2107,9 @@ class PlannerStreamer:
         # overrides. Retain the last successfully sent override to reconstruct
         # the reference being followed when a mode transition starts.
         self.last_upper_body_override: tuple[np.ndarray, np.ndarray] | None = None
+        self.last_vr_pose: np.ndarray | None = None
+        self.held_vr_pose: np.ndarray | None = None
+        self.first_vr_pose: np.ndarray | None = None
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
@@ -2107,39 +2153,59 @@ class PlannerStreamer:
         return True
 
     def recalibrate_for_vr3pt(self) -> bool:
-        """
-        Recalibrate VR 3-point pose tracking using the robot's current measured joints.
-
-        Polls the g1_debug feedback to get the robot's actual joint state, then
-        schedules recalibration so VR tracking aligns with the robot's current pose.
-        This prevents sudden jumps when entering VR 3PT mode from PLANNER mode.
-        """
+        """Recalibrate every entry; first packet is exactly the held VR target."""
         if not self.poll_fresh_feedback():
             print("[PlannerLoop] Cannot enter VR 3PT without fresh robot feedback")
             return False
-        measured_q = self.feedback_reader.full_body_q_measured
-        if measured_q is None or np.asarray(measured_q).shape != (29,):
-            print("[PlannerLoop] Cannot enter VR 3PT without complete 29-DOF feedback")
-            return False
-        if self.three_point.is_calibrated:
-            # Re-entering VR from the base pose must not recalculate wrist
-            # offsets from a slightly different encoder sample. That changes
-            # the first VR target and is the source of the calibration snap.
-            print("[PlannerLoop] Reusing existing VR 3PT calibration")
-            return True
-        # VR calibration must use the actual measured pose. The VR solver's
-        # offsets are defined from encoder feedback; substituting the planner's
-        # motion target prevents the headset pose from tracking correctly.
-        self.three_point.reset_with_measured_q(measured_q)
-        # Capture calibration from the same Pico frame that triggered the
-        # transition. Waiting for the next frame lets releasing A+X move the
-        # headset pose before the first VR command is generated.
         sample = self.reader.get_latest()
-        if sample is not None:
-            self.three_point.process_smpl_pose(sample["body_poses_np"])
-            print("[PlannerLoop] VR 3PT calibration captured from transition frame")
-        print("[PlannerLoop] VR 3PT recalibration scheduled with measured robot pose")
+        target = self.last_vr_pose if self.last_vr_pose is not None else self.feedback_reader.vr_pose
+        if sample is None or target is None:
+            print("[PlannerLoop] Cannot calibrate without Pico input and a current VR target")
+            return False
+        self.three_point.calibrate_to_vr_target(sample["body_poses_np"], target)
+        self.first_vr_pose = target.copy()
+        self.held_vr_pose = None
+        print("[PlannerLoop] Pico recalibrated to held VR target; first command preserved")
         return True
+
+    def vr_pose_from_upper_body(self, joints: np.ndarray) -> np.ndarray:
+        """Convert the existing base/idle joint reference to wrist VR targets once."""
+        body = np.zeros(29, dtype=np.float64)
+        body[self.feedback_reader.upper_body_joint_indices] = joints
+        model = self.three_point.robot_model
+        configuration = model.get_configuration_from_actuated_joints(body_actuated_joint_values=body)
+        frames = get_g1_key_frame_poses(model, q=configuration)
+        return validate_vr_pose(np.asarray([
+            np.concatenate((frames[name]["position"], frames[name]["orientation_wxyz"]))
+            for name in ("left_wrist", "right_wrist", "torso")
+        ]))
+
+    def begin_vr_return(self, *, to_base: bool, duration_s: float) -> VRPoseTransition | None:
+        if not self.poll_fresh_feedback(require_planner_target=not to_base):
+            return None
+        start = self.last_vr_pose if self.last_vr_pose is not None else self.feedback_reader.vr_pose
+        if start is None:
+            print("[PlannerLoop] Return blocked: current VR target is unavailable")
+            return None
+        goal = self.vr_pose_from_upper_body(
+            IDLE_BASE_UPPER_BODY_RAD if to_base else self.feedback_reader.upper_body_planner_target
+        )
+        # Returning the arms must not command a new head/waist orientation.
+        goal[2] = start[2]
+        transition = VRPoseTransition(start, goal, started_at=time.monotonic(), duration_s=duration_s)
+        self.first_vr_pose = None
+        self.held_vr_pose = start.copy()
+        print("[PlannerLoop] Frozen VR return; Pico motion ignored until A+X calibration")
+        return transition
+
+    def send_vr_return_sample(self, transition: VRPoseTransition, now: float) -> tuple[bool, bool]:
+        pose, complete = transition.sample(now)
+        sent = self.run_once(
+            StreamMode.PLANNER, vr_pose_override=pose, force_locomotion_idle=True
+        )
+        if sent:
+            self.held_vr_pose = self.last_vr_pose.copy()
+        return sent, complete and sent
 
     def commanded_transition_start(self) -> np.ndarray | None:
         """Snapshot the active joint reference, never the measured joint pose."""
@@ -2152,15 +2218,6 @@ class PlannerStreamer:
             override, mask = self.last_upper_body_override
             position[mask] = override[mask]
         return position
-
-    def effective_vr_transition_start(self) -> np.ndarray | None:
-        """Return the latest arm target after the robot-side VR/policy solve."""
-        if not self.poll_fresh_feedback():
-            return None
-        target = self.feedback_reader.upper_body_last_action
-        if target is None:
-            return None
-        return np.asarray(target, dtype=np.float64).copy()
 
     def prepare_ik_upper_body(self) -> bool:
         """Seed calibrated arm IK from fresh measured robot feedback."""
@@ -2191,14 +2248,22 @@ class PlannerStreamer:
         *,
         face_command: str | None = None,
         upper_body_override: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+        vr_pose_override: np.ndarray | None = None,
         force_locomotion_idle: bool = False,
     ) -> bool:
         """Execute one iteration of the planner control loop."""
         try:
+            if vr_pose_override is None and self.held_vr_pose is not None:
+                vr_pose_override = self.held_vr_pose
+            if vr_pose_override is not None and upper_body_override is not None:
+                raise ValueError("cannot mix a generated VR target with joint overrides")
+            generated_vr = vr_pose_override is not None
             # Avoid sending old commands if XRT timestamp hasn't advanced, in case of headset disconnect
             xrt_timestamp = self.reader.get_timestamp_ns()
             transition_or_base_pose = (
                 upper_body_override is not None
+                or generated_vr
+                or self.first_vr_pose is not None
                 or stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE
             )
             if xrt_timestamp == self.last_xrt_timestamp and not transition_or_base_pose:
@@ -2215,7 +2280,10 @@ class PlannerStreamer:
                 print(f"[PlannerLoop] Mode -> {self.mode.value}: {self.mode.name}")
 
             # Read axes/joysticks to control movement, facing, speed and mode
-            lx, ly, rx, ry = get_controller_axes(self.reader)
+            if force_locomotion_idle or stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE:
+                lx, ly, rx, ry = (0.0, 0.0, 0.0, 0.0)
+            else:
+                lx, ly, rx, ry = get_controller_axes(self.reader)
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
             facing = self.yaw_accumulator.update(rx, self.dt)
@@ -2260,7 +2328,7 @@ class PlannerStreamer:
             upper_body_mask = None
             left_hand_position = None
             right_hand_position = None
-            if stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE:
+            if stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE and not generated_vr:
                 upper_body_position = IDLE_BASE_UPPER_BODY_RAD.copy()
                 upper_body_velocity = np.zeros(UPPER_BODY_WIDTH, dtype=np.float64)
                 upper_body_mask = IDLE_BASE_UPPER_BODY_MASK.copy()
@@ -2282,12 +2350,22 @@ class PlannerStreamer:
             vr_3pt_position = None
             vr_3pt_orientation = None
             vr_3pt_compliance = None
-            if stream_mode == StreamMode.PLANNER_VR_3PT:
-                sample = self.reader.get_latest()
-                if sample is not None:
+            sent_vr_pose = None
+            if generated_vr:
+                sent_vr_pose = validate_vr_pose(vr_pose_override)
+                vr_3pt_position = sent_vr_pose[:, :3].flatten().tolist()
+                vr_3pt_orientation = sent_vr_pose[:, 3:].flatten().tolist()
+            elif stream_mode == StreamMode.PLANNER_VR_3PT:
+                if self.first_vr_pose is not None:
+                    vr_3pt_pose = self.first_vr_pose.copy()
+                else:
+                    sample = self.reader.get_latest()
+                    if sample is None:
+                        return False
                     vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
-                    vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
-                    vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
+                sent_vr_pose = validate_vr_pose(vr_3pt_pose)
+                vr_3pt_position = sent_vr_pose[:, :3].flatten().tolist()
+                vr_3pt_orientation = sent_vr_pose[:, 3:].flatten().tolist()
 
                 # Compute hand joints from trigger/grip inputs so operator can
                 # control hand open/close while in VR 3PT mode
@@ -2309,7 +2387,7 @@ class PlannerStreamer:
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
 
-            if stream_mode == StreamMode.PLANNER_IK_UPPER:
+            if stream_mode == StreamMode.PLANNER_IK_UPPER and not generated_vr:
                 if self.ik_upper_body is None:
                     raise RuntimeError("upper-body IK was not initialized")
                 sample = self.reader.get_latest()
@@ -2337,6 +2415,9 @@ class PlannerStreamer:
                 publisher_monotonic_ns=time.monotonic_ns(),
             )
             self.socket.send(msg)
+            self.last_vr_pose = None if sent_vr_pose is None else sent_vr_pose.copy()
+            if not generated_vr:
+                self.first_vr_pose = None
             # A failed send must not replace the command used by the handoff.
             # A normal planner/VR packet releases any earlier arm override.
             self.last_upper_body_override = (
@@ -2488,8 +2569,8 @@ def run_pico_manager(
     #             <------                 <--------------------------
     #               B+Y                              B+Y
     #
-    # The arrows touching IDLE_BASE_POSE use a private two-second joint
-    # interpolation. They are not additional public FSM states. During both
+    # The arrows touching IDLE_BASE_POSE use a private two-second VR-target
+    # (or joint, for IK) interpolation. They are not public FSM states. During both
     # directions locomotion is idle and hand intent is held.
     #
     # Full-body POSE retains its legacy switching behavior; the safe base-pose
@@ -2507,7 +2588,7 @@ def run_pico_manager(
     )
     current_mode = StreamMode.OFF
     vr3pt_parent_mode = StreamMode.PLANNER
-    upper_body_transition: JointPoseTransition | None = None
+    upper_body_transition: JointPoseTransition | VRPoseTransition | None = None
     transition_destination: StreamMode | None = None
     recorder_is_recording = False
     recorder_command_timestamp = 0.0
@@ -2538,6 +2619,9 @@ def run_pico_manager(
                 current_mode = StreamMode.OFF
                 upper_body_transition = None
                 transition_destination = None
+                planner_streamer.last_vr_pose = None
+                planner_streamer.held_vr_pose = None
+                planner_streamer.first_vr_pose = None
 
                 # OFF is local manager state only. Never send stop=True from the
                 # headset process: SONIC lifetime is owned by the operator UI or
@@ -2755,38 +2839,29 @@ def run_pico_manager(
 
             if requested_transition is not None:
                 needs_planner_target = requested_transition == StreamMode.PLANNER
-                if current_mode in {
-                    StreamMode.PLANNER_VR_3PT,
-                    StreamMode.PLANNER_IK_UPPER,
-                }:
-                    # VR/IK arm commands are applied inside the robot-side
-                    # solver and are not reflected by body_q_target feedback.
-                    # Use the current encoder pose when leaving those modes;
-                    # using the underlying motion target can jump the arms
-                    # toward the legs before the interpolation begins.
-                    transition_start = planner_streamer.effective_vr_transition_start()
-                    if transition_start is None:
-                        transition_start = np.asarray(
-                            planner_streamer.feedback_reader.upper_body_position_target,
-                            dtype=np.float64,
-                        ).copy()
-                else:
-                    transition_start = planner_streamer.commanded_transition_start()
-                if transition_start is not None:
-                    transition_goal = (
-                        np.asarray(
-                            planner_streamer.feedback_reader.upper_body_planner_target,
-                            dtype=np.float64,
-                        )
-                        if needs_planner_target
-                        else IDLE_BASE_UPPER_BODY_RAD
-                    )
-                    upper_body_transition = JointPoseTransition(
-                        transition_start,
-                        transition_goal,
-                        started_at=time.monotonic(),
+                if teleop_stream_mode == StreamMode.PLANNER_VR_3PT:
+                    upper_body_transition = planner_streamer.begin_vr_return(
+                        to_base=not needs_planner_target,
                         duration_s=idle_base_transition_duration,
                     )
+                else:
+                    transition_start = planner_streamer.commanded_transition_start()
+                    if transition_start is not None:
+                        transition_goal = (
+                            np.asarray(
+                                planner_streamer.feedback_reader.upper_body_planner_target,
+                                dtype=np.float64,
+                            )
+                            if needs_planner_target
+                            else IDLE_BASE_UPPER_BODY_RAD
+                        )
+                        upper_body_transition = JointPoseTransition(
+                            transition_start,
+                            transition_goal,
+                            started_at=time.monotonic(),
+                            duration_s=idle_base_transition_duration,
+                        )
+                if upper_body_transition is not None:
                     transition_destination = requested_transition
                     ax_double_press.reset()
                     print(
@@ -2816,24 +2891,25 @@ def run_pico_manager(
                     # not when returning from VR_3PT sub-mode
                     planner_streamer.reset_yaw()
                 elif new_mode == StreamMode.PLANNER_VR_3PT:
-                    # Recalibrate VR tracking against the robot's actual current pose
-                    # (read via g1_debug feedback + FK) to prevent sudden jumps
+                    # Re-anchor the current Pico sample to the held VR command.
                     if not planner_streamer.recalibrate_for_vr3pt():
                         new_mode = current_mode
                 elif new_mode == StreamMode.PLANNER_IK_UPPER:
                     if not planner_streamer.prepare_ik_upper_body():
                         new_mode = current_mode
 
-            # Run one iteration. Smooth transitions are emitted as planner
-            # overrides while the stable public source state remains unchanged.
+            # The public source state remains unchanged until the final target
+            # is sent. VR returns never read live Pico or send joint overrides.
             transition_completed = False
-            if upper_body_transition is not None:
+            if isinstance(upper_body_transition, VRPoseTransition):
+                planner_sent, transition_completed = planner_streamer.send_vr_return_sample(
+                    upper_body_transition, time.monotonic()
+                )
+                planner_report_count += int(planner_sent)
+            elif upper_body_transition is not None:
                 transition_sample = upper_body_transition.sample(time.monotonic())
                 planner_sent = planner_streamer.run_once(
-                    # Keep VR3PT ownership active while blending the base
-                    # target; switching to plain planner mode causes a
-                    # controller reset and an arm snap.
-                    StreamMode.PLANNER_VR_3PT,
+                    StreamMode.PLANNER,
                     upper_body_override=(
                         transition_sample.position,
                         transition_sample.velocity,
@@ -2842,19 +2918,20 @@ def run_pico_manager(
                     force_locomotion_idle=True,
                 )
                 planner_report_count += int(planner_sent)
-                transition_completed = transition_sample.complete
+                transition_completed = transition_sample.complete and planner_sent
             elif new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
             elif new_mode in PLANNER_STREAM_MODES:
-                if new_mode == StreamMode.PLANNER_IDLE_BASE_POSE:
+                if (
+                    new_mode == StreamMode.PLANNER_IDLE_BASE_POSE
+                    and teleop_stream_mode == StreamMode.PLANNER_VR_3PT
+                ):
+                    if planner_streamer.held_vr_pose is None:
+                        raise RuntimeError("VR base hold has no completed return target")
                     planner_sent = planner_streamer.run_once(
-                        StreamMode.PLANNER_VR_3PT,
+                        new_mode,
                         face_command=face_command,
-                        upper_body_override=(
-                            IDLE_BASE_UPPER_BODY_RAD.copy(),
-                            np.zeros(UPPER_BODY_WIDTH, dtype=np.float64),
-                            IDLE_BASE_UPPER_BODY_MASK,
-                        ),
+                        vr_pose_override=planner_streamer.held_vr_pose,
                         force_locomotion_idle=True,
                     )
                 else:
