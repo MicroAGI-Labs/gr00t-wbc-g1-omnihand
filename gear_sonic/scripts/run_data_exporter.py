@@ -1457,15 +1457,21 @@ class GrootDataCollector:
             int(np.asarray(value).reshape(-1)[0])
             for value in self.data_exporter.episode_buffer.get("teleop.stream_mode", [])
         }
-        unexpected_modes = sorted(
-            mode for mode in modes if mode != self.required_stream_mode
-        )
+        # Base pose (mode 3) is an intentional pause point during a recording:
+        # the operator may leave VR with B+Y, adjust/reset, and re-enter with
+        # A+X without closing the episode. It is valid alongside the required
+        # teleop mode, but an episode must still contain teleop frames.
+        allowed_modes = {self.required_stream_mode, 3}
+        unexpected_modes = sorted(mode for mode in modes if mode not in allowed_modes)
         if unexpected_modes:
             required_name = _RECORDING_STREAM_MODE_NAMES[self.required_stream_mode]
             errors.append(
                 f"episode contains stream modes {unexpected_modes}; "
-                f"required {required_name} ({self.required_stream_mode}) only"
+                f"required {required_name} ({self.required_stream_mode}) plus base pauses"
             )
+        if modes and self.required_stream_mode not in modes:
+            required_name = _RECORDING_STREAM_MODE_NAMES[self.required_stream_mode]
+            errors.append(f"episode contains no {required_name} teleop frames")
         errors = sorted(set(errors))
         return {
             "passed": not errors,
