@@ -2121,6 +2121,12 @@ class PlannerStreamer:
         if measured_q is None or np.asarray(measured_q).shape != (29,):
             print("[PlannerLoop] Cannot enter VR 3PT without complete 29-DOF feedback")
             return False
+        if self.three_point.is_calibrated:
+            # Re-entering VR from the base pose must not recalculate wrist
+            # offsets from a slightly different encoder sample. That changes
+            # the first VR target and is the source of the calibration snap.
+            print("[PlannerLoop] Reusing existing VR 3PT calibration")
+            return True
         # VR calibration must use the actual measured pose. The VR solver's
         # offsets are defined from encoder feedback; substituting the planner's
         # motion target prevents the headset pose from tracking correctly.

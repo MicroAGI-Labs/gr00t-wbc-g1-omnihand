@@ -116,9 +116,22 @@ def test_handoff_requires_fresh_reference_without_measured_fallback(streamer, fa
 
 def test_vr_calibration_still_uses_measured_joints(streamer):
     captured = []
-    streamer.three_point = SimpleNamespace(reset_with_measured_q=captured.append)
+    streamer.three_point = SimpleNamespace(
+        is_calibrated=False,
+        reset_with_measured_q=captured.append,
+    )
     assert streamer.recalibrate_for_vr3pt()
     np.testing.assert_array_equal(captured[0], streamer.feedback_reader.full_body_q_measured)
+
+
+def test_vr_reentry_reuses_existing_calibration(streamer):
+    captured = []
+    streamer.three_point = SimpleNamespace(
+        is_calibrated=True,
+        reset_with_measured_q=captured.append,
+    )
+    assert streamer.recalibrate_for_vr3pt()
+    assert captured == []
 
 
 def test_vr_exit_uses_measured_pose_when_motion_target_is_unrelated(streamer):
