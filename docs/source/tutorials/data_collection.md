@@ -9,7 +9,7 @@ Run the camera server on the computer physically connected to the cameras. In th
 
 ```{admonition} Supported cameras
 :class: note
-The composed camera server supports **ZED**, **Luxonis OAK**, RealSense, and generic USB cameras. The ZED integration publishes the rectified left RGB image; depth is not sent through the JPEG transport.
+The composed camera server supports **ZED**, **Luxonis OAK**, RealSense, and generic USB cameras. The ZED integration publishes the rectified right RGB image; depth is not sent through the JPEG transport.
 
 A 3D-printable mount for the head/ego-view **OAK-D W** camera is available under [`hardware/camera_mount/`](https://github.com/NVlabs/GR00T-WholeBodyControl/blob/main/hardware/camera_mount/README.md) — see its README for print settings, the bill of materials, and how it mounts on the G1.
 ```
@@ -162,6 +162,12 @@ launcher. Only one process should open each physical camera; close standalone
 USB viewers before starting the shared server. The teleop dashboard consumes
 that shared stream and automatically displays the wrist views.
 
+The dashboard's stream-rate table includes separate left and right wrist rows.
+Publisher Hz estimates each camera's capture cadence from its source timestamps;
+receiver Hz counts distinct frames sampled by the collector. Cached frames do
+not count as new arrivals, and a stalled wrist drops to 0 Hz independently of
+the other cameras. Active receiver rates below 45 Hz are highlighted.
+
 Enable optional collection with:
 
 ```sh
@@ -169,6 +175,20 @@ python gear_sonic/scripts/launch_data_collection.py \
     --hand-backend dex1 --remote-ui --record-wrist-cameras \
     --data-exporter-frequency 50
 ```
+
+This is the single launch command once the environments, deploy binary, DEX 1
+worker, and camera service are installed in the selected checkout. The camera
+service must use that checkout and `--ego-view-camera zed --wrist-camera-profile
+thor-jr` to publish all three streams. The launcher starts the service if needed;
+`--record-wrist-cameras` enables recording but does not configure the service.
+Use `--check-only` to check launch prerequisites without starting the stack.
+The browser UI is at `http://127.0.0.1:8080` on Thor (or through SSH forwarding).
+
+When the DEX 1 USB adapters are on Orin, add `--hand-server-host 192.168.123.164`
+to that launch command. This starts the prepared Orin hand server over SSH and
+routes hand status back to the collector and UI; Thor no longer needs the
+gripper USB devices. See [remote DEX 1 setup](../references/dex1_teleop.md) for
+the Orin installation and the option to reuse a separately managed hand service.
 
 Without `--record-wrist-cameras`, datasets contain only the existing ego view.
 With it, both wrist images must be present, correctly sized, and fresh within

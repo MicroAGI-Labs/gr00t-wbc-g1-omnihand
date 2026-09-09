@@ -156,7 +156,8 @@ _INDEX_HTML = """<!doctype html>
       </table>
       <div class="rate-note">
         Publisher Hz is measured from source timestamps; receiver Hz is measured where
-        the arrow ends. Inactive mode-specific streams show 0 Hz.
+        the arrow ends. Wrist publisher rates estimate capture cadence; wrist receiver
+        rates count fresh frames sampled by the collector. Inactive streams show 0 Hz.
       </div>
     </section>
     <section id="hand-controls" class="control-card" hidden>
@@ -210,6 +211,8 @@ _INDEX_HTML = """<!doctype html>
     let handCommandPending = false;
     const rateLabels = {
       camera: 'Camera server → collector',
+      left_wrist: 'Left wrist camera → collector',
+      right_wrist: 'Right wrist camera → collector',
       robot_state: 'Robot/C++ → collector',
       pico_pose: 'PICO manager (pose) → collector',
       planner: 'PICO manager (planner) → collector',
@@ -219,7 +222,8 @@ _INDEX_HTML = """<!doctype html>
       hand_state: 'Hand controller (state) → collector',
     };
     const collectorReceiverStreams = new Set([
-      'camera', 'robot_state', 'pico_pose', 'planner', 'manager_state', 'hand_state'
+      'camera', 'left_wrist', 'right_wrist', 'robot_state', 'pico_pose', 'planner',
+      'manager_state', 'hand_state'
     ]);
     const minimumCollectorReceiverHz = 45;
 

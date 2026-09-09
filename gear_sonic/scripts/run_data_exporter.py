@@ -835,7 +835,8 @@ def _sha256(path: Path) -> str:
 
 
 def _capture_reproducibility_metadata(
-    robot_config: dict, dataset_frequency_hz: float, hand_profile: HandProfile | None = None
+    robot_config: dict, dataset_frequency_hz: float, hand_profile: HandProfile | None = None,
+    *, hand_state_host: str = "localhost",
 ) -> dict:
     """Resolve immutable controller artifacts and record their identities."""
     repo_root = Path(__file__).resolve().parents[2]
@@ -901,7 +902,18 @@ def _capture_reproducibility_metadata(
         "position_units": "m",
         "quaternion_order": "wxyz",
         "capture_timestamp_units": "ns",
-        "capture_monotonic_clock_scope": "single_linux_host",
+        "capture_monotonic_clock_scope": (
+            "single_linux_host" if hand_state_host in ("localhost", "127.0.0.1", "::1") else "per_host"
+        ),
+        "hand_state_host": hand_state_host,
+        "hand_capture_clock_domains": {
+            "hand_state_source_monotonic_ns": "hand_server",
+            "hand_state_publish_monotonic_ns": "hand_server",
+            "hand_intent_received_monotonic_ns": "hand_server",
+            "hand_intent_source_monotonic_ns": "teleop_host",
+            "hand_state_received_monotonic_ns": "recorder_host",
+        },
+        "hand_freshness_clock": "receiver_local_monotonic_and_server_reported_age",
         "dataset_frequency_hz": float(dataset_frequency_hz),
         "git": git,
         "artifacts": artifacts,
@@ -983,6 +995,8 @@ class GrootDataCollector:
 
     RATE_STREAMS = (
         "camera",
+        "left_wrist",
+        "right_wrist",
         "robot_state",
         "pico_pose",
         "planner",
@@ -1082,6 +1096,7 @@ class GrootDataCollector:
         self._episode_input_errors: set[str] = set()
         self._last_input_block_log = 0.0
         self.stream_rates = StreamRateTracker()
+        self._last_wrist_camera_timestamps: dict[str, float] = {}
 
         self.current_stream_mode = 0
 
@@ -1224,6 +1239,21 @@ class GrootDataCollector:
             self._recording_status_socket.send_json(payload, flags=zmq.NOBLOCK)
         except zmq.Again:
             pass
+
+    def _observe_wrist_camera_rates(self, message: dict) -> None:
+        """Count fresh captures sampled by the collector, independently per wrist."""
+        for name in ("left_wrist", "right_wrist"):
+            if name not in message.get("images", {}):
+                continue
+            timestamp = _timestamp_seconds(message.get("timestamps", {}).get(name))
+            if timestamp is None or timestamp == self._last_wrist_camera_timestamps.get(name):
+                continue
+            self._last_wrist_camera_timestamps[name] = timestamp
+            # Source timestamps estimate capture cadence; observation times
+            # measure delivery of distinct frames into this collector loop.
+            # A shared publisher sequence belongs to the combined message and
+            # cannot measure an individual camera's frequency.
+            self.stream_rates.observe(name, source_timestamp=timestamp)
 
     def _poll_state_zmq(self):
         """Poll the ``g1_debug`` ZMQ topic for robot state (non-blocking)."""
@@ -2449,6 +2479,7 @@ class GrootDataCollector:
                                 ),
                                 received_timestamp=receiver_monotonic_ns / 1e9,
                             )
+                            self._observe_wrist_camera_rates(img_msg)
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
@@ -2543,7 +2574,8 @@ def main(config: SonicDataExporterConfig):
             "hand_profile": hand_profile.name,
             "hand_config": hand_config,
             "capture": _capture_reproducibility_metadata(
-                robot_config, config.data_collection_frequency, hand_profile
+                robot_config, config.data_collection_frequency, hand_profile,
+                hand_state_host=config.hand_state_host,
             ),
         },
         robot_type=dataset_robot_type(hand_profile),

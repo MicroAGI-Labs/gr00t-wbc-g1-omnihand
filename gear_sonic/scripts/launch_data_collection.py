@@ -34,9 +34,10 @@ Usage (from repo root — no venv activation needed):
 """
 
 from dataclasses import dataclass
-import os
 import math
+import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import signal
@@ -128,6 +129,15 @@ class DataCollectionLaunchConfig:
     hand_backend: Literal["dex3", "omnihand", "dex1", "none"] = "dex3"
     """Hand owner. OmniHand uses the external controller in sim and hardware."""
 
+    hand_server_host: str | None = None
+    """Launch DEX 1 hands on this host over SSH; omit to launch locally."""
+
+    start_hand_server: bool = True
+    """Start remote hands in the dashboard; disable to use an existing service."""
+
+    hand_server_repo: str = "/home/unitree/gr00t-wbc-g1-omnihand"
+    """Prepared checkout on the remote hand host (SSH uses your normal user/config)."""
+
     omnihand_close_scale: float = 1.0
     """Fraction of the calibrated O10 closing range used for hardware motion."""
 
@@ -138,7 +148,7 @@ class DataCollectionLaunchConfig:
     """Seconds for OmniHand to open or close; lower values respond faster."""
 
     dex1_transition_duration: float = 1.5
-    """Seconds per DEX 1 stroke; supported range 1.35–30."""
+    """Seconds per DEX 1 stroke (1.35–30) for locally or SSH-launched hands."""
 
     check_only: bool = False
     """Check launch prerequisites and print the hand command without starting services."""
@@ -296,17 +306,26 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
         if not scene.is_file() or not mesh.is_file() or mesh.stat().st_size < 1000:
             errors.append("Atlas OmniHand MuJoCo assets are unavailable or still LFS pointers. Run: git lfs pull")
 
+    if config.hand_server_host is not None:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", config.hand_server_host):
+            errors.append("--hand-server-host must be an IPv4 address or hostname")
+        if config.start_hand_server and not shutil.which("ssh"):
+            errors.append("ssh is required to launch the remote hand server")
+        if config.hand_backend != "dex1" or config.sim:
+            errors.append("--hand-server-host requires physical --hand-backend dex1")
+
     if config.hand_backend == "dex1":
         from gear_sonic.end_effectors.backends.dex1 import USB_PORTS
 
         if config.sim:
             errors.append("DEX 1 currently supports physical USB grippers only; no DEX 1 MuJoCo scene is configured")
-        worker = repo_root / "build/dex1/dex1_worker"
-        if not os.access(worker, os.X_OK):
-            errors.append("DEX 1 worker missing. Run: bash install_scripts/install_dex1.sh")
-        for side, port in USB_PORTS.items():
-            if not os.access(port, os.R_OK | os.W_OK):
-                errors.append(f"DEX 1 {side} serial adapter unavailable or inaccessible: {port}")
+        if config.hand_server_host is None:
+            worker = repo_root / "build/dex1/dex1_worker"
+            if not os.access(worker, os.X_OK):
+                errors.append("DEX 1 worker missing. Run: bash install_scripts/install_dex1.sh")
+            for side, port in USB_PORTS.items():
+                if not os.access(port, os.R_OK | os.W_OK):
+                    errors.append(f"DEX 1 {side} serial adapter unavailable or inaccessible: {port}")
         if not math.isfinite(config.dex1_transition_duration) or not 1.35 <= config.dex1_transition_duration <= 30:
             errors.append("--dex1-transition-duration must be between 1.35 and 30 seconds")
 
@@ -400,6 +419,61 @@ def _switch_camera_source(config: DataCollectionLaunchConfig) -> None:
     )
 
 
+def _launch_hands(config: DataCollectionLaunchConfig) -> bool:
+    return config.hand_backend in {"omnihand", "dex1"} and (
+        config.hand_server_host is None or config.start_hand_server
+    )
+
+
+def _remote_hand_ssh_args(config: DataCollectionLaunchConfig) -> list[str]:
+    args = [
+        "ssh", "-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=2", "-o", "ServerAliveCountMax=3",
+    ]
+    key = Path.home() / ".ssh" / f"id_ed25519_sonic_{config.hand_server_host}"
+    if key.is_file():
+        args += ["-i", str(key), "-o", "IdentitiesOnly=yes"]
+    return args
+
+
+def _check_remote_hand_connection(config: DataCollectionLaunchConfig) -> None:
+    """Check authentication before replacing a dashboard or starting services."""
+    if config.hand_server_host is None or not config.start_hand_server:
+        return
+    args = _remote_hand_ssh_args(config)
+    args[1] = "-T"
+    try:
+        result = subprocess.run(
+            [*args, "--", config.hand_server_host, "true"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit("Orin connection timed out; check the robot network.") from None
+    if result.returncode != 0:
+        setup = shlex.join(["bash", "tools/setup_orin_ssh.sh", config.hand_server_host])
+        raise SystemExit(
+            f"Cannot connect to hand host {config.hand_server_host} without a password.\n"
+            f"One-time pairing: {setup}\n"
+            f"SSH: {result.stderr.strip()}"
+        )
+
+
+def _remote_hand_command(config: DataCollectionLaunchConfig) -> str:
+    """Keep the remote process attached to the hand pane, including shutdown."""
+    command = (
+        f"cd {shlex.quote(config.hand_server_repo)} && "
+        # SSH_CONNECTION supplies Thor's address as seen by the hand host.
+        'exec .venv_hands/bin/python -m gear_sonic.end_effectors.server '
+        '--teleop-host "${SSH_CONNECTION%% *}" '
+        f"--intent-port {config.hand_intent_port} --state-port {config.hand_state_port} "
+        f"--control-port {config.hand_control_port} "
+        f"--dex1-transition-duration {config.dex1_transition_duration} --enable-command"
+    )
+    return shlex.join([
+        *_remote_hand_ssh_args(config), "--", str(config.hand_server_host), command,
+    ])
+
+
 def _hand_pane(config: DataCollectionLaunchConfig) -> int:
     """Return the OmniHand pane index for the selected launch configuration."""
     return CORE_PANE_COUNT + int(config.sim)
@@ -407,7 +481,7 @@ def _hand_pane(config: DataCollectionLaunchConfig) -> int:
 
 def _camera_server_log_pane(config: DataCollectionLaunchConfig) -> int:
     """Return the hardware camera log pane after optional sim/hand panes."""
-    return CORE_PANE_COUNT + int(config.sim) + int(config.hand_backend in {"omnihand", "dex1"})
+    return CORE_PANE_COUNT + int(config.sim) + int(_launch_hands(config))
 
 
 def _create_tmux_session(config: DataCollectionLaunchConfig):
@@ -438,7 +512,7 @@ def _create_tmux_session(config: DataCollectionLaunchConfig):
     pane_count = (
         CORE_PANE_COUNT
         + int(config.sim)
-        + int(config.hand_backend in {"omnihand", "dex1"})
+        + int(_launch_hands(config))
         + int(not config.sim and config.camera_server_logs)
     )
     for _ in range(1, pane_count):
@@ -519,9 +593,16 @@ def main(config: DataCollectionLaunchConfig):
     _check_prerequisites(config)
     if config.check_only:
         print("Launch prerequisites passed; no services started.")
-        if config.hand_backend in {"omnihand", "dex1"}:
+        if config.hand_server_host is not None:
+            if config.start_hand_server:
+                print(_remote_hand_command(config))
+            else:
+                print(f"Using existing hand server at {config.hand_server_host}:{config.hand_state_port}")
+        elif _launch_hands(config):
             print(_hand_worker_command(config)[1])
         return
+
+    _check_remote_hand_connection(config)
 
     print("=" * 60)
     print("  SONIC Data Collection Launcher")
@@ -533,6 +614,7 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Teleop input:    {config.pico_input_source}")
     print(f"  Body control:    {config.body_control_mode}")
     print(f"  Hand backend:    {config.hand_backend}")
+    print(f"  Hand server:     {config.hand_server_host or 'local (managed by launcher)'}")
     if config.deploy_checkpoint:
         print(f"  Checkpoint:      {config.deploy_checkpoint}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
@@ -650,18 +732,21 @@ def main(config: DataCollectionLaunchConfig):
     print("Starting teleop streamer (pane 1)...")
     _send_to_pane(1, pico_cmd, wait=2.0)
 
-    # --- Dedicated external hand controller pane ---
-    if config.hand_backend in {"omnihand", "dex1"}:
+    # --- Dedicated hand controller pane, local or SSH. ---
+    if _launch_hands(config):
         hand_pane = _hand_pane(config)
-        hand_venv, hand_worker_cmd = _hand_worker_command(config)
-        # The supervisor owns the restart command outside the native SDK
-        # process, so the UI can recover even if a vendor call is wedged.
-        hand_cmd = (
-            f"cd {repo_root} && source {hand_venv}/bin/activate && "
-            "python -m gear_sonic.end_effectors.supervisor "
-            f"--control-endpoint tcp://localhost:{config.hand_control_port} -- "
-            f"{hand_worker_cmd}"
-        )
+        if config.hand_server_host is not None:
+            hand_cmd = _remote_hand_command(config)
+        else:
+            hand_venv, hand_worker_cmd = _hand_worker_command(config)
+            # The supervisor owns the restart command outside the native SDK
+            # process, so the UI can recover even if a vendor call is wedged.
+            hand_cmd = (
+                f"cd {repo_root} && source {hand_venv}/bin/activate && "
+                "python -m gear_sonic.end_effectors.supervisor "
+                f"--control-endpoint tcp://localhost:{config.hand_control_port} -- "
+                f"{hand_worker_cmd}"
+            )
         print(f"Starting {config.hand_backend} controller (pane {hand_pane})...")
         _send_to_pane(hand_pane, hand_cmd)
 
@@ -685,6 +770,7 @@ def main(config: DataCollectionLaunchConfig):
             f"--camera-port {config.camera_port} "
             f"--http-port {config.remote_ui_port} "
             f"--hand-state-port {config.hand_state_port} "
+            f"--hand-state-host {shlex.quote(config.hand_server_host or 'localhost')} "
             f"--hand-control-port {config.hand_control_port} "
             f"--teleop-control-port {config.teleop_control_port}"
         )
@@ -713,7 +799,8 @@ def main(config: DataCollectionLaunchConfig):
         f"--required-stream-mode {required_stream_mode} "
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port} "
-        f"--hand-state-port {config.hand_state_port}"
+        f"--hand-state-port {config.hand_state_port} "
+        f"--hand-state-host {shlex.quote(config.hand_server_host or 'localhost')}"
     )
     if config.dataset_name:
         exporter_cmd += f" --dataset-name '{config.dataset_name}'"
@@ -750,8 +837,10 @@ def main(config: DataCollectionLaunchConfig):
         print("    Pane 3: Camera Viewer")
     if config.sim:
         print(f"    Pane {SIM_PANE}: MuJoCo Simulator")
-    if config.hand_backend in {"omnihand", "dex1"}:
+    if _launch_hands(config):
         print(f"    Pane {_hand_pane(config)}: {config.hand_backend} controller")
+    elif config.hand_server_host is not None:
+        print(f"    Hands: existing service on {config.hand_server_host}")
     if not config.sim and config.camera_server_logs:
         print(
             f"    Pane {_camera_server_log_pane(config)}: "

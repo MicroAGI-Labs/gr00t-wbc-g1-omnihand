@@ -91,7 +91,7 @@ class FakeSDK:
     RESOLUTION = SimpleNamespace(HD720="HD720")
     DEPTH_MODE = SimpleNamespace(NONE="NONE")
     ERROR_CODE = SimpleNamespace(SUCCESS=0, FAILURE=1)
-    VIEW = SimpleNamespace(LEFT="LEFT")
+    VIEW = SimpleNamespace(LEFT="LEFT", RIGHT="RIGHT")
     MEM = SimpleNamespace(CPU="CPU")
     TIME_REFERENCE = SimpleNamespace(IMAGE="IMAGE")
     InitParameters = FakeInitParameters
@@ -156,7 +156,7 @@ def test_zed_sensor_returns_owned_rgb_frame_and_host_timestamps(monkeypatch):
     assert sample["sample_monotonic_ns"] == 123_456_789
     assert sensor.serialize(sample)["sample_monotonic_ns"] == 123_456_789
     assert sdk.camera.retrieve_args[1:] == (
-        sdk.VIEW.LEFT,
+        sdk.VIEW.RIGHT,
         sdk.MEM.CPU,
         sensor._output_resolution,
     )

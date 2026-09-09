@@ -95,6 +95,41 @@ def assert_stopped(log):
 
 
 @pytest.mark.parametrize(
+    "fault,value,success,detail",
+    [
+        ("DEX1_TEST_STARTUP_FAILURES", "3", True, "startup recovered"),
+        ("DEX1_TEST_STARTUP_FAILURES", "1000", False, "startup timed out with drive disabled"),
+        ("DEX1_TEST_LOW_VOLTAGE", "1", False, "supply outside 24-64 V"),
+        ("DEX1_TEST_ACTIVE_FAILURE", "1", False, "invalid motor response"),
+    ],
+)
+def test_native_startup_retries_only_disabled_communication(fake_worker, tmp_path, fault, value, success, detail):
+    master, slave = os.openpty()
+    log = tmp_path / "exchanges.log"
+    try:
+        result = subprocess.run(
+            [str(fake_worker), os.ttyname(slave), "0", "-0.1", "5.75", "1.5", "1"],
+            input="C 1 0 2.5\n", capture_output=True, text=True, timeout=3,
+            env={**os.environ, fault: value, "DEX1_TEST_EXCHANGE_LOG": str(log)},
+        )
+        assert result.returncode == (0 if success else 2), result.stderr
+        assert detail in result.stderr
+        modes = [int(line) for line in log.read_text().splitlines()]
+        if fault == "DEX1_TEST_STARTUP_FAILURES" and success:
+            assert modes[:4] == [0, 0, 0, 0]
+            assert modes.count(1) == 1
+        elif fault == "DEX1_TEST_ACTIVE_FAILURE":
+            assert modes == [0, 1, 0, 0, 0]  # one failed active request, then stops
+        else:
+            assert set(modes) == {0}
+        if fault == "DEX1_TEST_LOW_VOLTAGE":
+            assert len(modes) == 4  # health fault is never retried
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
+@pytest.mark.parametrize(
     "side,adapter,motor_id,lower,upper,closed,opened",
     [
         ("left", "FTBQ776H", 0, -0.10, 5.75, 0.12, 5.30),

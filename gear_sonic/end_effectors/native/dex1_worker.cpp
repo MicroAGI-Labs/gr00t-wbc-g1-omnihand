@@ -26,6 +26,7 @@ constexpr float kTorque = 1.0f, kSpeed = 9.0f, kP = 8.0f, kD = .35f;
 constexpr double kWatchdog = .25;
 void on_signal(int) { interrupted = 1; }
 void check(bool ok, const std::string& why) { if (!ok) throw std::runtime_error(why); }
+struct CommunicationError : std::runtime_error { using std::runtime_error::runtime_error; };
 double seconds(Clock::duration d) { return std::chrono::duration<double>(d).count(); }
 
 struct Reference { float q, dq; };
@@ -64,6 +65,7 @@ Request parse(const std::string& line, float lower, float upper) {
 
 struct Motor {
     int id;
+    std::string port_name;
     float lower, upper;
     std::unique_ptr<SerialPort> serial;
     MotorData data;
@@ -75,7 +77,7 @@ struct Motor {
     float voltage() { return data.get_motor_recv_data()[5]/2.0f; }
 
     Motor(const std::string& port, int motor_id, float lo, float hi)
-        : id(motor_id), lower(lo), upper(hi) {
+        : id(motor_id), port_name(port), lower(lo), upper(hi) {
         // Kernel exclusivity prevents new opens by other services/test tools.
         lock_fd = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
         check(lock_fd >= 0, "cannot open " + port);
@@ -97,7 +99,8 @@ struct Motor {
         MotorData next;
         next.motorType = MotorType::M4010; next.correct = false;
         auto c = command(id, mode, tau_command);
-        check(serial->sendRecv(&c, &next) && next.correct && next.motor_id == id, "invalid motor response");
+        if (!serial->sendRecv(&c, &next) || !next.correct || next.motor_id != id)
+            throw CommunicationError("invalid motor response: port=" + port_name + " motor_id=" + std::to_string(id));
         data = next; last_reply = Clock::now();
         check(std::isfinite(q()) && std::isfinite(dq()) && std::isfinite(tau()), "nonfinite feedback");
         check(data.merror == 0, "motor fault " + std::to_string(data.merror));
@@ -106,6 +109,27 @@ struct Motor {
         check(q() >= lower && q() <= upper, "position limit");
         check(std::abs(dq()) < kSpeed && std::abs(tau()) < 1.30f, "speed/torque limit");
         if (mode == 1 && !enabling) check(data.mode == 1 && data.timeout == 0, "drive not enabled");
+    }
+    void establish_feedback() {
+        // USB enumeration does not mean the motor is ready to reply yet.
+        // Retry only this initial, disabled handshake. Never retry a health
+        // violation or a communication fault after this handshake succeeds.
+        const auto deadline = Clock::now() + std::chrono::seconds(1);
+        int retries = 0;
+        while (true) {
+            try {
+                exchange(0);
+                if (retries)
+                    std::cerr << "DEX1 startup recovered: motor_id=" << id << " retries=" << retries << '\n';
+                return;
+            } catch (const CommunicationError& e) {
+                if (Clock::now() >= deadline)
+                    throw CommunicationError(std::string(e.what()) +
+                        "; startup timed out with drive disabled; check motor power and data cable, then reconnect");
+                ++retries;
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
     }
     void stop() noexcept {
         if (!serial) return;
@@ -179,7 +203,7 @@ int main(int argc, char** argv) {
               && duration >= 1.35 && duration <= 30, "invalid motor configuration");
         check(fcntl(STDIN_FILENO,F_SETFL,O_NONBLOCK) == 0
               && fcntl(STDOUT_FILENO,F_SETFL,O_NONBLOCK) == 0, "pipe flags");
-        Motor m(argv[1],id,lower,upper); m.exchange(0);
+        Motor m(argv[1],id,lower,upper); m.establish_feedback();
         Request request; request.q = m.q();
         auto last_command = Clock::now(), previous = last_command, next = last_command, ramp_start = last_command;
         float start = m.q(), target = start, integral = 0;

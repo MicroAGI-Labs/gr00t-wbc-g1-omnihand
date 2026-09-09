@@ -678,11 +678,11 @@ def get_wrist_camera_features() -> dict:
     for name in ("left_wrist", "right_wrist"):
         features[f"observation.images.{name}"] = {
             "dtype": "video",
-            "shape": [WRIST_VIEW_HEIGHT, WRIST_VIEW_WIDTH, 3],
+            "shape": (WRIST_VIEW_HEIGHT, WRIST_VIEW_WIDTH, 3),
             "names": ["height", "width", "channel"],
         }
         features[f"capture.{name}_source_timestamp_ns"] = {
-            "dtype": "int64", "shape": [1], "names": ["timestamp_ns"],
+            "dtype": "int64", "shape": (1,), "names": ["timestamp_ns"],
         }
     return features
 

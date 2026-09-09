@@ -4,7 +4,7 @@ The ZED SDK and its Python API are system dependencies and are intentionally
 loaded lazily. Install the SDK on the camera host, then install ``pyzed`` into
 the camera virtual environment with ``/usr/local/zed/get_python_api.py``.
 
-This first integration exposes the rectified left RGB image only. Depth needs
+This integration exposes the rectified right RGB image only. Depth needs
 its own lossless wire format and is deliberately kept out of the JPEG pipeline.
 """
 
@@ -53,7 +53,7 @@ class ZEDConfig:
 
 
 class ZEDSensor(Sensor):
-    """Rectified left-RGB stream from a Stereolabs ZED camera."""
+    """Rectified right-RGB stream from a Stereolabs ZED camera."""
 
     def __init__(
         self,
@@ -136,7 +136,7 @@ class ZEDSensor(Sensor):
 
         retrieve_status = self._camera.retrieve_image(
             self._image,
-            self._sl.VIEW.LEFT,
+            self._sl.VIEW.RIGHT,
             self._sl.MEM.CPU,
             self._output_resolution,
         )
@@ -149,7 +149,7 @@ class ZEDSensor(Sensor):
             print(f"[{self.mount_position}] ZED returned an invalid image shape: {image_bgra.shape}")
             return None
 
-        # VIEW.LEFT is BGRA. Reordering also makes an owned, contiguous RGB copy;
+        # VIEW.RIGHT is BGRA. Reordering also makes an owned, contiguous RGB copy;
         # the SDK-owned Mat buffer may be overwritten by the next grab().
         image_rgb = np.ascontiguousarray(
             image_bgra[::-1, ::-1, 2::-1] if self.config.rotate_180 else image_bgra[..., 2::-1]

@@ -2,6 +2,7 @@ import queue
 from types import SimpleNamespace
 
 import cv2
+from lerobot.common.datasets.utils import validate_frame
 import numpy as np
 import pytest
 
@@ -14,7 +15,7 @@ from gear_sonic.camera.composed_camera import (
 from gear_sonic.camera.drivers import usb_camera
 from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.data.features_sonic_vla import get_wrist_camera_features
-from gear_sonic.scripts.run_data_exporter import GrootDataCollector
+from gear_sonic.scripts.run_data_exporter import GrootDataCollector, StreamRateTracker
 
 
 def sample(name, sequence, received_ns=1_000_000_000):
@@ -144,7 +145,78 @@ def collector(wrists):
     obj.camera_max_age = 0.1
     obj.latest_image_msg = sample("ego_view", 1)
     obj.latest_image_msg["camera_received_monotonic_ns"] = {"ego_view": 1_000_000_000}
+    obj.stream_rates = StreamRateTracker()
+    obj._last_wrist_camera_timestamps = {}
     return obj
+
+
+def test_first_wrist_frame_passes_lerobot_validation():
+    obj = collector(True)
+    features = get_wrist_camera_features()
+    features["observation.images.ego_view"] = {
+        "dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"],
+    }
+    for name in ("left_wrist", "right_wrist"):
+        obj.latest_image_msg["images"].update(sample(name, 2)["images"])
+        obj.latest_image_msg["timestamps"][name] = 2.0
+    frame = {"task": "record both wrist cameras"}
+    obj._add_images_to_frame_data(frame)
+    validate_frame(frame, features)
+
+
+def test_wrist_rates_separate_capture_and_fresh_collector_cadence(monkeypatch):
+    obj = collector(True)
+    now = [0.0]
+    monkeypatch.setattr("gear_sonic.scripts.run_data_exporter.time.monotonic", lambda: now[0])
+    # A 50 Hz collector samples cameras capturing independently at 60 and 30 Hz.
+    # The combined message's publisher sequence must not override either rate.
+    for tick in range(100):
+        now[0] = tick / 50
+        obj._observe_wrist_camera_rates({
+            "images": {"left_wrist": object(), "right_wrist": object()},
+            "timestamps": {
+                "left_wrist": 1000 + (tick * 60 // 50) / 60,
+                "right_wrist": 1000 + (tick * 30 // 50) / 30,
+            },
+            "publisher_sequence": tick * 10,
+        })
+    rates = obj.stream_rates.snapshot(obj.RATE_STREAMS)
+    assert rates["left_wrist"]["sent_hz"] == pytest.approx(60, abs=0.1)
+    assert rates["left_wrist"]["received_hz"] == pytest.approx(50, abs=0.1)
+    assert rates["right_wrist"]["sent_hz"] == pytest.approx(30, abs=0.1)
+    assert rates["right_wrist"]["received_hz"] == pytest.approx(30, abs=0.5)
+
+
+def test_cached_wrist_rate_goes_stale_while_other_wrist_keeps_arriving(monkeypatch):
+    obj = collector(True)
+    now = [0.0]
+    monkeypatch.setattr("gear_sonic.scripts.run_data_exporter.time.monotonic", lambda: now[0])
+    for tick in range(150):
+        now[0] = tick / 50
+        obj._observe_wrist_camera_rates({
+            "images": {"left_wrist": object(), "right_wrist": object()},
+            "timestamps": {
+                "left_wrist": 1000 + min(tick, 49) / 50,
+                "right_wrist": 1000 + tick / 50,
+            },
+        })
+    rates = obj.stream_rates.snapshot(obj.RATE_STREAMS)
+    assert rates["left_wrist"]["active"] is False
+    assert rates["left_wrist"]["sent_hz"] == rates["left_wrist"]["received_hz"] == 0
+    assert rates["right_wrist"]["active"] is True
+    assert rates["right_wrist"]["received_hz"] == pytest.approx(50, abs=0.1)
+
+
+@pytest.mark.parametrize("timestamp", [None, float("nan"), float("inf"), "invalid"])
+def test_wrist_rates_ignore_missing_images_and_invalid_timestamps(timestamp):
+    obj = collector(True)
+    obj._observe_wrist_camera_rates({
+        "images": {"left_wrist": object()},
+        "timestamps": {"left_wrist": timestamp, "right_wrist": 1000.0},
+    })
+    rates = obj.stream_rates.snapshot(obj.RATE_STREAMS)
+    assert rates["left_wrist"]["active"] is False
+    assert rates["right_wrist"]["active"] is False
 
 
 @pytest.mark.parametrize("wrists", [False, True])

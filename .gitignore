@@ -206,6 +206,7 @@ uv.lock
 .venv_camera
 .venv_inference
 .venv_omnihand
+.venv_hands
 
 # XRoboToolkit-PC-Service-Pybind
 xrobotoolkit_sdk.cpython-*-*-*.so
