@@ -2297,7 +2297,7 @@ class PlannerStreamer:
                 print(f"[PlannerLoop] Mode -> {self.mode.value}: {self.mode.name}")
 
             # Read axes/joysticks to control movement, facing, speed and mode
-            if force_locomotion_idle or stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE:
+            if force_locomotion_idle:
                 lx, ly, rx, ry = (0.0, 0.0, 0.0, 0.0)
             else:
                 lx, ly, rx, ry = get_controller_axes(self.reader)
@@ -2335,7 +2335,7 @@ class PlannerStreamer:
 
             movement = [movement_global[0], movement_global[1], 0.0]
 
-            if force_locomotion_idle or stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE:
+            if force_locomotion_idle:
                 mode_to_send = LocomotionMode.IDLE
                 movement = [0.0, 0.0, 0.0]
                 speed = -1.0
