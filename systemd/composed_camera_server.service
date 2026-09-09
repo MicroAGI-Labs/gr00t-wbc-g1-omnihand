@@ -27,7 +27,7 @@
 #  ZED:
 #       python -c "import pyzed.sl as sl; print(sl.Camera.get_device_list())"
 #  USB:
-#       ls /dev/video*    # use the index number, e.g. "0" for /dev/video0
+#       ls /dev/v4l/by-id/*video-index0    # stable paths survive USB renumbering
 # ─────────────────────────────────────────────────────────────────
 
 [Unit]
@@ -65,6 +65,11 @@ ExecStart=${REPO_DIR}/.venv_camera/bin/python -m gear_sonic.camera.composed_came
 #     --ego-view-camera zed --ego-view-device-id YOUR_ZED_SERIAL \
 #     --zed-camera-resolution HD720 --zed-camera-fps 60 --fps 60 \
 #     --port 5555
+
+# Add JR wrist cameras to the ZED command above (verify physical left/right):
+#     --left-wrist-camera usb --left-wrist-device-id /dev/v4l/by-id/LEFT_DEVICE-video-index0 \
+#     --right-wrist-camera usb --right-wrist-device-id /dev/v4l/by-id/RIGHT_DEVICE-video-index0 \
+#     --usb-camera-resolution 1280 720 --usb-camera-fps 60 --usb-camera-mjpeg
 
 Restart=on-failure
 RestartSec=5

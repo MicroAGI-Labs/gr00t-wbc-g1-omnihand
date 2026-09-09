@@ -673,19 +673,18 @@ def get_features_sonic_vla(
 
 
 def get_wrist_camera_features() -> dict:
-    """Features for optional wrist cameras (added when ``record_wrist_cameras`` is enabled)."""
-    return {
-        "observation.images.left_wrist": {
+    """Optional wrist videos and their original host capture timestamps."""
+    features = {}
+    for name in ("left_wrist", "right_wrist"):
+        features[f"observation.images.{name}"] = {
             "dtype": "video",
             "shape": [WRIST_VIEW_HEIGHT, WRIST_VIEW_WIDTH, 3],
             "names": ["height", "width", "channel"],
-        },
-        "observation.images.right_wrist": {
-            "dtype": "video",
-            "shape": [WRIST_VIEW_HEIGHT, WRIST_VIEW_WIDTH, 3],
-            "names": ["height", "width", "channel"],
-        },
-    }
+        }
+        features[f"capture.{name}_source_timestamp_ns"] = {
+            "dtype": "int64", "shape": [1], "names": ["timestamp_ns"],
+        }
+    return features
 
 
 def get_wrist_camera_modality_config() -> dict:

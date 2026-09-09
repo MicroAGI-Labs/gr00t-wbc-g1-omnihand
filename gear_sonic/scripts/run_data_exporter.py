@@ -1381,6 +1381,8 @@ class GrootDataCollector:
         if camera_age > self.camera_max_age:
             raise RuntimeError(f"camera frame is stale ({camera_age:.3f}s)")
 
+        self._validate_camera_inputs(now)
+
         if self.hand_config is not None:
             self._external_hand_values()
 
@@ -1835,6 +1837,27 @@ class GrootDataCollector:
             if parts:
                 print(f"[Latency] {', '.join(parts)}")
 
+    def _validate_camera_inputs(self, now: float) -> None:
+        """Validate only the streams selected for this dataset."""
+        message = self.latest_image_msg or {}
+        received = message.get("camera_received_monotonic_ns", {})
+        for feature_name, feature in self.data_exporter.features.items():
+            if feature.get("dtype") not in ("image", "video"):
+                continue
+            name = feature_name.split(".")[-1]
+            image = message.get("images", {}).get(name)
+            if image is None:
+                raise RuntimeError(f"required camera {name} is unavailable")
+            if tuple(image.shape) != tuple(feature["shape"]):
+                raise RuntimeError(f"camera {name} shape {image.shape} does not match {feature['shape']}")
+            timestamp_key = f"capture.{name}_source_timestamp_ns"
+            if timestamp_key in self.data_exporter.features:
+                if _timestamp_seconds(message.get("timestamps", {}).get(name)) is None:
+                    raise RuntimeError(f"camera {name} capture timestamp is unavailable")
+            received_at = received.get(name)
+            if received_at is not None and now - received_at / 1e9 > self.camera_max_age:
+                raise RuntimeError(f"camera {name} is stale")
+
     def _add_images_to_frame_data(self, frame_data: dict) -> None:
         if self.latest_image_msg is None:
             return
@@ -1848,6 +1871,10 @@ class GrootDataCollector:
                         f"not found in image message. Available: {list(images.keys())}"
                     )
                 frame_data[feature_name] = images[image_key]
+                timestamp_key = f"capture.{image_key}_source_timestamp_ns"
+                if timestamp_key in self.data_exporter.features:
+                    timestamp = self.latest_image_msg["timestamps"][image_key]
+                    frame_data[timestamp_key] = np.asarray([int(timestamp * 1e9)], dtype=np.int64)
 
     def _finalize_frame(self, t_start: float) -> bool:
         t_end = time.monotonic()

@@ -57,7 +57,7 @@ class ComposedCameraConfig:
     """Camera type for ego view: oak, oak_mono, realsense, zed, usb, or None."""
 
     ego_view_device_id: str | None = None
-    """Device ID (OAK MxID, RealSense/ZED serial, or USB /dev/video index)."""
+    """Device ID (OAK MxID, RealSense/ZED serial, or USB device path/index)."""
 
     head_camera: str | None = None
     """Camera type for head view."""
@@ -88,6 +88,15 @@ class ComposedCameraConfig:
 
     zed_camera_rotate_180: bool = True
     """Rotate robot-mounted ZED frames 180 degrees."""
+
+    usb_camera_fps: int = 30
+    """USB capture rate; use 60 for JR wrist cameras."""
+
+    usb_camera_resolution: tuple[int, int] = (640, 480)
+    """USB capture width/height; output remains 640x480 like ZED."""
+
+    usb_camera_mjpeg: bool = False
+    """Request MJPEG on USB cameras (required for JR 1280x720 at 60 FPS)."""
 
     run_as_server: bool = True
     """Run as ZMQ PUB server (set False for in-process usage)."""
@@ -125,6 +134,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
         self.error_events: dict[str, threading.Event] = {}
         self.error_messages: dict[str, str] = {}
         self._observation_spaces: dict[str, Any] = {}
+        self._latest_frames: dict[str, dict] = {}
 
         camera_configs = self._get_camera_configs()
 
@@ -415,8 +425,12 @@ class ComposedCameraSensor(Sensor, SensorServer):
         elif camera_type == "usb":
             from gear_sonic.camera.drivers.usb_camera import USBCameraConfig, USBCameraSensor
 
-            usb_config = USBCameraConfig()
-            device_idx = int(device_id) if device_id else 0
+            usb_config = USBCameraConfig(
+                fps=self.config.usb_camera_fps,
+                capture_dim=self.config.usb_camera_resolution,
+                mjpeg=self.config.usb_camera_mjpeg,
+            )
+            device_idx = int(device_id) if device_id and device_id.isdecimal() else (device_id or 0)
             print(f"Initializing USB camera for type: {camera_type}, device: {device_idx}")
             return USBCameraSensor(
                 config=usb_config, mount_position=mount_position, device_index=device_idx
@@ -434,20 +448,19 @@ class ComposedCameraSensor(Sensor, SensorServer):
                 raise RuntimeError(error_msg)
 
     def read(self):
-        """Read frames from all cameras. Returns None unless ALL cameras have frames."""
+        """Publish new arrivals without losing frames from asynchronous cameras.
+
+        Cached images retain their original timestamps, allowing each receiver
+        to identify fresh captures and sample each stream independently.
+        """
         self._check_for_errors()
-
-        expected_cameras = set(self.camera_queues.keys())
-        message = {}
-
+        updated = False
         for mount_position, camera_queue in self.camera_queues.items():
             frame = self._get_latest_from_queue(camera_queue)
             if frame is not None:
-                message[mount_position] = frame
-
-        if set(message.keys()) == expected_cameras:
-            return message
-        return None
+                self._latest_frames[mount_position] = frame
+                updated = True
+        return dict(self._latest_frames) if updated else None
 
     def _get_latest_from_queue(self, camera_queue: queue.Queue) -> dict[str, Any] | None:
         latest = None
@@ -554,7 +567,9 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         self._staleness_warning_interval = 2.0
         self._background = background
         self._background_lock = threading.Lock()
-        self._background_messages: deque[dict[str, Any]] = deque(maxlen=5)
+        self._background_frames: dict[str, deque] = {}
+        self._background_timestamps: dict[str, float] = {}
+        self._selected_frames: dict[str, dict] = {}
         self._background_target_depth = 2
         self._receiver_stop = threading.Event()
         self._receiver_ready = threading.Event()
@@ -599,11 +614,40 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
                 decoded = ImageMessageSchema.deserialize(message).asdict()
                 decoded["receiver_monotonic_ns"] = time.monotonic_ns()
                 with self._background_lock:
-                    self._background_messages.append(decoded)
+                    self._buffer_camera_frames(decoded)
         except BaseException as exc:
             self._receiver_error = exc
         finally:
             self.stop_client()
+
+    def _buffer_camera_frames(self, message: dict) -> None:
+        """Keep bounded queues of distinct captures, independently per camera."""
+        for name, image in message["images"].items():
+            timestamp = message["timestamps"][name]
+            if self._background_timestamps.get(name) == timestamp:
+                continue
+            self._background_timestamps[name] = timestamp
+            frames = self._background_frames.setdefault(name, deque(maxlen=5))
+            frames.append({**message, "images": {name: image}, "timestamps": {name: timestamp}})
+
+    def _sample_camera_frames(self) -> dict | None:
+        updated = False
+        for name, frames in self._background_frames.items():
+            # Leave one capture in reserve for the normal 60 -> 50 Hz cadence.
+            while len(frames) > self._background_target_depth:
+                frames.popleft()
+            if frames:
+                self._selected_frames[name] = frames.popleft()
+                updated = True
+        if not updated:
+            return None
+        latest = max(self._selected_frames.values(), key=lambda frame: frame["receiver_monotonic_ns"])
+        message = {**latest, "images": {}, "timestamps": {}, "camera_received_monotonic_ns": {}}
+        for name, frame in self._selected_frames.items():
+            message["images"].update(frame["images"])
+            message["timestamps"].update(frame["timestamps"])
+            message["camera_received_monotonic_ns"][name] = frame["receiver_monotonic_ns"]
+        return message
 
     def read(self, blocking: bool = False, **kwargs) -> dict[str, Any] | None:
         self._start_time = time.time()
@@ -613,16 +657,7 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             raise RuntimeError(f"camera receiver failed: {self._receiver_error}")
         if self._background:
             with self._background_lock:
-                # Convert the faster, bursty publisher into a steady collector
-                # stream. Keep one decoded frame in reserve across the normal
-                # 60 Hz -> 50 Hz downsample, and discard only excess old frames.
-                while len(self._background_messages) > self._background_target_depth:
-                    self._background_messages.popleft()
-                message = (
-                    self._background_messages.popleft()
-                    if self._background_messages
-                    else None
-                )
+                message = self._sample_camera_frames()
         elif blocking:
             message = self.receive_message()
             if not message:

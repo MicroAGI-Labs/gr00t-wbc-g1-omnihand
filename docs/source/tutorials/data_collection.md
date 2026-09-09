@@ -120,6 +120,52 @@ python -m gear_sonic.camera.composed_camera \
     --port 5555
 ```
 
+**ZED plus JR USB wrist cameras:**
+
+Use the physical left/right mapping when supplying device paths; JR0001 and
+JR0002 identify devices, not their mounting sides. Find their stable paths with
+`ls /dev/v4l/by-id/*video-index0`.
+
+```sh
+python -m gear_sonic.camera.composed_camera \
+    --ego-view-camera zed --zed-camera-fps 60 --fps 60 \
+    --left-wrist-camera usb --left-wrist-device-id /dev/v4l/by-id/LEFT_DEVICE-video-index0 \
+    --right-wrist-camera usb --right-wrist-device-id /dev/v4l/by-id/RIGHT_DEVICE-video-index0 \
+    --usb-camera-resolution 1280 720 --usb-camera-fps 60 --usb-camera-mjpeg \
+    --port 5555
+```
+
+The JR cameras capture MJPEG at 1280×720/60 FPS with two V4L2 buffers. The
+USB driver continuously drains capture and outputs RGB at 640×480, matching the
+existing wrist dataset schema and ZED output. The camera server publishes at
+60 FPS. Independently arriving images retain their original timestamps; a
+camera waiting for its next capture does not discard another camera's frame.
+The recorder's receiver buffers each stream separately and selects frames at
+50 Hz. There is no 50 Hz throttle in the camera driver.
+
+Configure the camera service's `ExecStart` with these arguments for persistent
+use. For a manually running server, pass `--no-manage-camera-service` to the
+launcher. Only one process should open each physical camera; close standalone
+USB viewers before starting the shared server. The teleop dashboard consumes
+that shared stream and automatically displays the wrist views.
+
+Enable optional collection with:
+
+```sh
+python gear_sonic/scripts/launch_data_collection.py \
+    --hand-backend dex1 --remote-ui --record-wrist-cameras \
+    --data-exporter-frequency 50
+```
+
+Without `--record-wrist-cameras`, datasets contain only the existing ego view.
+With it, both wrist images must be present, correctly sized, and fresh within
+`--camera-max-age` (0.1 seconds in the exporter). A stalled required camera
+blocks recording even if another camera keeps publishing. Wrist datasets also
+store `capture.left_wrist_source_timestamp_ns` and
+`capture.right_wrist_source_timestamp_ns`: host wall-clock timestamps taken
+immediately after capture returns, before resize/conversion, in nanoseconds.
+These identify reused images; they are not hardware exposure timestamps.
+
 Run `python -m gear_sonic.camera.composed_camera --help` for all options including `--fps`, `--use-mjpeg`, and `--mjpeg-quality`.
 
 **Manual systemd setup:**
@@ -155,7 +201,7 @@ Pass `--camera-host <THOR_IP>` only when a client runs on another computer.
 ### Frame Rates
 
 - Existing 30 FPS cameras publish only new frames. The 50 Hz exporter reuses its cached latest image when no new image arrived.
-- ZED captures and publishes at 60 FPS. The exporter samples the latest message at 50 Hz; ZMQ discards superseded messages rather than interpolating frames.
+- ZED and configured JR USB wrists capture and publish at 60 FPS. The exporter receiver selects each stream independently at 50 Hz, discarding excess queued captures without interpolating images.
 - The dataset timeline is controlled by `--data-collection-frequency` (50 Hz by default).
 
 The tmux launcher accepts the same host setting:
