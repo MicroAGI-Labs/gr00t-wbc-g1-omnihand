@@ -23,7 +23,7 @@ from dataclasses import dataclass
 import queue
 import threading
 import time
-from typing import Any
+from typing import Any, Literal
 
 import cv2  # noqa: F401 — imported early to avoid TSL segfault with camera SDKs
 import numpy as np
@@ -35,6 +35,11 @@ from gear_sonic.camera.sensor_server import (
     SensorClient,
     SensorServer,
 )
+
+THOR_JR_WRIST_DEVICE_IDS = {
+    "left_wrist": "/dev/v4l/by-id/usb-JR0001_JR0001_JR0001-video-index0",
+    "right_wrist": "/dev/v4l/by-id/usb-JR0002_JR0002_JR0002-video-index0",
+}
 
 
 def read_qr_code(data):
@@ -65,6 +70,9 @@ class ComposedCameraConfig:
     head_device_id: str | None = None
     """Device ID for head camera."""
 
+    wrist_camera_profile: Literal["custom", "thor-jr"] = "custom"
+    """Optional robot profile for the fixed JR wrist-camera pair."""
+
     left_wrist_camera: str | None = None
     """Camera type for left wrist view."""
 
@@ -85,6 +93,15 @@ class ComposedCameraConfig:
 
     zed_camera_fps: int = 60
     """ZED hardware capture rate. HD720 supports 60 FPS."""
+
+    usb_camera_fps: int = 30
+    """USB capture rate; the Thor JR profile uses 60 FPS."""
+
+    usb_camera_resolution: tuple[int, int] = (640, 480)
+    """USB capture resolution; frames are published at 640x480."""
+
+    usb_camera_mjpeg: bool = False
+    """Request MJPEG transport from UVC cameras."""
 
     run_as_server: bool = True
     """Run as ZMQ PUB server (set False for in-process usage)."""
@@ -109,6 +126,17 @@ class ComposedCameraConfig:
 
     def __post_init__(self):
         self.run_as_server = self.server
+        if self.wrist_camera_profile == "thor-jr":
+            for mount, device_id in THOR_JR_WRIST_DEVICE_IDS.items():
+                camera_type = getattr(self, f"{mount}_camera")
+                configured_id = getattr(self, f"{mount}_device_id")
+                if camera_type not in (None, "usb") or configured_id not in (None, device_id):
+                    raise ValueError(f"thor-jr fixes {mount} to USB device {device_id}; use custom to override")
+                setattr(self, f"{mount}_camera", "usb")
+                setattr(self, f"{mount}_device_id", device_id)
+            self.usb_camera_fps = self.fps = 60
+            self.usb_camera_resolution = (1280, 720)
+            self.usb_camera_mjpeg = True
 
 
 class ComposedCameraSensor(Sensor, SensorServer):
@@ -411,8 +439,12 @@ class ComposedCameraSensor(Sensor, SensorServer):
         elif camera_type == "usb":
             from gear_sonic.camera.drivers.usb_camera import USBCameraConfig, USBCameraSensor
 
-            usb_config = USBCameraConfig()
-            device_idx = int(device_id) if device_id else 0
+            usb_config = USBCameraConfig(
+                fps=self.config.usb_camera_fps,
+                capture_dim=self.config.usb_camera_resolution,
+                mjpeg=self.config.usb_camera_mjpeg,
+            )
+            device_idx = int(device_id) if device_id and device_id.isdecimal() else (device_id or 0)
             print(f"Initializing USB camera for type: {camera_type}, device: {device_idx}")
             return USBCameraSensor(
                 config=usb_config, mount_position=mount_position, device_index=device_idx
