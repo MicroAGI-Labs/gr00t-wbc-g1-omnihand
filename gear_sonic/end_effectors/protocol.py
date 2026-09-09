@@ -59,6 +59,8 @@ def decode_intent(raw: bytes) -> dict[str, Any]:
             raise HandProtocolError(f"{field} must be an integer")
     if payload.get("source") != "pico":
         raise HandProtocolError("hand intent source must be 'pico'")
+    if not isinstance(payload.get("hold", False), bool):
+        raise HandProtocolError("hold must be a boolean")
     for side in ("left", "right"):
         value = payload.get(side)
         if not isinstance(value, dict):

@@ -88,6 +88,8 @@ def test_protocol_rejects_unknown_schema_and_bad_trigger():
     bad_trigger["left"]["trigger"] = 1.1
     with pytest.raises(HandProtocolError):
         decode_intent(encode(HAND_INTENT_TOPIC, bad_trigger))
+    with pytest.raises(HandProtocolError, match="hold"):
+        decode_intent(encode(HAND_INTENT_TOPIC, dict(bad_trigger, hold=1)))
 
 
 def test_trigger_hysteresis_retains_state_and_ignores_invalid_input():
@@ -192,6 +194,33 @@ def test_controller_rejects_replayed_sequence_and_watchdog_holds():
     np.testing.assert_array_equal(controller.applied["left"], before)
     assert state["mode"] == "hold"
     assert state["input_stale"] is True
+
+
+def test_explicit_hold_reads_current_positions_once_and_requires_valid_resume():
+    devices = {side: SimHandBackend(OMNIHAND_O10.side(side)) for side in ("left", "right")}
+    controller = SafeHandController(OMNIHAND_O10, devices, backend_name="sim", clock=lambda: 0)
+    controller.accept_intent(_intent(1, left_closed=True, right_closed=True), now=0)
+    controller.step(now=0.1)
+    measured = {side: OMNIHAND_O10.side(side).target(True, 0.1) for side in devices}
+    for side, device in devices.items():
+        device._positions = measured[side].copy()  # Feedback moved since the last controller read.
+    hold = dict(_intent(2, left_closed=True, right_closed=True, valid=False), hold=True)
+    assert controller.accept_intent(hold, now=0.2)
+    counts = {side: len(device.commands) for side, device in devices.items()}
+    for side, device in devices.items():
+        np.testing.assert_array_equal(device.commands[-1], measured[side])
+    controller.accept_intent(dict(hold, sequence=3), now=0.3)
+    assert not controller.accept_intent(_intent(4, left_closed=True, right_closed=True, valid=False), now=0.4)
+    state = controller.step(now=0.6)
+    assert state["mode"] == "hold" and state["input_stale"]
+    assert counts == {side: len(device.commands) for side, device in devices.items()}
+    resume = _intent(5, left_closed=True, right_closed=True)
+    resume["right"]["valid"] = False
+    assert controller.accept_intent(resume, now=0.7)
+    state = controller.step(now=0.7)
+    assert state["mode"] == "tracking"
+    assert not np.array_equal(state["sides"]["left"]["applied_position_rad"], measured["left"])
+    np.testing.assert_array_equal(state["sides"]["right"]["applied_position_rad"], measured["right"])
 
 
 def test_startup_feedback_far_outside_limits_fails_closed():

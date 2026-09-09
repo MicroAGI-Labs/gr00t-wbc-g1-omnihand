@@ -95,6 +95,7 @@ class SafeHandController:
         self.last_valid_intent_at: dict[str, float | None] = {side: None for side in self.devices}
         self.last_step_at = clock()
         self.mode = "hold"
+        self.explicit_hold = False
         self.requested: dict[str, np.ndarray] = {}
         self.applied: dict[str, np.ndarray] = {}
         self.velocity_scale: dict[str, float] = {}
@@ -141,6 +142,10 @@ class SafeHandController:
             return False
         if self.fault_latched:
             return False
+        hold = payload.get("hold", False)
+        if hold and not self.explicit_hold:
+            # Reuse the bilateral feedback/health admission and measured hold.
+            self._connect_hold()
         accepted = False
         received_at = self.clock() if now is None else now
         for side in self.devices:
@@ -148,7 +153,7 @@ class SafeHandController:
             if not side_intent["valid"]:
                 continue
             side_profile = self.profile.side(side)
-            target = side_profile.target(bool(side_intent["closed"]), self.close_scale)
+            target = self.requested[side] if hold else side_profile.target(side_intent["closed"], self.close_scale)
             if not np.array_equal(target, self.requested[side]):
                 self.requested[side] = target
                 if self.transition_duration_s is not None:
@@ -161,8 +166,10 @@ class SafeHandController:
         self.last_intent_sequence = sequence
         if accepted:
             self.last_intent_at = received_at
-            self.mode = "tracking"
-        return accepted
+        if accepted or hold:
+            self.explicit_hold = hold
+            self.mode = "hold" if hold else "tracking"
+        return accepted or hold
 
     def step(self, *, now: float | None = None) -> dict[str, Any]:
         checked_at = self.clock() if now is None else now

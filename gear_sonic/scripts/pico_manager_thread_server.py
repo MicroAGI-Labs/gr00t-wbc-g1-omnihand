@@ -52,6 +52,11 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_rotation_matrix,
 )
 from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.teleop.pose_transition import (
+    IDLE_BASE_UPPER_BODY_MASK,
+    IDLE_BASE_UPPER_BODY_RAD,
+    JointPoseTransition,
+)
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
 try:
@@ -202,7 +207,7 @@ class HandIntentStream:
         self.last_source_timestamp_ns: int | None = None
         self.hysteresis = TriggerHysteresis()
 
-    def publish(self, socket, reader) -> None:
+    def publish(self, socket, reader, *, hold: bool = False) -> None:
         _, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(reader)
         try:
             source_timestamp_ns = int(reader.get_timestamp_ns())
@@ -228,6 +233,7 @@ class HandIntentStream:
                     "sequence": self.sequence,
                     "monotonic_ns": time.monotonic_ns(),
                     "source": "pico",
+                    "hold": hold,
                     "left": {
                         "valid": valid,
                         "closed": left_closed,
@@ -1893,6 +1899,7 @@ class FeedbackReader:
         self.upper_body_joint_indices = self._get_upper_body_joint_indices()
 
         self.upper_body_position_target = None
+        self.upper_body_planner_target = None
         self.left_hand_position_target = None
         self.right_hand_position_target = None
         # Full body joint configuration (29 DOFs) as measured from robot,
@@ -1937,6 +1944,15 @@ class FeedbackReader:
             print(f"[PlannerLoop] Invalid body feedback: {exc}")
             return None, None, None, None
         body_q = full_body_q[self.upper_body_joint_indices]
+        # Planner motion before arm overrides, in the same hardware joint order.
+        try:
+            planner_q = np.asarray(unpacked.get("body_q_target"), dtype=np.float64)
+            self.upper_body_planner_target = (
+                planner_q[self.upper_body_joint_indices]
+                if planner_q.shape == (29,) and np.all(np.isfinite(planner_q)) else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.upper_body_planner_target = None
 
         if "left_hand_q_measured" in unpacked:
             left_hand_q = unpacked["left_hand_q_measured"]
@@ -1991,31 +2007,36 @@ class PlannerStreamer:
         """Poll feedback and save upper body position target."""
         self.feedback_reader.poll_feedback()
 
-    def recalibrate_for_vr3pt(self) -> bool:
-        """
-        Recalibrate VR 3-point pose tracking using the robot's current measured joints.
-
-        Discard any queued g1_debug packet, then wait at most 100 ms for a new,
-        complete sample. A failed attempt leaves the current held targets intact.
-        """
+    def poll_fresh_feedback(self, *, require_planner_target: bool = False) -> bool:
+        """Discard queued feedback and require a new complete sample within 100 ms."""
         self.feedback_reader.poller.get_data()
         deadline = time.monotonic() + 0.1
         while time.monotonic() < deadline:
             if self.feedback_reader.poll_feedback(retain_last=True):
-                self.three_point.reset_with_measured_q(self.feedback_reader.full_body_q_measured)
-                print("[PlannerLoop] VR 3PT recalibration scheduled with measured robot pose")
-                return True
+                if not require_planner_target or self.feedback_reader.upper_body_planner_target is not None:
+                    return True
             time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
-        print("[PlannerLoop] Cannot enter VR 3PT without new valid robot feedback; retry when available")
+        print("[PlannerLoop] New valid robot feedback unavailable; keep current mode and retry")
         return False
 
-    def run_once(self, stream_mode: StreamMode, *, face_command: str | None = None):
+    def recalibrate_for_vr3pt(self) -> bool:
+        """Align VR3PT with new measured joints; keep held targets on failure."""
+        if not self.poll_fresh_feedback():
+            return False
+        self.three_point.reset_with_measured_q(self.feedback_reader.full_body_q_measured)
+        return True
+
+    def run_once(
+        self, stream_mode: StreamMode, *, face_command: str | None = None,
+        upper_body_override: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> bool:
         """Execute one iteration of the planner control loop."""
         try:
             # Avoid sending old commands if XRT timestamp hasn't advanced, in case of headset disconnect
             xrt_timestamp = self.reader.get_timestamp_ns()
             if xrt_timestamp == self.last_xrt_timestamp:
-                return
+                time.sleep(self.dt)
+                return False
             self.last_xrt_timestamp = xrt_timestamp
 
             # Face chords are disambiguated by the manager and confirmed on
@@ -2031,7 +2052,7 @@ class PlannerStreamer:
             lx, ly, rx, ry = get_controller_axes(self.reader)
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
-            facing = self.yaw_accumulator.update(rx, self.dt)
+            facing = self.yaw_accumulator.update(0.0 if upper_body_override is not None else rx, self.dt)
 
             raw_mag = np.hypot(lx, ly)
             raw_mag = np.clip(raw_mag, 0.0, 1.0)
@@ -2068,6 +2089,15 @@ class PlannerStreamer:
             right_hand_position = None
             if stream_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 upper_body_position = self.feedback_reader.upper_body_position_target
+                left_hand_position = self.feedback_reader.left_hand_position_target
+                right_hand_position = self.feedback_reader.right_hand_position_target
+
+            upper_body_velocity = None
+            upper_body_mask = None
+            if upper_body_override is not None:
+                upper_body_position, upper_body_velocity = upper_body_override
+                upper_body_mask = IDLE_BASE_UPPER_BODY_MASK
+                mode_to_send, movement, speed = LocomotionMode.IDLE, [0.0, 0.0, 0.0], -1.0
                 left_hand_position = self.feedback_reader.left_hand_position_target
                 right_hand_position = self.feedback_reader.right_hand_position_target
 
@@ -2109,6 +2139,8 @@ class PlannerStreamer:
                 speed=speed,
                 height=-1.0,
                 upper_body_position=upper_body_position,
+                upper_body_velocity=upper_body_velocity,
+                upper_body_mask=upper_body_mask,
                 left_hand_position=left_hand_position,
                 right_hand_position=right_hand_position,
                 vr_3pt_position=vr_3pt_position,
@@ -2129,6 +2161,7 @@ class PlannerStreamer:
         if sleep_t > 0:
             time.sleep(sleep_t)
         self.last_send = time.time()
+        return True
 
 
 def run_pico_manager(
@@ -2148,6 +2181,8 @@ def run_pico_manager(
     input_source: str = "xrt",
     recording_status_host: str = "localhost",
     recording_status_port: int = 5581,
+    teleop_mode: str = "pose",
+    idle_base_transition_duration: float = 2.0,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2158,6 +2193,10 @@ def run_pico_manager(
       X+B: Start/stop-success recording
       Y+A: Discard active recording
     """
+    if teleop_mode not in {"pose", "vr3pt"}:
+        raise ValueError("teleop_mode must be pose or vr3pt")
+    if not np.isfinite(idle_base_transition_duration) or idle_base_transition_duration <= 0:
+        raise ValueError("idle_base_transition_duration must be positive and finite")
     reader = _init_input_source(input_source, buffer_size)
 
     context = zmq.Context()
@@ -2203,7 +2242,7 @@ def run_pico_manager(
         socket=socket,
         reader=reader,
         three_point=three_point,
-        poll_hz=20,
+        poll_hz=target_fps,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
     )
@@ -2229,10 +2268,15 @@ def run_pico_manager(
         "B+Y=frozen upper body, X+B=record/save, Y+A=discard, "
         "A+B+X+Y=start/stop policy"
     )
+    if teleop_mode == "vr3pt":
+        print("VR3PT: two A+X gestures advance IDLE -> arm alignment -> VR3PT; B+Y steps back")
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
+    upper_body_transition = None
+    transition_destination = None
+    transition_last_sample_at = None
     recorder_is_recording = False
     recorder_command_timestamp = 0.0
     face_chords = FaceChordTracker()
@@ -2248,6 +2292,8 @@ def run_pico_manager(
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
                 current_mode = StreamMode.OFF
+                upper_body_transition = None
+                transition_destination = None
 
                 # Repeat the stop message because PUB/SUB delivery is best-effort.
                 for _ in range(3):
@@ -2264,6 +2310,7 @@ def run_pico_manager(
                             topic="manager_state",
                         )
                     )
+                    hand_intent.publish(socket, reader, hold=True)
                     time.sleep(0.05)
 
                 if isinstance(reader, PicoReader):
@@ -2331,7 +2378,28 @@ def run_pico_manager(
             by_pressed = face_command == "by"
 
             new_mode = current_mode
-            if current_mode == StreamMode.OFF:
+            requested_transition = None
+            if start_combo and not prev_start_combo and current_mode != StreamMode.OFF:
+                # Stop always wins, including during interpolation or recording.
+                new_mode = StreamMode.OFF
+                upper_body_transition = None
+                transition_destination = None
+            elif upper_body_transition is not None:
+                pass
+            elif teleop_mode == "vr3pt" and current_mode != StreamMode.OFF:
+                # Mode 3 is an arm alignment pose in this opt-in path. The default
+                # POSE path retains its existing frozen-upper-body behavior.
+                if not recorder_is_recording:
+                    if current_mode == StreamMode.PLANNER and ax_pressed:
+                        requested_transition = StreamMode.PLANNER_FROZEN_UPPER_BODY
+                    elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+                        if ax_pressed:
+                            new_mode = StreamMode.PLANNER_VR_3PT
+                        elif by_pressed:
+                            requested_transition = StreamMode.PLANNER
+                    elif current_mode == StreamMode.PLANNER_VR_3PT and by_pressed:
+                        requested_transition = StreamMode.PLANNER_FROZEN_UPPER_BODY
+            elif current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.PLANNER
                     # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
@@ -2389,6 +2457,19 @@ def run_pico_manager(
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
 
+            if requested_transition is not None:
+                returning_to_planner = requested_transition == StreamMode.PLANNER
+                if planner_streamer.poll_fresh_feedback(require_planner_target=returning_to_planner):
+                    feedback = planner_streamer.feedback_reader
+                    upper_body_transition = JointPoseTransition(
+                        feedback.upper_body_position_target,
+                        feedback.upper_body_planner_target if returning_to_planner else IDLE_BASE_UPPER_BODY_RAD,
+                        started_at=time.monotonic(), duration_s=idle_base_transition_duration,
+                    )
+                    transition_destination = requested_transition
+                    transition_last_sample_at = upper_body_transition.started_at
+                    ax_first_release_at = None
+
             # Handle mode transitions before running loop
             if new_mode != current_mode:
                 ax_first_release_at = None
@@ -2419,7 +2500,30 @@ def run_pico_manager(
                         new_mode = current_mode
 
             # Run one iteration of the new mode
-            if new_mode == StreamMode.POSE:
+            transition_was_active = upper_body_transition is not None
+            if upper_body_transition is not None:
+                sampled_at = time.monotonic()
+                sample = upper_body_transition.sample(sampled_at)
+                sent = planner_streamer.run_once(
+                    StreamMode.PLANNER, upper_body_override=(sample.position, sample.velocity),
+                )
+                if sent:
+                    # Advertise the completed mode only after its final target.
+                    if sample.complete:
+                        new_mode = transition_destination
+                        upper_body_transition = None
+                        transition_destination = None
+                else:
+                    # A repeated headset frame must not consume interpolation
+                    # time and cause a jump when fresh input resumes.
+                    upper_body_transition.started_at += sampled_at - transition_last_sample_at
+                transition_last_sample_at = sampled_at
+            elif teleop_mode == "vr3pt" and new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+                planner_streamer.run_once(
+                    StreamMode.PLANNER,
+                    upper_body_override=(IDLE_BASE_UPPER_BODY_RAD, np.zeros(17)),
+                )
+            elif new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
             elif (
                 new_mode == StreamMode.PLANNER
@@ -2449,6 +2553,9 @@ def run_pico_manager(
 
             # Mode-independent: send manager_state for data exporter
             toggle_dc = face_command == "xb" or save_recording
+            if toggle_dc and not recorder_is_recording and transition_was_active:
+                toggle_dc = False
+                print("[Manager] Finish arm alignment before starting a recording")
             toggle_da = face_command == "ya"
             if toggle_dc:
                 recorder_is_recording = not recorder_is_recording
@@ -2476,7 +2583,13 @@ def run_pico_manager(
             # a conflating subscriber, so publishing hand intent last prevents
             # unrelated manager/pose messages from starving its filtered topic.
             # Stalled headset timestamps remain invalid rather than implying open.
-            hand_intent.publish(socket, reader)
+            hand_intent.publish(
+                socket, reader, hold=(
+                    current_mode in {StreamMode.OFF, StreamMode.POSE_PAUSE}
+                    or transition_was_active
+                    or (teleop_mode == "vr3pt" and current_mode != StreamMode.PLANNER_VR_3PT)
+                ),
+            )
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
@@ -2610,6 +2723,9 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument("--teleop-mode", choices=["pose", "vr3pt"], default="pose",
+                        help="vr3pt uses staged arm alignment before learned VR3PT teleop")
+    parser.add_argument("--idle-base-transition-duration", type=float, default=2.0)
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2653,6 +2769,8 @@ if __name__ == "__main__":
             input_source=args.input_source,
             recording_status_host=args.recording_status_host,
             recording_status_port=args.recording_status_port,
+            teleop_mode=args.teleop_mode,
+            idle_base_transition_duration=args.idle_base_transition_duration,
         )
     else:
         # Run legacy single-thread pose streaming
