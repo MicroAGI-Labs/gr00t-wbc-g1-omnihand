@@ -47,7 +47,7 @@ packages extracted locally; it does not install a system service. On x86-64,
 
 The default stays **all on Thor**: `bash tools/teleop_dex1.sh` starts the local
 hand supervisor and uses the grippers connected to Thor. The same checkout can
-instead use a standalone hand service on Orin. Body control, headset input,
+instead launch the hand service on Orin over SSH. Body control, headset input,
 cameras, dashboard, and recording remain on Thor.
 
 | Connection | Publisher / listener | Subscriber / client |
@@ -61,7 +61,8 @@ address on that network with `ip route get 192.168.123.164` (the `src` address).
 The hand server runs 200 Hz motor loops locally and publishes state at 50 Hz.
 Only intent, status, and reconnect messages cross the network.
 
-On Orin, with this branch checked out:
+One-time setup on Orin: check out this branch at
+`/home/unitree/gr00t-wbc-g1-omnihand` (or pass `--hand-server-repo` on Thor):
 
 ```bash
 # Installs a separate .venv_hands and builds the pinned native worker.
@@ -81,7 +82,21 @@ NumPy 1.26.4, pyzmq 27.2.0, and msgpack 1.2.2. `DEX1_SDK_SOURCE` can point to a
 local git repository or bundle containing the pinned SDK commit for an offline
 native build.
 
-After moving the two gripper USB adapters to Orin, start the hand service there:
+After moving the two gripper USB adapters to Orin, launch everything from Thor:
+
+```bash
+bash tools/teleop_dex1.sh --hand-server-host 192.168.123.164
+```
+
+The normal hand pane runs SSH and displays the Orin logs. SSH uses the current
+user and normal SSH configuration; enter its password in that pane if prompted,
+or use an existing SSH key. Thor's address is derived from the SSH connection.
+Ports and `--dex1-transition-duration` are passed through automatically.
+Detaching tmux leaves the stack running; closing the hand pane or killing the
+dashboard closes SSH and stops the remote hand worker. On a network outage,
+the existing input watchdog holds the hands while SSH detects disconnection.
+
+For a separately managed service, start it on Orin with:
 
 ```bash
 .venv_hands/bin/python -m gear_sonic.end_effectors.server \
@@ -92,23 +107,22 @@ The existing `/dev/serial/by-id` assignments below preserve the physical sides.
 The Orin user needs read/write access to those serial devices. Start only one
 hand controller for the pair. The service owns its native workers and retains
 the measured startup holds, watchdogs, torque caps, and explicit fault recovery.
-Use `--dex1-transition-duration` on this server to configure its stroke timing;
-the launcher's duration option controls only locally launched hands.
+For a separately managed service, configure stroke timing on that service.
 
-Then on Thor:
+To reuse that already-running service, on Thor:
 
 ```bash
-bash tools/teleop_dex1.sh --hand-server-host 192.168.123.164
+bash tools/teleop_dex1.sh --hand-server-host 192.168.123.164 --no-start-hand-server
 # Optional wrist recording remains independent:
-bash tools/teleop_dex1.sh --hand-server-host 192.168.123.164 --record-wrist-cameras
+bash tools/teleop_dex1.sh --hand-server-host 192.168.123.164 --no-start-hand-server --record-wrist-cameras
 ```
 
-`--hand-server-host` connects to an **existing** service; it does not SSH, deploy,
-or start a second hand controller. Local hand USB/worker checks and the local
-hands pane are omitted. The recorder and browser use the specified hand-state
-host, and the existing Reconnect hands button reaches the Orin supervisor.
-`--check-only` on the Thor launcher validates Thor's launch prerequisites; the
-Orin command above checks the hand installation itself.
+`--no-start-hand-server` skips SSH and the hands pane. Both remote modes omit
+local hand USB/worker checks, route the recorder and browser to the specified
+host, and retain the Reconnect hands button. Thor's `--check-only` prints the
+launch command without opening SSH or starting any services; use the Orin
+check above to validate its installation. Launching does not install or update
+the remote checkout.
 
 For startup at boot, edit the checkout paths and `THOR_IP` in
 `systemd/dex1_hand_server.service`, then install it on Orin:
@@ -120,11 +134,12 @@ sudo systemctl enable --now dex1_hand_server.service
 journalctl -u dex1_hand_server.service -f
 ```
 
-Stop a manually launched server before enabling the service. The installer does
+Stop a manually or SSH-launched server before enabling the service. When using
+the boot service, always pass `--no-start-hand-server` on Thor. The installer does
 not enable it automatically. To return to all-on-Thor operation, stop the Orin
 service, reconnect the USB adapters to Thor, and omit `--hand-server-host`.
 A standalone server can also run on Thor with `--teleop-host 127.0.0.1`; pass
-`--hand-server-host 127.0.0.1` to reuse it rather than starting another worker.
+`--hand-server-host 127.0.0.1 --no-start-hand-server` to reuse it.
 
 Input and feedback watchdogs use local monotonic receipt times and the hand
 server's locally computed state age. They do not subtract Orin timestamps from

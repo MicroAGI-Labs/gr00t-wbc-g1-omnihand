@@ -25,10 +25,12 @@ def mock_launcher(monkeypatch):
     return commands
 
 
-@pytest.mark.parametrize("host", [None, "192.168.123.164"])
-def test_full_launcher_routes_hands_without_changing_body_or_camera(monkeypatch, host):
+@pytest.mark.parametrize("host,start", [(None, True), ("192.168.123.164", True), ("orin", False)])
+def test_full_launcher_routes_hands_without_changing_body_or_camera(monkeypatch, host, start):
     commands = mock_launcher(monkeypatch)
-    config = launcher.DataCollectionLaunchConfig(hand_backend="dex1", remote_ui=True, hand_server_host=host)
+    config = launcher.DataCollectionLaunchConfig(
+        hand_backend="dex1", remote_ui=True, hand_server_host=host, start_hand_server=start
+    )
     launcher.main(config)
     assert "--hand-control external" in commands[0]
     assert "--hand-intent-port 5569" in commands[1]
@@ -37,10 +39,13 @@ def test_full_launcher_routes_hands_without_changing_body_or_camera(monkeypatch,
         assert argv[argv.index("--hand-state-host") + 1] == (host or "localhost")
         assert argv[argv.index("--camera-host") + 1] == "localhost"
     assert "--enable-hand-controls" in commands[3]
-    if host:
+    if host and not start:
         assert len(commands) == 5
         assert commands[4].startswith("journalctl")
         assert not any("end_effectors.supervisor" in cmd for cmd in commands.values())
+    elif host:
+        assert shlex.split(commands[4])[:2] == ["ssh", "-tt"]
+        assert commands[5].startswith("journalctl")
     else:
         assert "end_effectors.supervisor" in commands[4]
         assert "tcp://localhost:5569" in commands[4]
@@ -67,10 +72,32 @@ def test_remote_check_only_never_prints_or_starts_a_local_worker(monkeypatch, ca
         launcher.DataCollectionLaunchConfig(
             hand_backend="dex1",
             hand_server_host="orin",
+            start_hand_server=False,
             check_only=True,
         )
     )
     assert "Using existing hand server at orin:5570" in capsys.readouterr().out
+
+
+def test_remote_command_quotes_checkout_and_forwards_configuration(monkeypatch, capsys):
+    config = launcher.DataCollectionLaunchConfig(
+        hand_backend="dex1", hand_server_host="orin", hand_server_repo="/tmp/a b'$(false)",
+        hand_intent_port=6001, hand_state_port=6002, hand_control_port=6003,
+        dex1_transition_duration=2.0, check_only=True,
+    )
+    monkeypatch.setattr(launcher, "_check_prerequisites", lambda config: None)
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **kw: pytest.fail("check-only started SSH"))
+    launcher.main(config)
+    command = capsys.readouterr().out.splitlines()[-1]
+    ssh = shlex.split(command)
+    assert ssh[-2] == "orin"
+    remote = shlex.split(ssh[-1])
+    assert remote[1] == config.hand_server_repo
+    assert remote[remote.index("--teleop-host") + 1] == "${SSH_CONNECTION%% *}"
+    assert remote[remote.index("--intent-port") + 1] == "6001"
+    assert remote[remote.index("--state-port") + 1] == "6002"
+    assert remote[remote.index("--control-port") + 1] == "6003"
+    assert remote[remote.index("--dex1-transition-duration") + 1] == "2.0"
 
 
 @pytest.mark.parametrize(

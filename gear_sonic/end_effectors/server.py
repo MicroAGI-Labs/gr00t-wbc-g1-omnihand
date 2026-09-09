@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import subprocess
 import sys
 
@@ -81,7 +82,16 @@ def main(argv: list[str] | None = None) -> int:
     print(shlex.join(command), flush=True)
     if args.check_only:
         return subprocess.run([str(args.dex1_worker), "--self-test"], check=False).returncode
-    return HandWorkerSupervisor(command, control_endpoint=control_endpoint).run()
+    # SSH terminal closure and systemd stop must run supervisor cleanup.
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGHUP, signal.SIGTERM)}
+    try:
+        return HandWorkerSupervisor(command, control_endpoint=control_endpoint).run()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 if __name__ == "__main__":
