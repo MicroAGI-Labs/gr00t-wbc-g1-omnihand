@@ -192,7 +192,7 @@ class DataCollectionLaunchConfig:
     pico_waist_tracking: bool = False
     """Enable waist tracking on the teleop streamer."""
 
-    idle_base_transition_duration: float = 2.0
+    idle_base_transition_duration: float = 5.0
     """Seconds for smooth arm motion into and out of the teleop alignment pose."""
 
     # Data exporter options

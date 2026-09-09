@@ -295,10 +295,61 @@ Active in **PLANNER**, **PLANNER_FROZEN_UPPER**, and **VR_3PT**:
 | **Keyboard** (C++ terminal) | Press **`O`** for immediate stop |
 | **Process control** | Terminate the SONIC control process |
 
-Loss of PICO body tracking suspends teleop input and returns the Python manager
-to **OFF**, but it does not terminate the SONIC deployment. SONIC remains active
-and the planner falls back to idle when its input times out. After tracking
-reconnects, use **A+B+X+Y** to recalibrate and re-enable teleop input.
+Loss of PICO body tracking during VR teleop holds the last commanded wrist
+and head targets and stops locomotion when SONIC's one-second input watchdog
+expires. The robot says **"Pico connection lost. Holding position."** once.
+After **15 seconds of holding**, SONIC returns the arms smoothly over **at least
+five seconds** to the arms-on-legs planner resting pose, keeping the head target unchanged.
+This is the final idle endpoint reached by **B+Y**, then **B+Y** again from
+teleop; it is distinct from the intermediate calibration base pose.
+Longer returns take additional time to respect the configured motion limits.
+It announces the return and continues holding the resting endpoint throughout
+the outage. The timer and return run in SONIC, even if the Python Pico manager
+is killed. The manager caches the planner resting wrists before calibration
+and refreshes them on a manual return to planner idle. It supplies this endpoint
+to SONIC in advance; if none was received, SONIC retains the original hold.
+Reconnecting does not resume movement: use
+**A+X twice** to recalibrate and resume teleop, or **B+Y** for a smooth return to
+planner idle. This requires rebuilding the C++ deployment as well as restarting
+the Python manager after updating. Legacy full-body POSE reconnect still returns
+the manager to OFF and requires **A+B+X+Y** to start.
+
+### Responsive 3PT smoothing
+
+VR 3PT conditions the calibrated left wrist, right wrist, and head targets before
+sending them to SONIC. Defaults are **0.15 m/s** translation speed, **0.6 m/s²**
+translation acceleration, **90°/s** angular speed, and **360°/s²** angular
+acceleration. These are vector limits per target, including diagonal motion.
+An adaptive low-pass filter smooths quiet tracking at 8 Hz and opens up to
+32 Hz during faster movement. Normal movements follow the latest target;
+abrupt starts and reversals ramp within the acceleration limits.
+Moving faster than these limits no longer freezes teleop or requires re-anchoring.
+The robot keeps following the latest target at the limited speed. Its immediate
+pursuit goal stays within 25 cm / 60°; reversing replaces the old goal immediately,
+with acceleration-limited braking. Holding your hands still lets the robot catch up.
+
+An isolated tracking jump is discarded while the target brakes. Three consecutive
+jumps latch a hold. Jump thresholds are the larger of 10 cm / 30° or three times
+the configured speed times the sample interval. An invalid pose or a control
+gap longer than 100 ms also causes braking
+to a hold and forces locomotion idle. The manager logs the reason. It does not
+replay accumulated motion: once stopped, use **A+X twice** to re-anchor and resume,
+or **B+Y** to request the normal return.
+
+Override the defaults with Pico manager arguments:
+
+```bash
+--vr-max-speed 0.15 --vr-max-acceleration 0.6 \
+--vr-max-angular-speed-deg 90 --vr-max-angular-acceleration-deg 360
+```
+
+Generated VR returns use the same limits. SONIC caches these limits for its
+autonomous disconnect return, including when the manager is killed. Automatic
+returns take at least five seconds; manual transitions also default to five
+seconds through `--idle-base-transition-duration`. These limits
+bound the 3PT reference sent to the policy; they do not impose arm joint torque
+limits or guarantee the same bounds on physical robot motion. Hardware tuning
+is still required.
 
 ---
 

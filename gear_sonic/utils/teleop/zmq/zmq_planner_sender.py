@@ -76,6 +76,8 @@ def build_planner_message(
     vr_3pt_orientation: Sequence[float] | None = None,
     vr_3pt_compliance: Sequence[float] | None = None,
     publisher_monotonic_ns: int | None = None,
+    vr_base_pose: Sequence[float] | None = None,
+    vr_motion_limits: Sequence[float] | None = None,
 ) -> bytes:
     """
     Assemble a 'planner' topic message:
@@ -172,6 +174,18 @@ def build_planner_message(
     if publisher_monotonic_ns is not None:
         fields.append({"name": "publisher_monotonic_ns", "dtype": "i64", "shape": [1]})
         payload += struct.pack("<q", int(publisher_monotonic_ns))
+
+    if vr_base_pose is not None:
+        if len(vr_base_pose) != 14:
+            raise ValueError("VR base pose must contain two XYZ + wxyz wrist targets")
+        fields.append({"name": "vr_base_pose", "dtype": "f32", "shape": [14]})
+        payload += struct.pack("<14f", *vr_base_pose)
+
+    if vr_motion_limits is not None:
+        if len(vr_motion_limits) != 4:
+            raise ValueError("VR motion limits must contain speed/acceleration and angular speed/acceleration")
+        fields.append({"name": "vr_motion_limits", "dtype": "f32", "shape": [4]})
+        payload += struct.pack("<4f", *vr_motion_limits)
 
     header = _build_header(fields, version=1, count=1)
 

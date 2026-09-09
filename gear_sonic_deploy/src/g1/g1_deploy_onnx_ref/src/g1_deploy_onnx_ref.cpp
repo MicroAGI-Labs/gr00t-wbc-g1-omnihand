@@ -3026,6 +3026,11 @@ class G1Deploy {
       auto low_state_data = low_state_buffer_.GetDataWithTime();
       bool low_state_late = (std::chrono::steady_clock::now() - low_state_data.timestamp) > LOW_STATE_LATE_THRESHOLD;
 
+      auto input_announcement = input_interface_->TakeStatusAnnouncement();
+      if (!input_announcement.empty()) {
+        if (!pending_tts_.empty()) pending_tts_ += ". ";
+        pending_tts_ += input_announcement;
+      }
       audio_thread_->SetCommand(
         AudioCommand{
           .streaming_data_absent = streaming_data_absent_debouncer_.state(),

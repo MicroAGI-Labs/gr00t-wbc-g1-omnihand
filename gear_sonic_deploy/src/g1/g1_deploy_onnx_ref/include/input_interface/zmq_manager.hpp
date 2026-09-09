@@ -27,8 +27,9 @@
  *
  * If no planner message arrives within 1 second (PLANNER_TIMEOUT), the manager
  * automatically resets locomotion to IDLE and holds the most recent arm target.
- * The hold remains latched until an explicit upper-body target arrives, so a
- * reconnect cannot hand the arms abruptly back to the planner's idle pose.
+ * After 15 seconds of holding, VR wrists return smoothly to the cached base
+ * pose over two seconds. This runs without the Python manager. Without a valid
+ * cached base target, the original hold is retained. Loss is announced once.
  *
  * ## Keyboard Shortcuts (via stdin)
  *
@@ -52,6 +53,9 @@
 #include <thread>
 #include <chrono>
 #include <mutex>
+#include <utility>
+#include <bit>
+#include <Eigen/Geometry>
 
 #include "input_interface.hpp"
 #include "input_command.hpp"
@@ -73,6 +77,7 @@
  * ZMQPackedMessageSubscriber instances for the command and planner topics.
  */
 class ZMQManager : public InputInterface {
+    friend class ZMQManagerTestPeer;
   public:
     static constexpr bool DEBUG_LOGGING = false;
 
@@ -260,6 +265,9 @@ class ZMQManager : public InputInterface {
                   if (latest_planner_message_.upper_body_position.has_value()) {
                     has_upper_body_control_ = true;
                     planner_timeout_hold_active_ = false;
+                  } else if (has_vr_3point_control_) {
+                    has_upper_body_control_ = false;
+                    planner_timeout_hold_active_ = false;
                   } else if (!planner_timeout_hold_active_) {
                     has_upper_body_control_ = false;
                   }
@@ -278,6 +286,7 @@ class ZMQManager : public InputInterface {
                 std::lock_guard<std::mutex> lock(planner_mutex_);
                 latest_planner_message_.valid = false;
                 latest_planner_message_.timestamp = {};
+                pico_lost_at_.reset();
                 is_planner_ready_ = false;
                 switch_from_teleop_to_planner_ = true;
               }
@@ -336,6 +345,7 @@ class ZMQManager : public InputInterface {
           std::lock_guard<std::mutex> lock(planner_mutex_);
           latest_planner_message_.valid = false;
           latest_planner_message_.timestamp = {};
+          pico_lost_at_.reset();
         }
         // Clear upper body control state
         has_upper_body_control_ = false;
@@ -360,6 +370,7 @@ class ZMQManager : public InputInterface {
           std::lock_guard<std::mutex> lock(planner_mutex_);
           latest_planner_message_.valid = false;
           latest_planner_message_.timestamp = {};
+          pico_lost_at_.reset();
         }
         // Clear upper body control state
         has_upper_body_control_ = false;
@@ -451,6 +462,11 @@ class ZMQManager : public InputInterface {
         return pose_interface_->GetLastUpdateTime();
       }
       return InputInterface::GetLastUpdateTime();
+    }
+
+    std::string TakeStatusAnnouncement() override {
+      std::lock_guard<std::mutex> lock(planner_mutex_);
+      return std::exchange(status_announcement_, {});
     }
 
   private:
@@ -594,10 +610,17 @@ class ZMQManager : public InputInterface {
         auto time_since_last_planner = std::chrono::steady_clock::now() - latest_planner_message_.timestamp;
         
         if (latest_planner_message_.valid) {
+          if (pico_lost_at_) {
+            status_announcement_ = "Pico connection restored. Arms held.";
+            pico_lost_at_.reset();
+          }
           // Valid planner message within timeout - use it
           // Update upper body control state based on this message
           if (latest_planner_message_.upper_body_position.has_value()) {
             has_upper_body_control_ = true;
+            planner_timeout_hold_active_ = false;
+          } else if (has_vr_3point_control_) {
+            has_upper_body_control_ = false;
             planner_timeout_hold_active_ = false;
           } else if (!planner_timeout_hold_active_) {
             has_upper_body_control_ = false;
@@ -664,6 +687,11 @@ class ZMQManager : public InputInterface {
         }
 
         if (planner_timed_out) {
+          pico_lost_at_ = std::chrono::steady_clock::now();
+          status_announcement_ = "Pico connection lost. Holding position.";
+          return_announced_ = false;
+          timeout_vr_position_ = GetVR3PointPosition().second;
+          timeout_vr_orientation_ = GetVR3PointOrientation().second;
           lock.unlock();
           const bool arms_held = latchPlannerTimeoutArmHold(
               current_motion, current_frame, current_motion_mutex);
@@ -674,6 +702,8 @@ class ZMQManager : public InputInterface {
                     << std::endl;
         }
       }
+
+      advancePicoDisconnectReturn(std::chrono::steady_clock::now());
 
       if (has_vr_3point_control_ && !last_has_vr_3point_control_) {
         std::cout << "[ZMQManager] VR 3-point control enabled" << std::endl;
@@ -1238,21 +1268,127 @@ class ZMQManager : public InputInterface {
         has_vr_3point_control_ = false;
       }
 
+      // Cache resting planner wrists before input can disappear. vr_base_pose
+      // is the legacy wire name; the publisher supplies the final idle pose.
+      // Reject malformed fallback data without replacing the previous target.
+      std::optional<std::array<double, 14>> base_pose;
+      std::optional<std::array<double, 4>> motion_limits;
+      for (size_t i = 0; i < hdr.fields.size(); ++i) {
+        const auto& field = hdr.fields[i];
+        const size_t count = field.name == "vr_base_pose" ? 14 : field.name == "vr_motion_limits" ? 4 : 0;
+        if (!count || field.shape != std::vector<size_t>{count}) continue;
+        const size_t width = field.dtype == "f32" ? 4 : field.dtype == "f64" ? 8 : 0;
+        if (!width || i >= bufs.size() || bufs[i].size != count * width) continue;
+        std::array<double, 14> candidate{};
+        bool valid = true;
+        for (size_t j = 0; j < count; ++j) {
+          const auto* data = static_cast<const uint8_t*>(bufs[i].data) + j * width;
+          if (width == 4) {
+            float value;
+            std::memcpy(&value, data, 4);
+            candidate[j] = needs_swap ? byte_swap(value) : value;
+          } else {
+            double value;
+            std::memcpy(&value, data, 8);
+            candidate[j] = needs_swap ? byte_swap(value) : value;
+          }
+          // Keep validation effective in the deployment's -ffast-math build.
+          valid &= (std::bit_cast<uint64_t>(candidate[j]) & 0x7ff0000000000000ULL) != 0x7ff0000000000000ULL;
+        }
+        if (count == 4) {
+          for (size_t j = 0; j < 4; ++j) valid &= candidate[j] > 0;
+          if (valid) motion_limits = {candidate[0], candidate[1], candidate[2], candidate[3]};
+          continue;
+        }
+        for (size_t offset : {size_t{3}, size_t{10}}) {
+          double norm = 0;
+          for (size_t j = 0; j < 4; ++j) norm += candidate[offset + j] * candidate[offset + j];
+          valid &= norm > 1e-12 && (std::bit_cast<uint64_t>(norm) & 0x7ff0000000000000ULL) != 0x7ff0000000000000ULL;
+          if (norm > 1e-12) {
+            for (size_t j = 0; j < 4; ++j) candidate[offset + j] /= std::sqrt(norm);
+          }
+        }
+        if (valid) base_pose = candidate;
+      }
+
       // Update buffer directly (no queue) and set timestamp
       std::lock_guard<std::mutex> lock(planner_mutex_);
+      if (base_pose) vr_base_pose_ = base_pose;
+      if (motion_limits) vr_return_limits_ = *motion_limits;
       latest_planner_message_ = msg;
       latest_planner_message_.timestamp = std::chrono::steady_clock::now();
     }
     
 
   private:
+    void advancePicoDisconnectReturn(std::chrono::steady_clock::time_point now) {
+      std::lock_guard<std::mutex> lock(planner_mutex_);
+      if (!pico_lost_at_ || !has_vr_3point_control_ || !vr_base_pose_) return;
+      const double elapsed = std::chrono::duration<double>(now - *pico_lost_at_).count();
+      if (elapsed <= 15.0) return;
+      if (!return_announced_) {
+        status_announcement_ = "Pico still disconnected. Returning arms to rest on legs.";
+        std::cout << "[ZMQManager] Pico lost for 15s; returning arms to resting pose" << std::endl;
+        return_announced_ = true;
+      }
+      // Quintic peak derivatives are 1.875 and 10/sqrt(3). Match the
+      // configured 3PT limits cached from the publisher, even after it exits.
+      double duration = 5.0;
+      for (size_t side = 0; side < 2; ++side) {
+        double distance_squared = 0;
+        for (size_t axis = 0; axis < 3; ++axis) {
+          double d = (*vr_base_pose_)[7 * side + axis] - timeout_vr_position_[3 * side + axis];
+          distance_squared += d * d;
+        }
+        const double distance = std::sqrt(distance_squared);
+        const size_t q = 4 * side, b = 7 * side + 3;
+        Eigen::Quaterniond start(timeout_vr_orientation_[q], timeout_vr_orientation_[q+1], timeout_vr_orientation_[q+2], timeout_vr_orientation_[q+3]);
+        Eigen::Quaterniond goal((*vr_base_pose_)[b], (*vr_base_pose_)[b+1], (*vr_base_pose_)[b+2], (*vr_base_pose_)[b+3]);
+        // Dot-product distance avoids Eigen's conjugate sign-mask path, which
+        // can lose a sign with this deployment's -ffast-math build.
+        const double angle = 2.0 * std::acos(std::clamp(std::abs(start.normalized().dot(goal)), 0.0, 1.0));
+        duration = std::max({duration, 1.875 * distance / vr_return_limits_[0],
+            std::sqrt(10.0 / std::sqrt(3.0) * distance / vr_return_limits_[1]),
+            1.875 * angle / vr_return_limits_[2],
+            std::sqrt(10.0 / std::sqrt(3.0) * angle / vr_return_limits_[3])});
+      }
+      const double u = std::clamp((elapsed - 15.0) / duration, 0.0, 1.0);
+      const double blend = u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
+      auto position = timeout_vr_position_;
+      auto orientation = timeout_vr_orientation_;
+      for (size_t side = 0; side < 2; ++side) {
+        for (size_t axis = 0; axis < 3; ++axis) {
+          position[3 * side + axis] += blend *
+              ((*vr_base_pose_)[7 * side + axis] - position[3 * side + axis]);
+          if (u >= 1.0) position[3 * side + axis] = (*vr_base_pose_)[7 * side + axis];
+        }
+        const size_t q = 4 * side, b = 7 * side + 3;
+        Eigen::Quaterniond start(orientation[q], orientation[q+1], orientation[q+2], orientation[q+3]);
+        Eigen::Quaterniond end((*vr_base_pose_)[b], (*vr_base_pose_)[b+1], (*vr_base_pose_)[b+2], (*vr_base_pose_)[b+3]);
+        const auto value = start.normalized().slerp(blend, end);
+        orientation[q] = value.w(); orientation[q+1] = value.x();
+        orientation[q+2] = value.y(); orientation[q+3] = value.z();
+      }
+      vr_3point_position_.SetData(position);
+      vr_3point_orientation_.SetData(orientation);
+      pose_interface_->SetVR3PointPosition(position);
+      pose_interface_->SetVR3PointOrientation(orientation);
+    }
+
     /// Keep arm ownership on a planner publisher failure instead of snapping to
     /// the planner motion's resting arms. Existing explicit targets are retained;
-    /// VR-only control falls back to the current planner-motion arm target.
+    /// VR control retains its Cartesian targets and encoder mode. The planner
+    /// motion's joint reference is not the arm command produced by VR control.
     bool latchPlannerTimeoutArmHold(
         const std::shared_ptr<const MotionSequence>& current_motion,
         int current_frame,
         std::mutex& current_motion_mutex) {
+      if (has_vr_3point_control_) {
+        // Locomotion has already been stopped by handlePlannerInput. Keep the
+        // same VR controller and target through the entire publisher outage;
+        // switching to planner joints here makes the arms drop on disconnect.
+        return true;
+      }
       std::array<double, 17> held_position{};
       bool have_target = has_upper_body_control_;
 
@@ -1354,6 +1490,13 @@ class ZMQManager : public InputInterface {
     /// Arm hold installed after planner-message timeout. Only an explicit
     /// upper-body target releases it; ordinary locomotion heartbeats do not.
     bool planner_timeout_hold_active_ = false;
+    std::optional<std::chrono::steady_clock::time_point> pico_lost_at_;
+    std::optional<std::array<double, 14>> vr_base_pose_;
+    std::array<double, 9> timeout_vr_position_{};
+    std::array<double, 12> timeout_vr_orientation_{};
+    bool return_announced_ = false;
+    std::string status_announcement_;
+    std::array<double, 4> vr_return_limits_{0.15, 0.6, M_PI / 2, 2.0 * M_PI};
 };
 
 #endif // ZMQ_MANAGER_HPP

@@ -35,6 +35,10 @@ def streamer(monkeypatch):
     instance.last_vr_pose = None
     instance.held_vr_pose = None
     instance.first_vr_pose = None
+    instance.disconnect_idle_pose = vr_pose()
+    # These geometry/FSM tests isolate calibration from motion conditioning;
+    # dedicated conditioner integration tests exercise the production filter.
+    instance.vr_conditioner = None
     instance.reader = SimpleNamespace(get_timestamp_ns=lambda: 123, get_latest=lambda: None)
     instance.last_xrt_timestamp = None
     instance.dt = 0.02
@@ -198,6 +202,27 @@ def test_initial_vr_return_uses_planner_command_and_real_base_fk(streamer):
     # Base wrist FK is symmetric about the robot's sagittal plane.
     np.testing.assert_allclose(transition.goal[0, :3], transition.goal[1, :3] * [1, -1, 1], atol=1e-5)
     assert np.isfinite(transition.goal).all()
+    assert streamer.send_vr_return_sample(transition, transition.progress.started_at)[0]
+    packet = unpack_pose_message(streamer.packets[-1], "planner")
+    # Automatic recovery returns all the way to planner idle, not calibration.
+    np.testing.assert_allclose(packet["vr_base_pose"].reshape(2, 7), expected_start[:2], atol=1e-7)
+    assert not np.allclose(expected_start[:2], transition.goal[:2])
+
+    # The reconnect completion must use that same cached idle destination,
+    # even if fresh planner feedback has since changed during locomotion.
+    streamer.last_vr_pose = transition.goal.copy()
+    streamer.feedback_reader.upper_body_planner_target += 0.3
+    recovery = streamer.begin_vr_return(
+        to_base=True, duration_s=2, goal_override=streamer.disconnect_idle_pose
+    )
+    np.testing.assert_allclose(recovery.goal[:2], expected_start[:2])
+    np.testing.assert_array_equal(recovery.goal[2], streamer.last_vr_pose[2])
+
+    # A deliberate second B+Y refreshes the destination from the planner.
+    streamer.feedback_reader.last_body_feedback_monotonic = manager.time.monotonic()
+    idle_return = streamer.begin_vr_return(to_base=False, duration_s=2)
+    np.testing.assert_allclose(streamer.disconnect_idle_pose[:2], idle_return.goal[:2])
+    assert not np.allclose(streamer.disconnect_idle_pose[:2], expected_start[:2])
 
 
 def test_every_reentry_reanchors_pico_and_preserves_first_packet(streamer, monkeypatch):
@@ -256,7 +281,8 @@ def test_calibration_maps_actual_smpl_sample_to_held_target():
     np.testing.assert_array_equal(sample, original)
 
 
-def test_manager_gesture_flow_keeps_pico_out_of_return_and_base(streamer, monkeypatch):
+@pytest.mark.parametrize("disconnect_frame,outage_seconds", [(None, 0), (123, 5), (123, 14.5), (123, 20), (150, 5), (150, 20), (232, 20)])
+def test_manager_gesture_flow_keeps_pico_out_of_return_and_base(streamer, monkeypatch, disconnect_frame, outage_seconds):
     # Run the real FSM, gesture trackers, calibration and packet sender offline.
     # Replace only time, hardware, pose extraction and unused full-body/hand workers.
     clock = SimpleNamespace(now=100.0)
@@ -275,12 +301,41 @@ def test_manager_gesture_flow_keeps_pico_out_of_return_and_base(streamer, monkey
     monkeypatch.setattr(manager, "ThreePointPose", lambda **kwargs: three_point)
     monkeypatch.setattr(manager, "_process_3pt_pose", lambda sample: sample.copy())
     streamer.three_point = three_point
-    monkeypatch.setattr(streamer, "vr_pose_from_upper_body", lambda joints: vr_pose())
+
+    def fk(joints):
+        pose = vr_pose()
+        if np.array_equal(joints, IDLE_BASE_UPPER_BODY_RAD):
+            pose[:2, 2] += 0.12  # Calibration and resting idle are distinct.
+        return pose
+
+    monkeypatch.setattr(streamer, "vr_pose_from_upper_body", fk)
     streamer.left_hand_ik_solver = streamer.right_hand_ik_solver = None
     streamer.reset_yaw = lambda: None
     streamer.reader.disconnected = False
     streamer.reader.stop = lambda: None
     streamer.reader.get_timestamp_ns = lambda: int(clock.now * 1e9)
+    monkeypatch.setattr(manager, "PicoReader", type(streamer.reader))
+    reconnects = []
+    recovery_targets = []
+    reconnect_packet_counts = []
+
+    def reconnect():
+        reconnects.append(frame[0])
+        reconnect_packet_counts.append(len(emitted))
+        # Native reconnect may block far longer than the robot's 1s watchdog.
+        clock.now += outage_seconds
+        target = streamer.last_vr_pose.copy()
+        if outage_seconds > 17:
+            target[:2] = vr_pose()[:2]
+        elif outage_seconds > 14:
+            # Reconnect during SONIC's return (its watchdog starts before
+            # Python's 2s disconnect detector). Finish from current feedback.
+            target[:2, :3] = (target[:2, :3] + vr_pose()[:2, :3]) / 2
+        streamer.feedback_reader.vr_pose = target.copy()
+        recovery_targets.append(target)
+        streamer.reader.disconnected = False
+
+    streamer.reader.reconnect = reconnect
     source = vr_pose()
     reads = []
 
@@ -301,7 +356,7 @@ def test_manager_gesture_flow_keeps_pico_out_of_return_and_base(streamer, monkey
     schedule = [(True,) * 4, neutral, ax, neutral, ax, neutral] + [neutral] * 110
     schedule += [ax, neutral, ax, neutral] + [neutral] * 5
     return_frame = len(schedule) + 1
-    schedule += [by, neutral] + [neutral] * 110
+    schedule += [neutral if disconnect_frame == 123 else by, neutral] + [neutral] * 110
     reentry_frame = len(schedule) + 3
     schedule += [ax, neutral, ax, neutral] + [neutral] * 5
     frame = [-1]
@@ -311,6 +366,11 @@ def test_manager_gesture_flow_keeps_pico_out_of_return_and_base(streamer, monkey
         if frame[0] == len(schedule):
             raise KeyboardInterrupt
         source[0, 0] = 0.3 + frame[0] * 0.01  # Pico never stops moving.
+        if frame[0] == disconnect_frame:
+            streamer.reader.disconnected = True
+            streamer.mode = manager.LocomotionMode.WALK
+            # Reconnected/stale sticks cannot start walking before re-arming.
+            monkeypatch.setattr(manager, "get_controller_axes", lambda reader: (1, 0, 1, 0))
         return schedule[frame[0]]
 
     monkeypatch.setattr(manager, "get_abxy_buttons", buttons)
@@ -325,7 +385,35 @@ def test_manager_gesture_flow_keeps_pico_out_of_return_and_base(streamer, monkey
     monkeypatch.setattr(
         manager.zmq, "Context", lambda: SimpleNamespace(socket=lambda *args: socket, term=lambda: None)
     )
-    manager.run_pico_manager(teleop_mode="vr3pt", input_source="isaac", target_fps=50)
+    manager.run_pico_manager(
+        teleop_mode="vr3pt", input_source="isaac", target_fps=50,
+        idle_base_transition_duration=2.0,  # Fixed timeline for this gesture scenario.
+    )
+    if disconnect_frame is not None:
+        assert reconnects == [disconnect_frame]
+        # Only the robot owns the outage timer. Python must not keep sending
+        # stale planner packets or overwrite the robot's return on reconnect.
+        before = emitted[:reconnect_packet_counts[0]]
+        assert len([data for index, data in before if index == disconnect_frame and data.startswith(b"planner")]) == 1
+        packets = [(index, data) for index, data in emitted[reconnect_packet_counts[0]:]
+                   if data.startswith(b"planner") and index < reentry_frame]
+        expected = recovery_targets[0]
+        assert packets
+        np.testing.assert_allclose(decode_vr(packets[0][1]), expected, atol=1e-7)
+        if outage_seconds > 14:
+            expected = expected.copy()
+            expected[:2] = vr_pose()[:2]
+        for index, data in packets:
+            if index > disconnect_frame:
+                np.testing.assert_allclose(decode_vr(data), expected, atol=1e-7)
+            payload = unpack_pose_message(data, "planner")
+            np.testing.assert_array_equal(payload["movement"], [0, 0, 0])
+            assert payload["mode"][0] == manager.LocomotionMode.IDLE.value
+        # Re-entry recalibrates from the held target, without a pose jump.
+        resumed = next(data for index, data in emitted
+                       if index == reentry_frame and data.startswith(b"planner"))
+        np.testing.assert_array_equal(decode_vr(resumed), decode_vr(packets[-1][1]))
+        return
     states = [int(unpack_pose_message(data, "manager_state")["stream_mode"][0])
               for _, data in emitted if data.startswith(b"manager_state")]
     assert states[return_frame - 1] == manager.StreamMode.PLANNER_VR_3PT.value
@@ -342,3 +430,20 @@ def test_manager_gesture_flow_keeps_pico_out_of_return_and_base(streamer, monkey
     assert len(held) > 1
     for pose in held[1:]:
         np.testing.assert_array_equal(pose, held[0])
+
+
+def test_generated_hold_does_not_call_disconnected_timestamp_api(streamer):
+    streamer.reader.get_timestamp_ns = forbidden_pico_read
+    streamer.reader.get_latest = forbidden_pico_read
+    streamer.held_vr_pose = vr_pose()
+    for _ in range(100):
+        assert streamer.run_once(manager.StreamMode.PLANNER_IDLE_BASE_POSE, force_locomotion_idle=True)
+        np.testing.assert_allclose(decode_vr(streamer.packets[-1]), vr_pose(), atol=1e-7)
+
+
+def test_pico_timestamp_is_from_last_complete_sample():
+    reader = manager.PicoReader()
+    assert reader.get_timestamp_ns() == 0
+    reader._latest = {"timestamp_ns": 123}
+    reader._disconnected.set()
+    assert reader.get_timestamp_ns() == 123

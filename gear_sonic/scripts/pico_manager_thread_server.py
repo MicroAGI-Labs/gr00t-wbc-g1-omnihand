@@ -23,6 +23,7 @@
 """
 
 from collections import defaultdict, deque
+from copy import deepcopy
 from enum import Enum, IntEnum
 import os
 import socket
@@ -53,6 +54,7 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_rotation_matrix,
 )
 from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.teleop.vr_motion_conditioner import VRMotionConditioner, VRMotionLimits
 from gear_sonic.utils.teleop.gesture_trackers import (
     DoublePressTracker,
     recording_face_action,
@@ -994,9 +996,10 @@ class PicoReader:
         self.start()
 
     def get_timestamp_ns(self) -> int:
-        if xrt is None:
-            return 0
-        return int(xrt.get_time_stamp_ns())
+        # Only the reader thread touches XRT body/timestamp APIs. Consumers
+        # see the timestamp of the last complete sample, even during reconnect.
+        with self._lock:
+            return 0 if self._latest is None else int(self._latest["timestamp_ns"])
 
     def _run(self):
         last_report = time.time()
@@ -2088,6 +2091,7 @@ class PlannerStreamer:
         zmq_feedback_port: int = 5557,
         initial_mode: LocomotionMode = LocomotionMode.IDLE,
         ik_upper_body: bool = False,
+        vr_motion_limits: VRMotionLimits = VRMotionLimits(),
     ):
         self.socket = socket
         self.reader = reader
@@ -2110,6 +2114,8 @@ class PlannerStreamer:
         self.last_vr_pose: np.ndarray | None = None
         self.held_vr_pose: np.ndarray | None = None
         self.first_vr_pose: np.ndarray | None = None
+        self.disconnect_idle_pose: np.ndarray | None = None
+        self.vr_conditioner = VRMotionConditioner(vr_motion_limits)
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
@@ -2154,7 +2160,10 @@ class PlannerStreamer:
 
     def recalibrate_for_vr3pt(self) -> bool:
         """Recalibrate every entry; first packet is exactly the held VR target."""
-        if not self.poll_fresh_feedback():
+        if self.vr_conditioner is not None and not self.vr_conditioner.stopped:
+            print("[PlannerLoop] Wait for 3PT braking to finish before re-anchoring")
+            return False
+        if not self.poll_fresh_feedback(require_planner_target=self.disconnect_idle_pose is None):
             print("[PlannerLoop] Cannot enter VR 3PT without fresh robot feedback")
             return False
         sample = self.reader.get_latest()
@@ -2162,9 +2171,15 @@ class PlannerStreamer:
         if sample is None or target is None:
             print("[PlannerLoop] Cannot calibrate without Pico input and a current VR target")
             return False
+        if self.disconnect_idle_pose is None:
+            self.disconnect_idle_pose = self.vr_pose_from_upper_body(
+                self.feedback_reader.upper_body_planner_target
+            )
         self.three_point.calibrate_to_vr_target(sample["body_poses_np"], target)
         self.first_vr_pose = target.copy()
         self.held_vr_pose = None
+        if self.vr_conditioner is not None:
+            self.vr_conditioner.seed(target, time.monotonic())
         print("[PlannerLoop] Pico recalibrated to held VR target; first command preserved")
         return True
 
@@ -2180,7 +2195,9 @@ class PlannerStreamer:
             for name in ("left_wrist", "right_wrist", "torso")
         ]))
 
-    def begin_vr_return(self, *, to_base: bool, duration_s: float) -> VRPoseTransition | None:
+    def begin_vr_return(
+        self, *, to_base: bool, duration_s: float, goal_override: np.ndarray | None = None
+    ) -> VRPoseTransition | None:
         needs_joint_start = to_base and self.last_vr_pose is None
         # A Pico disconnect must still return smoothly from the last command.
         # Do not let a simultaneous planner-feedback timeout turn this into an
@@ -2199,14 +2216,26 @@ class PlannerStreamer:
             start = self.vr_pose_from_upper_body(
                 self.feedback_reader.upper_body_planner_target
             )
+            # Retain the resting planner pose before entering calibration.
+            # The calibration pose itself is not the arms-on-legs destination.
+            self.disconnect_idle_pose = start.copy()
         else:
             start = self.feedback_reader.vr_pose
         if start is None:
             print("[PlannerLoop] Return blocked: current VR target is unavailable")
             return None
-        goal = self.vr_pose_from_upper_body(
+        if self.vr_conditioner is not None:
+            if self.vr_conditioner.fault:
+                if not self.vr_conditioner.stopped:
+                    return None
+                self.vr_conditioner.seed(start, time.monotonic())
+            elif self.vr_conditioner.pose is None or self.vr_conditioner.stopped:
+                self.vr_conditioner.seed(start, time.monotonic())
+        goal = validate_vr_pose(goal_override) if goal_override is not None else self.vr_pose_from_upper_body(
             IDLE_BASE_UPPER_BODY_RAD if to_base else self.feedback_reader.upper_body_planner_target
         )
+        if not to_base:
+            self.disconnect_idle_pose = goal.copy()
         # Returning the arms must not command a new head/waist orientation.
         goal[2] = start[2]
         transition = VRPoseTransition(start, goal, started_at=time.monotonic(), duration_s=duration_s)
@@ -2222,7 +2251,8 @@ class PlannerStreamer:
         )
         if sent:
             self.held_vr_pose = self.last_vr_pose.copy()
-        return sent, complete and sent
+        reached = self.vr_conditioner is None or self.vr_conditioner.reached(transition.goal)
+        return sent, complete and sent and reached
 
     def commanded_transition_start(self) -> np.ndarray | None:
         """Snapshot the active joint reference, never the measured joint pose."""
@@ -2276,16 +2306,19 @@ class PlannerStreamer:
                 raise ValueError("cannot mix a generated VR target with joint overrides")
             generated_vr = vr_pose_override is not None
             # Avoid sending old commands if XRT timestamp hasn't advanced, in case of headset disconnect
-            xrt_timestamp = self.reader.get_timestamp_ns()
             transition_or_base_pose = (
                 upper_body_override is not None
                 or generated_vr
                 or self.first_vr_pose is not None
                 or stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE
             )
-            if xrt_timestamp == self.last_xrt_timestamp and not transition_or_base_pose:
-                return False
-            self.last_xrt_timestamp = xrt_timestamp
+            # Generated targets must remain sendable while the native Pico
+            # client is disconnected (including timestamp API failures).
+            if not generated_vr:
+                xrt_timestamp = self.reader.get_timestamp_ns()
+                if xrt_timestamp == self.last_xrt_timestamp and not transition_or_base_pose:
+                    return False
+                self.last_xrt_timestamp = xrt_timestamp
 
             # Face chords are disambiguated by the manager and confirmed on
             # release. A+B selects the next mode; X+Y selects the previous.
@@ -2380,9 +2413,7 @@ class PlannerStreamer:
                     if sample is None:
                         return False
                     vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
-                sent_vr_pose = validate_vr_pose(vr_3pt_pose)
-                vr_3pt_position = sent_vr_pose[:, :3].flatten().tolist()
-                vr_3pt_orientation = sent_vr_pose[:, 3:].flatten().tolist()
+                sent_vr_pose = vr_3pt_pose
 
                 # Compute hand joints from trigger/grip inputs so operator can
                 # control hand open/close while in VR 3PT mode
@@ -2415,6 +2446,24 @@ class PlannerStreamer:
                     self.ik_upper_body.update(vr_3pt_pose)
                 )
 
+            base_pose = None
+            next_conditioner = None
+            if sent_vr_pose is not None:
+                if self.vr_conditioner is not None:
+                    # Commit filter state only after the corresponding packet is sent.
+                    next_conditioner = deepcopy(self.vr_conditioner)
+                    sent_vr_pose = next_conditioner.update(
+                        sent_vr_pose, time.monotonic(), live=not generated_vr
+                    )
+                    if next_conditioner.fault:
+                        mode_to_send = LocomotionMode.IDLE
+                        movement, speed = [0.0, 0.0, 0.0], -1.0
+                vr_3pt_position = sent_vr_pose[:, :3].flatten().tolist()
+                vr_3pt_orientation = sent_vr_pose[:, 3:].flatten().tolist()
+                if self.disconnect_idle_pose is not None:
+                    # Keep the legacy wire name; the endpoint is planner idle,
+                    # matching the second B+Y return, not calibration base.
+                    base_pose = self.disconnect_idle_pose[:2].reshape(-1).tolist()
             msg = build_planner_message(
                 mode_to_send.value,
                 movement,
@@ -2430,8 +2479,20 @@ class PlannerStreamer:
                 vr_3pt_orientation=vr_3pt_orientation,
                 vr_3pt_compliance=vr_3pt_compliance,
                 publisher_monotonic_ns=time.monotonic_ns(),
+                vr_base_pose=base_pose,
+                vr_motion_limits=(
+                    [next_conditioner.limits.speed, next_conditioner.limits.acceleration,
+                     next_conditioner.limits.angular_speed, next_conditioner.limits.angular_acceleration]
+                    if next_conditioner is not None else None
+                ),
             )
             self.socket.send(msg)
+            if next_conditioner is not None:
+                if next_conditioner.fault and not self.vr_conditioner.fault:
+                    print(f"[PlannerLoop] {next_conditioner.fault}; braking to hold. A+X twice to re-anchor.")
+                self.vr_conditioner = next_conditioner
+                if generated_vr or next_conditioner.fault:
+                    self.held_vr_pose = sent_vr_pose.copy()
             self.last_vr_pose = None if sent_vr_pose is None else sent_vr_pose.copy()
             if not generated_vr:
                 self.first_vr_pose = None
@@ -2480,7 +2541,11 @@ def run_pico_manager(
     recording_status_port: int = 5581,
     teleop_control_host: str = "localhost",
     teleop_control_port: int = DEFAULT_TELEOP_CONTROL_PORT,
-    idle_base_transition_duration: float = 2.0,
+    idle_base_transition_duration: float = 5.0,
+    vr_max_speed: float = 0.15,
+    vr_max_acceleration: float = 0.6,
+    vr_max_angular_speed_deg: float = 90.0,
+    vr_max_angular_acceleration_deg: float = 360.0,
 ):
     """
     Manager: publishes body and latest-only hand intent from one fixed-rate loop.
@@ -2491,6 +2556,11 @@ def run_pico_manager(
       X+B: Start/stop-success recording
       Y+A: The only explicit discard gesture
     """
+    motion_limits = VRMotionLimits(
+        speed=vr_max_speed, acceleration=vr_max_acceleration,
+        angular_speed=np.deg2rad(vr_max_angular_speed_deg),
+        angular_acceleration=np.deg2rad(vr_max_angular_acceleration_deg),
+    )
     reader = _init_input_source(input_source, buffer_size)
     if teleop_mode not in {"pose", "vr3pt", "ik-upper"}:
         raise ValueError("teleop_mode must be 'pose', 'vr3pt', or 'ik-upper'")
@@ -2576,6 +2646,7 @@ def run_pico_manager(
         zmq_feedback_port=zmq_feedback_port,
         initial_mode=initial_mode,
         ik_upper_body=teleop_mode == "ik-upper",
+        vr_motion_limits=motion_limits,
     )
     hand_intent = HandIntentStream()
 
@@ -2611,6 +2682,7 @@ def run_pico_manager(
     safe_idle_requested = False
     last_teleop_control_sequence = -1
     policy_started = False
+    disconnect_hold_active = False
     face_chords = FaceChordTracker()
     ax_double_press = DoublePressTracker(window_seconds=2.0)
     manager_period = 1.0 / max(target_fps, 1)
@@ -2630,49 +2702,36 @@ def run_pico_manager(
                     "[Manager] Teleop frames lost; suspending teleop input. "
                     "SONIC remains running."
                 )
-                # A disconnect must use the same controlled VR return as B+Y.
-                # Sending OFF immediately would make the C++ side fall back to
-                # its base pose and visibly snap the arms.
-                disconnect_transition = None
-                if (
+                # SONIC owns the loss timer and delayed base return so it also
+                # works when this entire process disappears. Do not refresh the
+                # planner heartbeat with old input while Pico reconnects.
+                disconnect_started_at = time.monotonic()
+                disconnect_hold_active = (
                     teleop_stream_mode == StreamMode.PLANNER_VR_3PT
-                    and current_mode in {
-                        StreamMode.PLANNER,
-                        StreamMode.PLANNER_VR_3PT,
-                    }
-                ):
-                    disconnect_transition = planner_streamer.begin_vr_return(
-                        to_base=True, duration_s=idle_base_transition_duration
-                    )
-                if isinstance(disconnect_transition, VRPoseTransition):
-                    print("[Manager] Completing two-second VR return before disconnect hold")
-                    while True:
-                        _sent, complete = planner_streamer.send_vr_return_sample(
-                            disconnect_transition, time.monotonic()
-                        )
-                        if complete:
-                            break
-                        time.sleep(1.0 / max(target_fps, 1))
+                    and planner_streamer.last_vr_pose is not None
+                )
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
-                current_mode = StreamMode.OFF
                 upper_body_transition = None
                 transition_destination = None
-                planner_streamer.last_vr_pose = None
-                planner_streamer.held_vr_pose = None
                 planner_streamer.first_vr_pose = None
+                if disconnect_hold_active:
+                    planner_streamer.held_vr_pose = planner_streamer.last_vr_pose.copy()
+                    current_mode = StreamMode.PLANNER_IDLE_BASE_POSE
+                else:
+                    current_mode = StreamMode.OFF
+                    planner_streamer.last_vr_pose = None
+                    planner_streamer.held_vr_pose = None
 
-                # Keep the downstream controller in its explicit base-pose mode
-                # while input is disconnected. Sending OFF here would hand
-                # control to a hard-coded fallback and can cause an abrupt arm
-                # jump. SONIC lifetime is owned by the operator UI or direct
-                # process termination, not by this headset process.
+                # This topic reports state to the recorder; it does not command
+                # the robot. Arm ownership is retained by the planner target
+                # above and the robot's timeout hold, not these status packets.
                 for _ in range(3):
                     socket.send(
                         pack_pose_message(
                             {
                                 "stream_mode": np.array(
-                                    [StreamMode.PLANNER_IDLE_BASE_POSE.value], dtype=np.int32
+                                    [current_mode.value], dtype=np.int32
                                 ),
                                 "toggle_data_collection": np.array([False], dtype=bool),
                                 "toggle_data_abort": np.array([False], dtype=bool),
@@ -2692,6 +2751,49 @@ def run_pico_manager(
                     while reader.disconnected:
                         time.sleep(0.5)
 
+                if disconnect_hold_active:
+                    # SONIC may have returned to base during the outage. Never
+                    # replace that target with our pre-disconnect cached pose.
+                    previous_recovery_pose = None
+                    stable_since = None
+                    while True:
+                        if planner_streamer.poll_fresh_feedback():
+                            pose = planner_streamer.feedback_reader.vr_pose
+                            if pose is not None:
+                                if planner_streamer.vr_conditioner is not None:
+                                    # Let an autonomous return finish before
+                                    # reseeding zero velocity in the publisher.
+                                    unchanged = (previous_recovery_pose is not None and
+                                        np.allclose(pose, previous_recovery_pose, atol=1e-7, rtol=0))
+                                    previous_recovery_pose = np.asarray(pose).copy()
+                                    if not unchanged:
+                                        stable_since = time.monotonic()
+                                    if stable_since is None or time.monotonic() - stable_since < 0.1:
+                                        time.sleep(0.02)
+                                        continue
+                                return_started = not np.allclose(
+                                    pose, planner_streamer.held_vr_pose, atol=1e-5
+                                )
+                                planner_streamer.last_vr_pose = validate_vr_pose(pose)
+                                planner_streamer.held_vr_pose = planner_streamer.last_vr_pose.copy()
+                                if planner_streamer.vr_conditioner is not None:
+                                    planner_streamer.vr_conditioner.seed(pose, time.monotonic())
+                                break
+                        time.sleep(0.1)
+                    if (planner_streamer.disconnect_idle_pose is not None and
+                            (return_started or time.monotonic() - disconnect_started_at >= 15.0)):
+                        transition = planner_streamer.begin_vr_return(
+                            to_base=True, duration_s=idle_base_transition_duration,
+                            goal_override=planner_streamer.disconnect_idle_pose,
+                        )
+                        if transition is not None:
+                            while True:
+                                _, complete = planner_streamer.send_vr_return_sample(transition, time.monotonic())
+                                conditioner = planner_streamer.vr_conditioner
+                                if complete or (conditioner is not None and conditioner.fault and conditioner.stopped):
+                                    break
+                                time.sleep(manager_period)
+
                 hand_intent = HandIntentStream()
                 prev_ax_pressed = False
                 prev_by_pressed = False
@@ -2699,11 +2801,16 @@ def run_pico_manager(
                 prev_left_axis_click = False
                 face_chords.reset()
                 ax_double_press.reset()
-                print(
-                    "[Manager] Teleop reconnected; SONIC is still running and "
-                    "teleop remains OFF. "
-                    "Use A+B+X+Y to recalibrate/start when ready."
-                )
+                if disconnect_hold_active:
+                    print(
+                        "[Manager] Teleop reconnected; arms remain held and locomotion IDLE. "
+                        "Use A+X twice to recalibrate/resume, or B+Y to return to idle."
+                    )
+                else:
+                    print(
+                        "[Manager] Teleop reconnected; SONIC is still running and "
+                        "teleop remains OFF. Use A+B+X+Y to start when ready."
+                    )
                 manager_deadline = time.monotonic()
                 continue
 
@@ -2978,6 +3085,7 @@ def run_pico_manager(
                         new_mode,
                         face_command=face_command,
                         vr_pose_override=planner_streamer.held_vr_pose,
+                        force_locomotion_idle=disconnect_hold_active,
                     )
                 else:
                     planner_sent = planner_streamer.run_once(
@@ -2985,6 +3093,16 @@ def run_pico_manager(
                         face_command=face_command,
                     )
                 planner_report_count += int(planner_sent)
+
+            if (planner_streamer.vr_conditioner is not None
+                    and planner_streamer.vr_conditioner.fault
+                    and new_mode in PLANNER_STREAM_MODES
+                    and planner_streamer.last_vr_pose is not None):
+                upper_body_transition = None
+                transition_destination = None
+                transition_completed = False
+                new_mode = StreamMode.PLANNER_IDLE_BASE_POSE
+                disconnect_hold_active = True
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if upper_body_transition is None and new_mode != current_mode:
@@ -2995,6 +3113,9 @@ def run_pico_manager(
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
+                disconnect_hold_active = bool(
+                    planner_streamer.vr_conditioner is not None and planner_streamer.vr_conditioner.fault
+                )
 
             if transition_completed:
                 completed_destination = transition_destination
@@ -3005,6 +3126,7 @@ def run_pico_manager(
                     f"{completed_destination.name}"
                 )
                 current_mode = completed_destination
+                disconnect_hold_active = False
                 upper_body_transition = None
                 transition_destination = None
 
@@ -3263,9 +3385,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--idle-base-transition-duration",
         type=float,
-        default=2.0,
-        help="Seconds for each arm transition into or out of idle base pose (default: 2.0)",
+        default=5.0,
+        help="Seconds for each arm transition into or out of idle base pose (default: 5.0)",
     )
+    parser.add_argument("--vr-max-speed", type=float, default=0.15, help="3PT translation speed in m/s")
+    parser.add_argument("--vr-max-acceleration", type=float, default=0.6, help="3PT translation acceleration in m/s^2")
+    parser.add_argument("--vr-max-angular-speed-deg", type=float, default=90.0)
+    parser.add_argument("--vr-max-angular-acceleration-deg", type=float, default=360.0)
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -3315,6 +3441,10 @@ if __name__ == "__main__":
             teleop_control_host=args.teleop_control_host,
             teleop_control_port=args.teleop_control_port,
             idle_base_transition_duration=args.idle_base_transition_duration,
+            vr_max_speed=args.vr_max_speed,
+            vr_max_acceleration=args.vr_max_acceleration,
+            vr_max_angular_speed_deg=args.vr_max_angular_speed_deg,
+            vr_max_angular_acceleration_deg=args.vr_max_angular_acceleration_deg,
         )
     else:
         # Run legacy single-thread pose streaming
