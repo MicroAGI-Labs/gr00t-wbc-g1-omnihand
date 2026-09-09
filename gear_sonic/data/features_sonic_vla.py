@@ -16,7 +16,7 @@ from typing import Literal
 import numpy as np
 
 from gear_sonic.data.robot_model import RobotModel
-from gear_sonic.end_effectors.profiles import HandProfile
+from gear_sonic.end_effectors.profiles import HandProfile, raw_hand_name
 
 EGO_VIEW_HEIGHT: int = 480
 EGO_VIEW_WIDTH: int = 640
@@ -359,7 +359,7 @@ def get_features_sonic_vla(
             "shape": (3,),
             "names": ["angular_velocity_x", "angular_velocity_y", "angular_velocity_z"],
         },
-        "observation.omnihand_left_raw": {
+        f"observation.{raw_hand_name(hand_profile)}_left_raw": {
             "dtype": "float32",
             "shape": (hand_width,),
             "names": (
@@ -368,7 +368,7 @@ def get_features_sonic_vla(
                 else [f"left_hand_{index}" for index in range(hand_width)]
             ),
         },
-        "observation.omnihand_right_raw": {
+        f"observation.{raw_hand_name(hand_profile)}_right_raw": {
             "dtype": "float32",
             "shape": (hand_width,),
             "names": (
@@ -377,7 +377,7 @@ def get_features_sonic_vla(
                 else [f"right_hand_{index}" for index in range(hand_width)]
             ),
         },
-        "action.omnihand_left_raw": {
+        f"action.{raw_hand_name(hand_profile)}_left_raw": {
             "dtype": "float32",
             "shape": (hand_width,),
             "names": (
@@ -386,7 +386,7 @@ def get_features_sonic_vla(
                 else [f"left_hand_{index}" for index in range(hand_width)]
             ),
         },
-        "action.omnihand_right_raw": {
+        f"action.{raw_hand_name(hand_profile)}_right_raw": {
             "dtype": "float32",
             "shape": (hand_width,),
             "names": (

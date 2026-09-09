@@ -35,7 +35,9 @@ Usage (from repo root — no venv activation needed):
 
 from dataclasses import dataclass
 import os
+import math
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import socket
@@ -68,6 +70,12 @@ def _bootstrap_venv():
 
 
 _bootstrap_venv()
+
+# Worktrees may reuse installed environments whose editable package points to
+# another checkout. All panes must import the source selected by this launcher.
+_SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
+sys.path.insert(0, _SOURCE_ROOT)
+os.environ["PYTHONPATH"] = _SOURCE_ROOT + os.pathsep + os.environ.get("PYTHONPATH", "")
 
 import tyro  # noqa: E402
 
@@ -117,7 +125,7 @@ class DataCollectionLaunchConfig:
     deploy_output_type: str = ""
     """Output type for deploy.sh. Leave empty for default."""
 
-    hand_backend: Literal["dex3", "omnihand", "none"] = "dex3"
+    hand_backend: Literal["dex3", "omnihand", "dex1", "none"] = "dex3"
     """Hand owner. OmniHand uses the external controller in sim and hardware."""
 
     omnihand_close_scale: float = 1.0
@@ -128,6 +136,12 @@ class DataCollectionLaunchConfig:
 
     omnihand_transition_duration: float = 0.2
     """Seconds for OmniHand to open or close; lower values respond faster."""
+
+    dex1_transition_duration: float = 1.5
+    """Seconds per DEX 1 stroke; supported range 1.35–30."""
+
+    check_only: bool = False
+    """Check launch prerequisites and print the hand command without starting services."""
 
     omnihand_left_interface: str = "can11"
     """Serial-bound SocketCAN interface for the physical left O10."""
@@ -282,6 +296,20 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
         if not scene.is_file() or not mesh.is_file() or mesh.stat().st_size < 1000:
             errors.append("Atlas OmniHand MuJoCo assets are unavailable or still LFS pointers. Run: git lfs pull")
 
+    if config.hand_backend == "dex1":
+        from gear_sonic.end_effectors.backends.dex1 import USB_PORTS
+
+        if config.sim:
+            errors.append("DEX 1 currently supports physical USB grippers only; no DEX 1 MuJoCo scene is configured")
+        worker = repo_root / "build/dex1/dex1_worker"
+        if not os.access(worker, os.X_OK):
+            errors.append("DEX 1 worker missing. Run: bash install_scripts/install_dex1.sh")
+        for side, port in USB_PORTS.items():
+            if not os.access(port, os.R_OK | os.W_OK):
+                errors.append(f"DEX 1 {side} serial adapter unavailable or inaccessible: {port}")
+        if not math.isfinite(config.dex1_transition_duration) or not 1.35 <= config.dex1_transition_duration <= 30:
+            errors.append("--dex1-transition-duration must be between 1.35 and 30 seconds")
+
     if not 0.0 <= config.omnihand_close_scale <= 1.0:
         errors.append("--omnihand-close-scale must be between zero and one")
     if not 0.0 <= config.omnihand_sim_close_scale <= 1.0:
@@ -348,13 +376,16 @@ def _switch_camera_source(config: DataCollectionLaunchConfig) -> None:
     ):
         print(f"Camera source already set to {source} on port {config.camera_port}.")
         return
-    print(f"Switching camera source to {source} on port {config.camera_port}...")
-    result = subprocess.run(["sudo", "-n", "systemctl", action, service])
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Could not {action} {service} without a password prompt. "
-            f"Run 'sudo systemctl {action} {service}' once, then launch again."
-        )
+    if currently_active != (action == "start"):
+        print(f"Switching camera source to {source} on port {config.camera_port}...")
+        result = subprocess.run(["sudo", "-n", "systemctl", action, service])
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not {action} {service} without a password prompt. "
+                f"Run 'sudo systemctl {action} {service}' once, then launch again."
+            )
+    else:
+        print(f"Waiting for camera port {config.camera_port} to {'be ready' if expected_listening else 'be free'}...")
 
     deadline = time.monotonic() + (10.0 if config.sim else 60.0)
     while time.monotonic() < deadline:
@@ -363,7 +394,10 @@ def _switch_camera_source(config: DataCollectionLaunchConfig) -> None:
         time.sleep(0.25)
 
     state = "become free" if config.sim else "start listening"
-    raise RuntimeError(f"Camera port {config.camera_port} did not {state} after service {action}")
+    raise RuntimeError(
+        f"Camera port {config.camera_port} did not {state}. "
+        f"Check camera availability and service logs: journalctl -u {service} -n 50 --no-pager"
+    )
 
 
 def _hand_pane(config: DataCollectionLaunchConfig) -> int:
@@ -373,7 +407,7 @@ def _hand_pane(config: DataCollectionLaunchConfig) -> int:
 
 def _camera_server_log_pane(config: DataCollectionLaunchConfig) -> int:
     """Return the hardware camera log pane after optional sim/hand panes."""
-    return CORE_PANE_COUNT + int(config.sim) + int(config.hand_backend == "omnihand")
+    return CORE_PANE_COUNT + int(config.sim) + int(config.hand_backend in {"omnihand", "dex1"})
 
 
 def _create_tmux_session(config: DataCollectionLaunchConfig):
@@ -404,7 +438,7 @@ def _create_tmux_session(config: DataCollectionLaunchConfig):
     pane_count = (
         CORE_PANE_COUNT
         + int(config.sim)
-        + int(config.hand_backend == "omnihand")
+        + int(config.hand_backend in {"omnihand", "dex1"})
         + int(not config.sim and config.camera_server_logs)
     )
     for _ in range(1, pane_count):
@@ -435,6 +469,9 @@ def _select_dashboard():
 def _send_to_pane(pane_index: int, cmd: str, wait: float = 1.0):
     """Send a command string to a tmux pane."""
     target = f"{DASHBOARD_WINDOW}.{pane_index}"
+    # An existing tmux server retains its old environment. Pass the source
+    # checkout explicitly even when the launcher reused an installed venv.
+    cmd = f"export PYTHONPATH={shlex.quote(_SOURCE_ROOT)} && {cmd}"
 
     subprocess.run(
         ["tmux", "send-keys", "-t", target, cmd, "C-m"],
@@ -453,10 +490,38 @@ def _check_pane_alive(pane_index: int) -> bool:
     return result.stdout.strip() != "1"
 
 
+def _hand_worker_command(config: DataCollectionLaunchConfig) -> tuple[str, str]:
+    """Return the environment and complete external-hand worker command."""
+    if config.hand_backend == "dex1":
+        return ".venv_data_collection", shlex.join([
+            "python", "-m", "gear_sonic.end_effectors.controller", "run",
+            "--backend", "dex1", "--sides", "both", "--enable-command",
+            "--intent-endpoint", f"tcp://localhost:{config.hand_intent_port}",
+            "--state-endpoint", f"tcp://*:{config.hand_state_port}",
+            "--dex1-transition-duration", str(config.dex1_transition_duration),
+        ])
+    return (".venv_sim" if config.sim else ".venv_omnihand"), shlex.join([
+        "python", "-m", "gear_sonic.end_effectors.controller", "run",
+        "--backend", "sim" if config.sim else "omnihand", "--sides", "both",
+        "--intent-endpoint", f"tcp://localhost:{config.hand_intent_port}",
+        "--state-endpoint", f"tcp://*:{config.hand_state_port}",
+        "--left-interface", config.omnihand_left_interface,
+        "--right-interface", config.omnihand_right_interface,
+        "--close-scale", str(config.omnihand_sim_close_scale if config.sim else config.omnihand_close_scale),
+        "--transition-duration", str(config.omnihand_transition_duration),
+        *([] if config.sim else ["--enable-command"]),
+    ])
+
+
 def main(config: DataCollectionLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
     _check_prerequisites(config)
+    if config.check_only:
+        print("Launch prerequisites passed; no services started.")
+        if config.hand_backend in {"omnihand", "dex1"}:
+            print(_hand_worker_command(config)[1])
+        return
 
     print("=" * 60)
     print("  SONIC Data Collection Launcher")
@@ -516,6 +581,7 @@ def main(config: DataCollectionLaunchConfig):
     hand_control = {
         "dex3": "legacy-dex3",
         "omnihand": "external",
+        "dex1": "external",
         "none": "none",
     }[config.hand_backend]
     deploy_cmd += f"--hand-control {hand_control} "
@@ -584,24 +650,10 @@ def main(config: DataCollectionLaunchConfig):
     print("Starting teleop streamer (pane 1)...")
     _send_to_pane(1, pico_cmd, wait=2.0)
 
-    # --- Dedicated hand controller pane (OmniHand only) ---
-    if config.hand_backend == "omnihand":
+    # --- Dedicated external hand controller pane ---
+    if config.hand_backend in {"omnihand", "dex1"}:
         hand_pane = _hand_pane(config)
-        hand_venv = ".venv_sim" if config.sim else ".venv_omnihand"
-        hand_backend = "sim" if config.sim else "omnihand"
-        close_scale = config.omnihand_sim_close_scale if config.sim else config.omnihand_close_scale
-        hand_worker_cmd = (
-            f"python -m gear_sonic.end_effectors.controller run "
-            f"--backend {hand_backend} --sides both "
-            f"--intent-endpoint tcp://localhost:{config.hand_intent_port} "
-            f"--state-endpoint tcp://*:{config.hand_state_port} "
-            f"--left-interface {config.omnihand_left_interface} "
-            f"--right-interface {config.omnihand_right_interface} "
-            f"--close-scale {close_scale} "
-            f"--transition-duration {config.omnihand_transition_duration}"
-        )
-        if not config.sim:
-            hand_worker_cmd += " --enable-command"
+        hand_venv, hand_worker_cmd = _hand_worker_command(config)
         # The supervisor owns the restart command outside the native SDK
         # process, so the UI can recover even if a vendor call is wedged.
         hand_cmd = (
@@ -610,7 +662,7 @@ def main(config: DataCollectionLaunchConfig):
             f"--control-endpoint tcp://localhost:{config.hand_control_port} -- "
             f"{hand_worker_cmd}"
         )
-        print(f"Starting OmniHand controller (pane {hand_pane})...")
+        print(f"Starting {config.hand_backend} controller (pane {hand_pane})...")
         _send_to_pane(hand_pane, hand_cmd)
 
     # --- Read-only system camera service log (hardware only) ---
@@ -636,7 +688,7 @@ def main(config: DataCollectionLaunchConfig):
             f"--hand-control-port {config.hand_control_port} "
             f"--teleop-control-port {config.teleop_control_port}"
         )
-        if config.hand_backend == "omnihand":
+        if config.hand_backend in {"omnihand", "dex1"}:
             viewer_cmd += " --enable-hand-controls"
         print(f"Starting browser viewer on loopback port {config.remote_ui_port} (pane 3)...")
         _send_to_pane(3, viewer_cmd, wait=2.0)
@@ -698,8 +750,8 @@ def main(config: DataCollectionLaunchConfig):
         print("    Pane 3: Camera Viewer")
     if config.sim:
         print(f"    Pane {SIM_PANE}: MuJoCo Simulator")
-    if config.hand_backend == "omnihand":
-        print(f"    Pane {_hand_pane(config)}: OmniHand controller")
+    if config.hand_backend in {"omnihand", "dex1"}:
+        print(f"    Pane {_hand_pane(config)}: {config.hand_backend} controller")
     if not config.sim and config.camera_server_logs:
         print(
             f"    Pane {_camera_server_log_pane(config)}: "

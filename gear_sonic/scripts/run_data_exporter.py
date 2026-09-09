@@ -51,7 +51,7 @@ from gear_sonic.data.features_sonic_vla import (
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
 )
-from gear_sonic.end_effectors.profiles import HandProfile, get_hand_profile
+from gear_sonic.end_effectors.profiles import HandProfile, dataset_robot_type, get_hand_profile, raw_hand_name
 from gear_sonic.end_effectors.protocol import (
     HAND_CONFIG_TOPIC,
     HAND_STATE_TOPIC,
@@ -128,7 +128,7 @@ class SonicDataExporterConfig:
     """Use text-to-speech voice feedback."""
 
     hand_profile: str = "auto"
-    """Hand profile (auto, dex3.v1, or omnihand_o10.v1)."""
+    """Hand profile (auto, dex3.v1, omnihand_o10.v1, or dex1.v1)."""
 
     hand_state_host: str = "localhost"
     """Host publishing external hand_config/hand_state messages."""
@@ -834,7 +834,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _capture_reproducibility_metadata(robot_config: dict, dataset_frequency_hz: float) -> dict:
+def _capture_reproducibility_metadata(
+    robot_config: dict, dataset_frequency_hz: float, hand_profile: HandProfile | None = None
+) -> dict:
     """Resolve immutable controller artifacts and record their identities."""
     repo_root = Path(__file__).resolve().parents[2]
     deploy_root = repo_root / "gear_sonic_deploy"
@@ -892,7 +894,7 @@ def _capture_reproducibility_metadata(robot_config: dict, dataset_frequency_hz: 
 
     return {
         "schema": "sonic.capture.v1",
-        "robot_type": "unitree_g1_omnihand_sonic",
+        "robot_type": dataset_robot_type(hand_profile),
         "gr00t_embodiment_tag": "UNITREE_G1_SONIC",
         "joint_units": "rad",
         "angular_velocity_units": "rad_s",
@@ -1955,10 +1957,10 @@ class GrootDataCollector:
             "observation.state": np.asarray(whole_q, dtype=np.float32),
             "observation.eef_state": np.asarray(observation_eef_state, dtype=np.float32),
             "action.wbc": np.asarray(whole_action_wbc, dtype=np.float32),
-            "observation.omnihand_left_raw": np.asarray(measured_left, dtype=np.float32),
-            "observation.omnihand_right_raw": np.asarray(measured_right, dtype=np.float32),
-            "action.omnihand_left_raw": np.asarray(requested_left, dtype=np.float32),
-            "action.omnihand_right_raw": np.asarray(requested_right, dtype=np.float32),
+            f"observation.{raw_hand_name(self.hand_profile)}_left_raw": np.asarray(measured_left, dtype=np.float32),
+            f"observation.{raw_hand_name(self.hand_profile)}_right_raw": np.asarray(measured_right, dtype=np.float32),
+            f"action.{raw_hand_name(self.hand_profile)}_left_raw": np.asarray(requested_left, dtype=np.float32),
+            f"action.{raw_hand_name(self.hand_profile)}_right_raw": np.asarray(requested_right, dtype=np.float32),
             "observation.left_hand_valid": np.ones(1, dtype=np.uint8),
             "observation.right_hand_valid": np.ones(1, dtype=np.uint8),
             "episode.success": np.ones(1, dtype=np.uint8),
@@ -2462,6 +2464,17 @@ class GrootDataCollector:
 # ---------------------------------------------------------------------------
 
 
+def resolve_hand_profile(requested: str, hand_config: dict | None) -> HandProfile:
+    """Use the external controller's declared profile before creating a schema."""
+    name = requested
+    if name == "auto":
+        name = hand_config["profile"] if hand_config is not None else "dex3.v1"
+    profile = get_hand_profile(name)
+    if hand_config is not None and hand_config.get("profile") != profile.name:
+        raise RuntimeError(f"requested {profile.name}, controller reports {hand_config.get('profile')}")
+    return profile
+
+
 def main(config: SonicDataExporterConfig):
     g1_rm = get_g1_robot_model()
 
@@ -2469,22 +2482,11 @@ def main(config: SonicDataExporterConfig):
         config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
     )
     hand_config = None
-    profile_name = config.hand_profile
-    if profile_name == "auto":
-        profile_name = (
-            "omnihand_o10.v1"
-            if robot_config.get("hand_control") == "external"
-            else "dex3.v1"
-        )
-    hand_profile = get_hand_profile(profile_name)
     if robot_config.get("hand_control") == "external":
         hand_config = poll_hand_config_zmq(
             config.hand_state_host, config.hand_state_port, config.hand_config_timeout
         )
-        if hand_config.get("profile") != hand_profile.name:
-            raise RuntimeError(
-                f"requested {hand_profile.name}, controller reports {hand_config.get('profile')}"
-            )
+    hand_profile = resolve_hand_profile(config.hand_profile, hand_config)
 
     schema_profile = hand_profile if hand_config is not None else None
     dataset_features = get_features_sonic_vla(g1_rm, schema_profile)
@@ -2514,10 +2516,10 @@ def main(config: SonicDataExporterConfig):
             "hand_profile": hand_profile.name,
             "hand_config": hand_config,
             "capture": _capture_reproducibility_metadata(
-                robot_config, config.data_collection_frequency
+                robot_config, config.data_collection_frequency, hand_profile
             ),
         },
-        robot_type="unitree_g1_omnihand_sonic",
+        robot_type=dataset_robot_type(hand_profile),
     )
 
     data_collector = GrootDataCollector(
