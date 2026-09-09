@@ -1,3 +1,5 @@
+import subprocess
+
 import numpy as np
 import pytest
 
@@ -25,3 +27,22 @@ def test_dex1_transition_duration_is_checked_by_backend(duration):
 
     with pytest.raises(ValueError):
         Dex1Backend("left", DEX1.left, worker="/missing", transition_duration=duration)
+
+
+def test_native_worker_self_test_builds_with_fake_motor(tmp_path):
+    worker = tmp_path / "dex1_worker"
+    result = subprocess.run(
+        [
+            "g++", "-std=c++17", "-O2", "-Wall", "-Wextra", "-Wpedantic",
+            "-DDEX1_FAKE_MOTOR_FOR_TEST",
+            "-I", "gear_sonic/end_effectors/tests/fakes",
+            "gear_sonic/end_effectors/native/dex1_worker.cpp",
+            "-o", str(worker),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    completed = subprocess.run([str(worker), "--self-test"], capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr

@@ -31,8 +31,13 @@ struct MotorData {
     uint8_t* get_motor_recv_data() { return bytes; }
 };
 struct SerialPort {
+    int calls = 0;
     SerialPort(const std::string&, int, int, int) {}
     bool sendRecv(MotorCmd* c, MotorData* d) {
+        ++calls;
+        if (const auto* failures = std::getenv("DEX1_TEST_STARTUP_FAILURES"))
+            if (calls <= std::stoi(failures)) return false;
+        if (std::getenv("DEX1_TEST_ACTIVE_FAILURE") && c->mode == 1) return false;
         d->correct = true; d->motor_id = c->id; d->mode = c->mode;
         d->tau = c->tau; d->bytes[5] = 50; d->bytes[4] = 30;
         if (const auto* log = std::getenv("DEX1_TEST_MOTOR_LOG"))
