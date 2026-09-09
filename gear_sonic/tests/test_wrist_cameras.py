@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from gear_sonic.camera.composed_camera import (
+    THOR_JR_WRIST_DEVICE_IDS,
     ComposedCameraClientSensor,
     ComposedCameraConfig,
     ComposedCameraSensor,
@@ -183,3 +184,53 @@ def test_optional_recording_rejects_missing_stale_and_wrong_size_wrists():
 def test_invalid_usb_capture_configuration_is_rejected(kwargs):
     with pytest.raises(ValueError):
         usb_camera.USBCameraConfig(**kwargs)
+
+
+def test_thor_profile_pins_robot_sides_and_capture_settings():
+    config = ComposedCameraConfig(ego_view_camera="zed", wrist_camera_profile="thor-jr")
+    sensor = object.__new__(ComposedCameraSensor)
+    sensor.config = config
+    cameras = sensor._get_camera_configs()
+    assert cameras["left_wrist"] == {
+        "camera_type": "usb",
+        "device_id": "/dev/v4l/by-id/usb-JR0001_JR0001_JR0001-video-index0",
+    }
+    assert cameras["right_wrist"] == {
+        "camera_type": "usb",
+        "device_id": "/dev/v4l/by-id/usb-JR0002_JR0002_JR0002-video-index0",
+    }
+    assert config.usb_camera_resolution == (1280, 720)
+    assert config.usb_camera_fps == config.fps == 60
+    assert config.usb_camera_mjpeg
+    assert cameras["ego_view"]["camera_type"] == "zed"
+
+
+def test_thor_profile_does_not_resolve_or_fallback_when_devices_are_absent(monkeypatch):
+    from pathlib import Path
+
+    def no_device_access(*args, **kwargs):
+        raise AssertionError("Mapping must not depend on current USB enumeration")
+
+    monkeypatch.setattr(Path, "resolve", no_device_access)
+    monkeypatch.setattr(Path, "exists", no_device_access)
+    config = ComposedCameraConfig(wrist_camera_profile="thor-jr")
+    assert config.left_wrist_device_id == THOR_JR_WRIST_DEVICE_IDS["left_wrist"]
+    assert config.right_wrist_device_id == THOR_JR_WRIST_DEVICE_IDS["right_wrist"]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"left_wrist_device_id": "0"},
+        {"right_wrist_device_id": THOR_JR_WRIST_DEVICE_IDS["left_wrist"]},
+        {"left_wrist_camera": "oak"},
+    ],
+)
+def test_thor_profile_rejects_conflicting_side_assignments(override):
+    with pytest.raises(ValueError, match="thor-jr fixes"):
+        ComposedCameraConfig(wrist_camera_profile="thor-jr", **override)
+
+
+def test_default_profile_keeps_wrist_capture_optional():
+    config = ComposedCameraConfig()
+    assert config.left_wrist_camera is config.right_wrist_camera is None

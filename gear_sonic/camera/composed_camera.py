@@ -23,7 +23,7 @@ from dataclasses import dataclass
 import queue
 import threading
 import time
-from typing import Any
+from typing import Any, Literal
 
 import cv2  # noqa: F401 — imported early to avoid TSL segfault with camera SDKs
 import numpy as np
@@ -35,6 +35,13 @@ from gear_sonic.camera.sensor_server import (
     SensorClient,
     SensorServer,
 )
+
+# Robot-side mounting of the fixed JR pair on this Thor. Keep the by-id names:
+# /dev/video numbers and USB hub paths can change after reboot/reconnection.
+THOR_JR_WRIST_DEVICE_IDS = {
+    "left_wrist": "/dev/v4l/by-id/usb-JR0001_JR0001_JR0001-video-index0",
+    "right_wrist": "/dev/v4l/by-id/usb-JR0002_JR0002_JR0002-video-index0",
+}
 
 
 def read_qr_code(data):
@@ -64,6 +71,9 @@ class ComposedCameraConfig:
 
     head_device_id: str | None = None
     """Device ID for head camera."""
+
+    wrist_camera_profile: Literal["custom", "thor-jr"] = "custom"
+    """thor-jr fixes this robot's wrist IDs, MJPEG/720p capture and 60 FPS publication."""
 
     left_wrist_camera: str | None = None
     """Camera type for left wrist view."""
@@ -121,6 +131,17 @@ class ComposedCameraConfig:
 
     def __post_init__(self):
         self.run_as_server = self.server
+        if self.wrist_camera_profile == "thor-jr":
+            for mount, device_id in THOR_JR_WRIST_DEVICE_IDS.items():
+                camera_type = getattr(self, f"{mount}_camera")
+                configured_id = getattr(self, f"{mount}_device_id")
+                if camera_type not in (None, "usb") or configured_id not in (None, device_id):
+                    raise ValueError(f"thor-jr fixes {mount} to USB device {device_id}; use custom to override")
+                setattr(self, f"{mount}_camera", "usb")
+                setattr(self, f"{mount}_device_id", device_id)
+            self.usb_camera_fps = self.fps = 60
+            self.usb_camera_resolution = (1280, 720)
+            self.usb_camera_mjpeg = True
 
 
 class ComposedCameraSensor(Sensor, SensorServer):

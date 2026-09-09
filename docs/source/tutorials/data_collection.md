@@ -122,18 +122,31 @@ python -m gear_sonic.camera.composed_camera \
 
 **ZED plus JR USB wrist cameras:**
 
-Use the physical left/right mapping when supplying device paths; JR0001 and
-JR0002 identify devices, not their mounting sides. Find their stable paths with
-`ls /dev/v4l/by-id/*video-index0`.
+For the fixed pair mounted on this Thor, use the saved profile:
 
 ```sh
 python -m gear_sonic.camera.composed_camera \
-    --ego-view-camera zed --zed-camera-fps 60 --fps 60 \
-    --left-wrist-camera usb --left-wrist-device-id /dev/v4l/by-id/LEFT_DEVICE-video-index0 \
-    --right-wrist-camera usb --right-wrist-device-id /dev/v4l/by-id/RIGHT_DEVICE-video-index0 \
-    --usb-camera-resolution 1280 720 --usb-camera-fps 60 --usb-camera-mjpeg \
-    --port 5555
+    --ego-view-camera zed --wrist-camera-profile thor-jr --port 5555
 ```
+
+The mapping uses the **robot's** left and right, based on the current mounted
+camera views:
+
+| Dataset stream | Camera serial | Persistent device path |
+| --- | --- | --- |
+| `left_wrist` | JR0001 | `/dev/v4l/by-id/usb-JR0001_JR0001_JR0001-video-index0` |
+| `right_wrist` | JR0002 | `/dev/v4l/by-id/usb-JR0002_JR0002_JR0002-video-index0` |
+
+These identities survive reboot, unplug/replug, and changes to `/dev/videoN`
+numbering or hub ports. The profile never falls back to another camera if one
+is missing, and rejects conflicting side assignments. Keep the cameras in
+these mounting positions; swapping the physical cameras requires updating the
+profile. No additional udev rule is needed for the existing JR devices.
+
+`thor-jr` fixes wrist capture to 1280×720 MJPEG at 60 FPS and the shared publisher
+to 60 FPS. For other hardware, leave `--wrist-camera-profile custom` (the default)
+and use the explicit `--left-wrist-camera`, `--left-wrist-device-id`,
+`--right-wrist-camera`, `--right-wrist-device-id`, and `--usb-camera-*` options.
 
 The JR cameras capture MJPEG at 1280×720/60 FPS with two V4L2 buffers. The
 USB driver continuously drains capture and outputs RGB at 640×480, matching the

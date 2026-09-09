@@ -66,10 +66,9 @@ ExecStart=${REPO_DIR}/.venv_camera/bin/python -m gear_sonic.camera.composed_came
 #     --zed-camera-resolution HD720 --zed-camera-fps 60 --fps 60 \
 #     --port 5555
 
-# Add JR wrist cameras to the ZED command above (verify physical left/right):
-#     --left-wrist-camera usb --left-wrist-device-id /dev/v4l/by-id/LEFT_DEVICE-video-index0 \
-#     --right-wrist-camera usb --right-wrist-device-id /dev/v4l/by-id/RIGHT_DEVICE-video-index0 \
-#     --usb-camera-resolution 1280 720 --usb-camera-fps 60 --usb-camera-mjpeg
+# This Thor's permanent wrist pair (robot-left JR0001, robot-right JR0002):
+# Add --wrist-camera-profile thor-jr to the ZED command above. The profile uses
+# stable /dev/v4l/by-id paths and sets MJPEG/720p/60 FPS capture and publication.
 
 Restart=on-failure
 RestartSec=5
