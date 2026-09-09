@@ -50,6 +50,8 @@ from gear_sonic.data.features_sonic_vla import (
     get_modality_config_sonic_vla,
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
+    get_zed_stereo_features,
+    get_zed_stereo_modality_config,
 )
 from gear_sonic.end_effectors.profiles import HandProfile, dataset_robot_type, get_hand_profile, raw_hand_name
 from gear_sonic.end_effectors.protocol import (
@@ -123,6 +125,9 @@ class SonicDataExporterConfig:
 
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
+
+    record_zed_stereo: bool = False
+    """Record native-orientation ZED left RGB, right RGB ego view, and float32 depth."""
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
@@ -1875,19 +1880,22 @@ class GrootDataCollector:
         message = self.latest_image_msg or {}
         received = message.get("camera_received_monotonic_ns", {})
         for feature_name, feature in self.data_exporter.features.items():
-            if feature.get("dtype") not in ("image", "video"):
+            is_depth = feature_name.startswith("observation.depth.")
+            if feature.get("dtype") not in ("image", "video") and not is_depth:
                 continue
             name = feature_name.split(".")[-1]
-            image = message.get("images", {}).get(name)
+            source = message.get("depths", {}) if is_depth else message.get("images", {})
+            source_name = "ego_view_depth" if is_depth else name
+            image = source.get(source_name)
             if image is None:
                 raise RuntimeError(f"required camera {name} is unavailable")
             if tuple(image.shape) != tuple(feature["shape"]):
                 raise RuntimeError(f"camera {name} shape {image.shape} does not match {feature['shape']}")
-            timestamp_key = f"capture.{name}_source_timestamp_ns"
+            timestamp_key = f"capture.{source_name}_source_timestamp_ns"
             if timestamp_key in self.data_exporter.features:
-                if _timestamp_seconds(message.get("timestamps", {}).get(name)) is None:
+                if _timestamp_seconds(message.get("timestamps", {}).get(source_name)) is None:
                     raise RuntimeError(f"camera {name} capture timestamp is unavailable")
-            received_at = received.get(name)
+            received_at = received.get(source_name)
             if received_at is not None and now - received_at / 1e9 > self.camera_max_age:
                 raise RuntimeError(f"camera {name} is stale")
 
@@ -1895,7 +1903,19 @@ class GrootDataCollector:
         if self.latest_image_msg is None:
             return
         images = self.latest_image_msg["images"]
+        depths = self.latest_image_msg.get("depths", {})
         for feature_name, feature_info in self.data_exporter.features.items():
+            if feature_name.startswith("observation.depth."):
+                source_name = "ego_view_depth"
+                if source_name not in depths:
+                    raise ValueError(f"Required depth '{source_name}' not found in camera message")
+                frame_data[feature_name] = depths[source_name]
+                timestamp_key = f"capture.{source_name}_source_timestamp_ns"
+                if timestamp_key in self.data_exporter.features:
+                    frame_data[timestamp_key] = np.asarray(
+                        [int(self.latest_image_msg["timestamps"][source_name] * 1e9)], dtype=np.int64
+                    )
+                continue
             if feature_info.get("dtype") in ["image", "video"]:
                 image_key = feature_name.split(".")[-1]
                 if image_key not in images:
@@ -2562,6 +2582,11 @@ def main(config: SonicDataExporterConfig):
                 modality_config[key].update(value)
             else:
                 modality_config[key] = value
+    if config.record_zed_stereo:
+        print("[Camera] ZED stereo enabled — adding left RGB and depth to dataset schema")
+        dataset_features.update(get_zed_stereo_features())
+        for key, value in get_zed_stereo_modality_config().items():
+            modality_config.setdefault(key, {}).update(value)
 
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 

@@ -208,6 +208,9 @@ class DataCollectionLaunchConfig:
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist) in the dataset."""
 
+    record_zed_stereo: bool = False
+    """Record ZED left-eye RGB and float32 depth in the dataset."""
+
     text_to_speech: bool = True
     """Enable voice feedback via espeak (data exporter)."""
 
@@ -806,6 +809,8 @@ def main(config: DataCollectionLaunchConfig):
         exporter_cmd += f" --dataset-name '{config.dataset_name}'"
     if config.record_wrist_cameras:
         exporter_cmd += " --record-wrist-cameras"
+    if config.record_zed_stereo:
+        exporter_cmd += " --record-zed-stereo"
     if config.remote_ui:
         exporter_cmd += " --require-hub-upload"
     if not config.text_to_speech:

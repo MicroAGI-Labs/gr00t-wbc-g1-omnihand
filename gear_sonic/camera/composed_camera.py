@@ -96,8 +96,11 @@ class ComposedCameraConfig:
     zed_camera_fps: int = 60
     """ZED hardware capture rate. HD720 supports 60 FPS."""
 
-    zed_camera_rotate_180: bool = True
-    """Rotate robot-mounted ZED frames 180 degrees."""
+    zed_camera_rotate_180: bool = False
+    """Keep ZED frames in native orientation."""
+
+    zed_record_depth: bool = True
+    """Publish the ZED depth map alongside both rectified eyes."""
 
     usb_camera_fps: int = 30
     """USB capture rate; use 60 for JR wrist cameras."""
@@ -426,6 +429,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
                 camera_resolution=self.config.zed_camera_resolution,
                 camera_fps=self.config.zed_camera_fps,
                 rotate_180=self.config.zed_camera_rotate_180,
+                record_depth=self.config.zed_record_depth,
             )
             print(
                 f"Initializing ZED sensor at {zed_config.camera_resolution}"
@@ -513,16 +517,19 @@ class ComposedCameraSensor(Sensor, SensorServer):
         """Merge per-camera data into a single ImageMessageSchema."""
         all_timestamps = {}
         all_images = {}
+        all_depths = {}
         sample_monotonic_values = []
         for _mount, camera_data in message.items():
             all_timestamps.update(camera_data.get("timestamps", {}))
             all_images.update(camera_data.get("images", {}))
+            all_depths.update(camera_data.get("depths", {}))
             sample_monotonic_ns = camera_data.get("sample_monotonic_ns")
             if isinstance(sample_monotonic_ns, int) and sample_monotonic_ns > 0:
                 sample_monotonic_values.append(sample_monotonic_ns)
         img_schema = ImageMessageSchema(
             timestamps=all_timestamps,
             images=all_images,
+            depths=all_depths,
             # Match the existing wall-timestamp fallback, which uses the most
             # recent capture when several cameras share one published packet.
             sample_monotonic_ns=(
@@ -650,6 +657,13 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             self._background_timestamps[name] = timestamp
             frames = self._background_frames.setdefault(name, deque(maxlen=5))
             frames.append({**message, "images": {name: image}, "timestamps": {name: timestamp}})
+        for name, depth in message.get("depths", {}).items():
+            timestamp = message["timestamps"][name]
+            if self._background_timestamps.get(name) == timestamp:
+                continue
+            self._background_timestamps[name] = timestamp
+            frames = self._background_frames.setdefault(name, deque(maxlen=5))
+            frames.append({**message, "images": {}, "depths": {name: depth}, "timestamps": {name: timestamp}})
 
     def _sample_camera_frames(self) -> dict | None:
         updated = False
@@ -663,9 +677,10 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         if not updated:
             return None
         latest = max(self._selected_frames.values(), key=lambda frame: frame["receiver_monotonic_ns"])
-        message = {**latest, "images": {}, "timestamps": {}, "camera_received_monotonic_ns": {}}
+        message = {**latest, "images": {}, "depths": {}, "timestamps": {}, "camera_received_monotonic_ns": {}}
         for name, frame in self._selected_frames.items():
             message["images"].update(frame["images"])
+            message["depths"].update(frame.get("depths", {}))
             message["timestamps"].update(frame["timestamps"])
             message["camera_received_monotonic_ns"][name] = frame["receiver_monotonic_ns"]
         return message

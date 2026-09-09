@@ -9,7 +9,7 @@ Run the camera server on the computer physically connected to the cameras. In th
 
 ```{admonition} Supported cameras
 :class: note
-The composed camera server supports **ZED**, **Luxonis OAK**, RealSense, and generic USB cameras. The ZED integration publishes the rectified right RGB image; depth is not sent through the JPEG transport.
+The composed camera server supports **ZED**, **Luxonis OAK**, RealSense, and generic USB cameras. A ZED publishes both rectified RGB eyes plus a lossless float32 depth map. ZED frames stay in native camera orientation; no 180-degree image rotation is applied by default.
 
 A 3D-printable mount for the head/ego-view **OAK-D W** camera is available under [`hardware/camera_mount/`](https://github.com/NVlabs/GR00T-WholeBodyControl/blob/main/hardware/camera_mount/README.md) — see its README for print settings, the bill of materials, and how it mounts on the G1.
 ```
@@ -328,6 +328,9 @@ python gear_sonic/scripts/launch_data_collection.py \
     --record-wrist-cameras
 ```
 
+Add `--record-zed-stereo` when the ego camera is a ZED to record its left eye
+and float32 depth map alongside the existing right-eye ego video.
+
 **With physical OmniHands and the browser controls:**
 
 ```bash
@@ -374,6 +377,7 @@ Common options:
 | `--deploy-planner` | *(default)* | Custom planner model path for deploy.sh |
 | `--deploy-motion-data` | *(default)* | Custom motion data path for deploy.sh |
 | `--record-wrist-cameras` | `False` | Record left/right wrist camera streams in the dataset |
+| `--record-zed-stereo` | `False` | Record ZED left-eye RGB and float32 depth |
 | `--no-text-to-speech` | *(on)* | Disable voice feedback via espeak |
 
 Run `python gear_sonic/scripts/launch_data_collection.py --help` for all options.
@@ -648,6 +652,8 @@ Each frame contains:
 | `observation.projected_gravity` | `(3,)` | Gravity vector in body frame |
 | `observation.omnihand_{left,right}_raw` | `(10,)` | Native measured OmniHand positions (rad) |
 | `observation.images.ego_view` | `(480, 640, 3)` | Ego camera image (saved as MP4 video) |
+| `observation.images.ego_view_left` | `(480, 640, 3)` | ZED rectified left-eye image (with `--record-zed-stereo`) |
+| `observation.depth.ego_view` | `(480, 640)` | ZED float32 depth map (with `--record-zed-stereo`) |
 | `observation.images.left_wrist` | `(480, 640, 3)` | Left wrist camera (only with `--record-wrist-cameras`) |
 | `observation.images.right_wrist` | `(480, 640, 3)` | Right wrist camera (only with `--record-wrist-cameras`) |
 | `action.motion_token` | `(64,)` | SONIC universal motion token |

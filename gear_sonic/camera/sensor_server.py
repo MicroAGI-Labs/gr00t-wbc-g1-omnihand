@@ -111,6 +111,8 @@ class ImageMessageSchema:
 
     * **str** – legacy base64-encoded JPEG.
     * **bytes** – raw JPEG from on-device MJPEG encoder (e.g. OAK).
+
+    Depth maps are carried losslessly in the separate ``depths`` mapping.
     """
 
     timestamps: dict[str, float]
@@ -118,11 +120,13 @@ class ImageMessageSchema:
     sample_monotonic_ns: int | None = None
     publisher_sequence: int | None = None
     publisher_monotonic_ns: int | None = None
+    depths: dict[str, np.ndarray] = field(default_factory=dict)
 
     def serialize(self) -> dict[str, Any]:
         serialized_msg: dict[str, Any] = {
             "timestamps": self.timestamps,
             "images": {},
+            "depths": {key: np.asarray(value) for key, value in self.depths.items()},
             "sample_monotonic_ns": self.sample_monotonic_ns,
             "publisher_sequence": self.publisher_sequence,
             "publisher_monotonic_ns": self.publisher_monotonic_ns,
@@ -150,9 +154,11 @@ class ImageMessageSchema:
                 images[key] = m.decode(value)
             else:
                 images[key] = value
+        depths = {key: np.asarray(value) for key, value in data.get("depths", {}).items()}
         return ImageMessageSchema(
             timestamps=timestamps,
             images=images,
+            depths=depths,
             sample_monotonic_ns=data.get("sample_monotonic_ns"),
             publisher_sequence=data.get("publisher_sequence"),
             publisher_monotonic_ns=data.get("publisher_monotonic_ns"),
@@ -162,6 +168,7 @@ class ImageMessageSchema:
         return {
             "timestamps": self.timestamps,
             "images": self.images,
+            "depths": self.depths,
             "sample_monotonic_ns": self.sample_monotonic_ns,
             "publisher_sequence": self.publisher_sequence,
             "publisher_monotonic_ns": self.publisher_monotonic_ns,
@@ -209,7 +216,10 @@ class SensorServer:
         payload["publisher_sequence"] = self.message_sent + 1
         payload["publisher_monotonic_ns"] = published_monotonic_ns
         try:
-            packed = msgpack.packb(payload, use_bin_type=True)
+            try:
+                packed = msgpack.packb(payload, use_bin_type=True)
+            except TypeError:
+                packed = msgpack.packb(payload, use_bin_type=True, default=m.encode)
             self.socket.send(packed, flags=zmq.NOBLOCK)
         except zmq.Again:
             self.message_dropped += 1
