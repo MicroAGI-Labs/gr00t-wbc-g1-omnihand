@@ -1051,6 +1051,12 @@ class GrootDataCollector:
                         f"not found in image message. Available: {list(images.keys())}"
                     )
                 frame_data[feature_name] = images[image_key]
+                timestamp_feature = f"capture.{image_key}_source_timestamp_ns"
+                if timestamp_feature in self.data_exporter.features:
+                    timestamp = image_message.get("timestamps", {}).get(image_key)
+                    if timestamp is None or not np.isfinite(float(timestamp)):
+                        raise ValueError(f"Required source timestamp for image '{image_key}' is missing")
+                    frame_data[timestamp_feature] = np.asarray([int(float(timestamp) * 1e9)], dtype=np.int64)
 
     def _finalize_frame(self, t_start: float) -> bool:
         t_end = time.monotonic()
@@ -1783,6 +1789,15 @@ def main(config: SonicDataExporterConfig):
             "record_wrist_cameras": config.record_wrist_cameras,
             "hand_profile": hand_profile.name,
             "hand_config": hand_config,
+            "capture_timestamp_metadata": {
+                "units": "ns",
+                "clock_scope": (
+                    "single_host"
+                    if config.hand_state_host in {"localhost", "127.0.0.1", "::1"}
+                    else "per_host"
+                ),
+                "hand_state_host": config.hand_state_host,
+            },
         },
     )
 
