@@ -1902,12 +1902,13 @@ class GrootDataCollector:
             if feature.get("dtype") not in ("image", "video") and not is_depth:
                 continue
             name = feature_name.split(".")[-1]
-            source = message.get("depths", {}) if is_depth else message.get("images", {})
             source_name = "ego_view_depth" if is_depth else name
+            sdk_depth_view = is_depth and source_name in message.get("images", {})
+            source = message.get("images", {}) if sdk_depth_view or not is_depth else message.get("depths", {})
             image = source.get(source_name)
             if image is None:
                 raise RuntimeError(f"required camera {name} is unavailable")
-            image_shape = _depth_to_video_frame(image).shape if is_depth else image.shape
+            image_shape = image.shape if sdk_depth_view or not is_depth else _depth_to_video_frame(image).shape
             if tuple(image_shape) != tuple(feature["shape"]):
                 raise RuntimeError(f"camera {name} shape {image.shape} does not match {feature['shape']}")
             timestamp_key = f"capture.{source_name}_source_timestamp_ns"
@@ -1926,9 +1927,12 @@ class GrootDataCollector:
         for feature_name, feature_info in self.data_exporter.features.items():
             if feature_name == DEPTH_VIDEO_FEATURE:
                 source_name = "ego_view_depth"
-                if source_name not in depths:
+                if source_name in images:
+                    frame_data[feature_name] = np.ascontiguousarray(images[source_name])
+                elif source_name in depths:
+                    frame_data[feature_name] = _depth_to_video_frame(depths[source_name])
+                else:
                     raise ValueError(f"Required depth '{source_name}' not found in camera message")
-                frame_data[feature_name] = _depth_to_video_frame(depths[source_name])
                 timestamp_key = f"capture.{source_name}_source_timestamp_ns"
                 if timestamp_key in self.data_exporter.features:
                     frame_data[timestamp_key] = np.asarray(

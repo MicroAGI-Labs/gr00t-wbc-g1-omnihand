@@ -4,7 +4,8 @@ The ZED SDK and its Python API are system dependencies and are intentionally
 loaded lazily. Install the SDK on the camera host, then install ``pyzed`` into
 the camera virtual environment with ``/usr/local/zed/get_python_api.py``.
 
-This integration exposes both rectified RGB eyes and a float32 depth map.
+This integration exposes both rectified RGB eyes, the SDK-rendered depth view,
+and a float32 depth map.
 """
 
 from dataclasses import dataclass
@@ -99,6 +100,7 @@ class ZEDSensor(Sensor):
             self._left_image = self._sl.Mat()
             self._right_image = self._sl.Mat()
             self._depth = self._sl.Mat() if self.config.record_depth else None
+            self._depth_view = self._sl.Mat() if self.config.record_depth else None
             self._output_resolution = self._sl.Resolution(*self.config.image_dim)
             self._print_camera_info()
         except Exception:
@@ -155,6 +157,26 @@ class ZEDSensor(Sensor):
 
         depths = {}
         if self.config.record_depth and self._depth is not None:
+            depth_name = f"{self.mount_position}_depth"
+            # Capture the SDK's own filtered/colorized depth view so the
+            # recorded video matches the ZED viewer instead of re-encoding
+            # noisy float depth ourselves.
+            if self._depth_view is not None and hasattr(self._sl.VIEW, "DEPTH"):
+                view_status = self._camera.retrieve_image(
+                    self._depth_view, self._sl.VIEW.DEPTH, self._sl.MEM.CPU, self._output_resolution
+                )
+                if view_status != self._sl.ERROR_CODE.SUCCESS:
+                    print(f"[{self.mount_position}] ZED depth view retrieval failed: {view_status}")
+                    return None
+                view_bgra = np.asarray(self._depth_view.get_data())
+                if view_bgra.ndim != 3 or view_bgra.shape[2] < 3 or view_bgra.size == 0:
+                    print(f"[{self.mount_position}] ZED returned an invalid depth view shape: {view_bgra.shape}")
+                    return None
+                depth_view = np.ascontiguousarray(view_bgra[..., 2::-1])
+                if self.config.rotate_180:
+                    depth_view = depth_view[::-1, ::-1]
+                images[depth_name] = depth_view
+
             status = self._camera.retrieve_measure(self._depth, self._sl.MEASURE.DEPTH, self._sl.MEM.CPU,
                                                    self._output_resolution)
             if status != self._sl.ERROR_CODE.SUCCESS:
@@ -168,7 +190,7 @@ class ZEDSensor(Sensor):
                 return None
             if self.config.rotate_180:
                 depth = depth[::-1, ::-1]
-            depths[f"{self.mount_position}_depth"] = np.ascontiguousarray(depth)
+            depths[depth_name] = np.ascontiguousarray(depth)
 
         timestamps = {name: capture_time for name in images}
         timestamps.update({name: capture_time for name in depths})
@@ -205,7 +227,7 @@ class ZEDSensor(Sensor):
         )
 
     def close(self):
-        for attr in ("_left_image", "_right_image", "_depth"):
+        for attr in ("_left_image", "_right_image", "_depth", "_depth_view"):
             image = getattr(self, attr, None)
             setattr(self, attr, None)
             if image is not None:
