@@ -1,0 +1,20 @@
+# Edit paths and THOR_IP before installing. Install on the USB gripper host only.
+# The default all-on-Thor launcher does not need this service.
+[Unit]
+Description=DEX 1 hand controller and supervisor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/home/unitree/gr00t-wbc-g1-omnihand
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/unitree/gr00t-wbc-g1-omnihand/.venv_hands/bin/python -m gear_sonic.end_effectors.server --teleop-host THOR_IP --enable-command
+KillMode=control-group
+TimeoutStopSec=5
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

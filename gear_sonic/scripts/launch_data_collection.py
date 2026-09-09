@@ -34,9 +34,10 @@ Usage (from repo root — no venv activation needed):
 """
 
 from dataclasses import dataclass
-import os
 import math
+import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import signal
@@ -128,6 +129,9 @@ class DataCollectionLaunchConfig:
     hand_backend: Literal["dex3", "omnihand", "dex1", "none"] = "dex3"
     """Hand owner. OmniHand uses the external controller in sim and hardware."""
 
+    hand_server_host: str | None = None
+    """Use an existing DEX 1 hand server on this host; omit to launch locally."""
+
     omnihand_close_scale: float = 1.0
     """Fraction of the calibrated O10 closing range used for hardware motion."""
 
@@ -138,7 +142,7 @@ class DataCollectionLaunchConfig:
     """Seconds for OmniHand to open or close; lower values respond faster."""
 
     dex1_transition_duration: float = 1.5
-    """Seconds per DEX 1 stroke; supported range 1.35–30."""
+    """Seconds per local DEX 1 stroke (1.35–30); configure a remote server separately."""
 
     check_only: bool = False
     """Check launch prerequisites and print the hand command without starting services."""
@@ -296,17 +300,24 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
         if not scene.is_file() or not mesh.is_file() or mesh.stat().st_size < 1000:
             errors.append("Atlas OmniHand MuJoCo assets are unavailable or still LFS pointers. Run: git lfs pull")
 
+    if config.hand_server_host is not None:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", config.hand_server_host):
+            errors.append("--hand-server-host must be an IPv4 address or hostname")
+        if config.hand_backend != "dex1" or config.sim:
+            errors.append("--hand-server-host requires physical --hand-backend dex1")
+
     if config.hand_backend == "dex1":
         from gear_sonic.end_effectors.backends.dex1 import USB_PORTS
 
         if config.sim:
             errors.append("DEX 1 currently supports physical USB grippers only; no DEX 1 MuJoCo scene is configured")
-        worker = repo_root / "build/dex1/dex1_worker"
-        if not os.access(worker, os.X_OK):
-            errors.append("DEX 1 worker missing. Run: bash install_scripts/install_dex1.sh")
-        for side, port in USB_PORTS.items():
-            if not os.access(port, os.R_OK | os.W_OK):
-                errors.append(f"DEX 1 {side} serial adapter unavailable or inaccessible: {port}")
+        if config.hand_server_host is None:
+            worker = repo_root / "build/dex1/dex1_worker"
+            if not os.access(worker, os.X_OK):
+                errors.append("DEX 1 worker missing. Run: bash install_scripts/install_dex1.sh")
+            for side, port in USB_PORTS.items():
+                if not os.access(port, os.R_OK | os.W_OK):
+                    errors.append(f"DEX 1 {side} serial adapter unavailable or inaccessible: {port}")
         if not math.isfinite(config.dex1_transition_duration) or not 1.35 <= config.dex1_transition_duration <= 30:
             errors.append("--dex1-transition-duration must be between 1.35 and 30 seconds")
 
@@ -400,6 +411,10 @@ def _switch_camera_source(config: DataCollectionLaunchConfig) -> None:
     )
 
 
+def _launch_local_hands(config: DataCollectionLaunchConfig) -> bool:
+    return config.hand_backend in {"omnihand", "dex1"} and config.hand_server_host is None
+
+
 def _hand_pane(config: DataCollectionLaunchConfig) -> int:
     """Return the OmniHand pane index for the selected launch configuration."""
     return CORE_PANE_COUNT + int(config.sim)
@@ -407,7 +422,7 @@ def _hand_pane(config: DataCollectionLaunchConfig) -> int:
 
 def _camera_server_log_pane(config: DataCollectionLaunchConfig) -> int:
     """Return the hardware camera log pane after optional sim/hand panes."""
-    return CORE_PANE_COUNT + int(config.sim) + int(config.hand_backend in {"omnihand", "dex1"})
+    return CORE_PANE_COUNT + int(config.sim) + int(_launch_local_hands(config))
 
 
 def _create_tmux_session(config: DataCollectionLaunchConfig):
@@ -438,7 +453,7 @@ def _create_tmux_session(config: DataCollectionLaunchConfig):
     pane_count = (
         CORE_PANE_COUNT
         + int(config.sim)
-        + int(config.hand_backend in {"omnihand", "dex1"})
+        + int(_launch_local_hands(config))
         + int(not config.sim and config.camera_server_logs)
     )
     for _ in range(1, pane_count):
@@ -519,7 +534,9 @@ def main(config: DataCollectionLaunchConfig):
     _check_prerequisites(config)
     if config.check_only:
         print("Launch prerequisites passed; no services started.")
-        if config.hand_backend in {"omnihand", "dex1"}:
+        if config.hand_server_host is not None:
+            print(f"Using existing hand server at {config.hand_server_host}:{config.hand_state_port}")
+        elif _launch_local_hands(config):
             print(_hand_worker_command(config)[1])
         return
 
@@ -533,6 +550,7 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Teleop input:    {config.pico_input_source}")
     print(f"  Body control:    {config.body_control_mode}")
     print(f"  Hand backend:    {config.hand_backend}")
+    print(f"  Hand server:     {config.hand_server_host or 'local (managed by launcher)'}")
     if config.deploy_checkpoint:
         print(f"  Checkpoint:      {config.deploy_checkpoint}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
@@ -650,8 +668,8 @@ def main(config: DataCollectionLaunchConfig):
     print("Starting teleop streamer (pane 1)...")
     _send_to_pane(1, pico_cmd, wait=2.0)
 
-    # --- Dedicated external hand controller pane ---
-    if config.hand_backend in {"omnihand", "dex1"}:
+    # --- Dedicated local hand controller pane; remote server is managed separately. ---
+    if _launch_local_hands(config):
         hand_pane = _hand_pane(config)
         hand_venv, hand_worker_cmd = _hand_worker_command(config)
         # The supervisor owns the restart command outside the native SDK
@@ -685,6 +703,7 @@ def main(config: DataCollectionLaunchConfig):
             f"--camera-port {config.camera_port} "
             f"--http-port {config.remote_ui_port} "
             f"--hand-state-port {config.hand_state_port} "
+            f"--hand-state-host {shlex.quote(config.hand_server_host or 'localhost')} "
             f"--hand-control-port {config.hand_control_port} "
             f"--teleop-control-port {config.teleop_control_port}"
         )
@@ -713,7 +732,8 @@ def main(config: DataCollectionLaunchConfig):
         f"--required-stream-mode {required_stream_mode} "
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port} "
-        f"--hand-state-port {config.hand_state_port}"
+        f"--hand-state-port {config.hand_state_port} "
+        f"--hand-state-host {shlex.quote(config.hand_server_host or 'localhost')}"
     )
     if config.dataset_name:
         exporter_cmd += f" --dataset-name '{config.dataset_name}'"
@@ -750,8 +770,10 @@ def main(config: DataCollectionLaunchConfig):
         print("    Pane 3: Camera Viewer")
     if config.sim:
         print(f"    Pane {SIM_PANE}: MuJoCo Simulator")
-    if config.hand_backend in {"omnihand", "dex1"}:
+    if _launch_local_hands(config):
         print(f"    Pane {_hand_pane(config)}: {config.hand_backend} controller")
+    elif config.hand_server_host is not None:
+        print(f"    Hands: existing service on {config.hand_server_host}")
     if not config.sim and config.camera_server_logs:
         print(
             f"    Pane {_camera_server_log_pane(config)}: "

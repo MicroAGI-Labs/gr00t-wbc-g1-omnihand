@@ -835,7 +835,8 @@ def _sha256(path: Path) -> str:
 
 
 def _capture_reproducibility_metadata(
-    robot_config: dict, dataset_frequency_hz: float, hand_profile: HandProfile | None = None
+    robot_config: dict, dataset_frequency_hz: float, hand_profile: HandProfile | None = None,
+    *, hand_state_host: str = "localhost",
 ) -> dict:
     """Resolve immutable controller artifacts and record their identities."""
     repo_root = Path(__file__).resolve().parents[2]
@@ -901,7 +902,18 @@ def _capture_reproducibility_metadata(
         "position_units": "m",
         "quaternion_order": "wxyz",
         "capture_timestamp_units": "ns",
-        "capture_monotonic_clock_scope": "single_linux_host",
+        "capture_monotonic_clock_scope": (
+            "single_linux_host" if hand_state_host in ("localhost", "127.0.0.1", "::1") else "per_host"
+        ),
+        "hand_state_host": hand_state_host,
+        "hand_capture_clock_domains": {
+            "hand_state_source_monotonic_ns": "hand_server",
+            "hand_state_publish_monotonic_ns": "hand_server",
+            "hand_intent_received_monotonic_ns": "hand_server",
+            "hand_intent_source_monotonic_ns": "teleop_host",
+            "hand_state_received_monotonic_ns": "recorder_host",
+        },
+        "hand_freshness_clock": "receiver_local_monotonic_and_server_reported_age",
         "dataset_frequency_hz": float(dataset_frequency_hz),
         "git": git,
         "artifacts": artifacts,
@@ -2543,7 +2555,8 @@ def main(config: SonicDataExporterConfig):
             "hand_profile": hand_profile.name,
             "hand_config": hand_config,
             "capture": _capture_reproducibility_metadata(
-                robot_config, config.data_collection_frequency, hand_profile
+                robot_config, config.data_collection_frequency, hand_profile,
+                hand_state_host=config.hand_state_host,
             ),
         },
         robot_type=dataset_robot_type(hand_profile),
