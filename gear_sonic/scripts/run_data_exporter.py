@@ -1384,8 +1384,9 @@ class GrootDataCollector:
 
     def _validate_recording_inputs(self) -> None:
         """Reject stale or malformed inputs before they enter an episode."""
-        if not _recording_mode_ready(
-            self.current_stream_mode, self.required_stream_mode
+        if (
+            not _recording_mode_ready(self.current_stream_mode, self.required_stream_mode)
+            and self.current_stream_mode != 3
         ):
             required_name = _RECORDING_STREAM_MODE_NAMES[self.required_stream_mode]
             raise RuntimeError(
