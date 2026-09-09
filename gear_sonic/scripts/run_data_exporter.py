@@ -21,7 +21,6 @@ Usage (from repo root):
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
 import hashlib
 import json
 import os
@@ -96,8 +95,8 @@ class SonicDataExporterConfig:
     """CLI config for the ROS-free Sonic data exporter."""
 
     # Dataset
-    dataset_name: str | None = None
-    """Dataset name (auto-generated if creating new)."""
+    dataset_name: str | None = "episode-dataset"
+    """Dataset name used when no explicit name is supplied."""
 
     task_prompt: str = DEFAULT_TASK_PROMPT
     """Language task prompt."""
@@ -2670,6 +2669,6 @@ if __name__ == "__main__":
     config = tyro.cli(SonicDataExporterConfig)
 
     if config.dataset_name is None:
-        config.dataset_name = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        config.dataset_name = "episode-dataset"
 
     main(config)

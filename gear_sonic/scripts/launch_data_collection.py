@@ -199,8 +199,8 @@ class DataCollectionLaunchConfig:
     task_prompt: str = DEFAULT_TASK_PROMPT
     """Language task prompt for the data exporter."""
 
-    dataset_name: str = ""
-    """Dataset name for the data exporter. Leave empty to auto-generate from timestamp."""
+    dataset_name: str = "episode-dataset"
+    """Dataset name for the data exporter."""
 
     data_exporter_frequency: int = 50
     """Data collection frequency (Hz) for the data exporter."""
