@@ -4,6 +4,7 @@ No hardware SDK needed — works with any UVC-compatible camera visible as
 ``/dev/video*``.  Only requires ``opencv-python``.
 """
 
+from dataclasses import dataclass
 import time
 from typing import Any
 
@@ -19,12 +20,20 @@ from gear_sonic.camera.sensor import Sensor
 from gear_sonic.camera.sensor_server import CameraMountPosition
 
 
+@dataclass
 class USBCameraConfig:
     """Configuration for generic USB camera."""
 
-    image_dim: tuple = (640, 480)
+    image_dim: tuple[int, int] = (640, 480)
     fps: int = 30
     device_index: int = 0
+    capture_dim: tuple[int, int] = (640, 480)
+    mjpeg: bool = False
+    buffer_size: int = 2
+
+    def __post_init__(self):
+        if self.fps <= 0 or min(*self.image_dim, *self.capture_dim) <= 0 or self.buffer_size < 2:
+            raise ValueError("USB camera requires positive FPS/dimensions and at least two capture buffers")
 
 
 class USBCameraSensor(Sensor):
@@ -34,21 +43,23 @@ class USBCameraSensor(Sensor):
         self,
         config: USBCameraConfig = USBCameraConfig(),
         mount_position: str = CameraMountPosition.EGO_VIEW.value,
-        device_index: int | None = None,
+        device_index: int | str | None = None,
     ):
         self.config = config
         self.mount_position = mount_position
 
         idx = device_index if device_index is not None else config.device_index
 
-        self.cap = cv2.VideoCapture(idx)
+        self.cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             raise RuntimeError(f"Failed to open USB camera at index {idx}")
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.image_dim[0])
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.image_dim[1])
+        if config.mjpeg:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.capture_dim[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.capture_dim[1])
         self.cap.set(cv2.CAP_PROP_FPS, config.fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, config.buffer_size)
 
         print(f"[{mount_position}] Warming up USB camera...")
         for _ in range(10):
@@ -69,9 +80,14 @@ class USBCameraSensor(Sensor):
             print(f"[{self.mount_position}] USB camera read failed: ret={ret}")
             return None
 
+        captured_at = time.time()
+        capture_monotonic_ns = time.monotonic_ns()
+        if frame.shape[1::-1] != self.config.image_dim:
+            frame = cv2.resize(frame, self.config.image_dim, interpolation=cv2.INTER_AREA)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         return {
-            "timestamps": {self.mount_position: time.time()},
+            "timestamps": {self.mount_position: captured_at},
+            "capture_monotonic_ns": {self.mount_position: capture_monotonic_ns},
             "images": {self.mount_position: frame_rgb},
         }
 

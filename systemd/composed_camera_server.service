@@ -66,6 +66,10 @@ ExecStart=${REPO_DIR}/.venv_camera/bin/python -m gear_sonic.camera.composed_came
 #     --zed-camera-resolution HD720 --zed-camera-fps 60 --fps 60 \
 #     --port 5555
 
+# Thor JR wrist pair (robot-left JR0001, robot-right JR0002):
+# append --wrist-camera-profile thor-jr to the ZED command above. This uses
+# stable /dev/v4l/by-id paths and configures MJPEG/1280x720 capture at 60 FPS.
+
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

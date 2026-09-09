@@ -118,6 +118,15 @@ python -m gear_sonic.camera.composed_camera \
     --left-wrist-camera oak --left-wrist-device-id <LEFT_WRIST_MXID> \
     --right-wrist-camera oak --right-wrist-device-id <RIGHT_WRIST_MXID> \
     --port 5555
+
+# Thor JR wrist pair: stable by-id mapping, MJPEG 1280x720 capture,
+# 640x480 output, and 60 FPS publication. Add --record-wrist-cameras to the
+# exporter command to include both streams in the LeRobot recording.
+python -m gear_sonic.camera.composed_camera \
+    --ego-view-camera zed --ego-view-device-id <YOUR_ZED_SERIAL> \
+    --wrist-camera-profile thor-jr \
+    --zed-camera-resolution HD720 --zed-camera-fps 60 --fps 60 \
+    --port 5555
 ```
 
 Run `python -m gear_sonic.camera.composed_camera --help` for all options including `--fps`, `--use-mjpeg`, and `--mjpeg-quality`.
