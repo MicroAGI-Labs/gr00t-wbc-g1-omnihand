@@ -688,15 +688,15 @@ def get_wrist_camera_features() -> dict:
 
 
 def get_zed_stereo_features() -> dict:
-    """Optional native-orientation ZED left/right RGB and float32 depth streams."""
+    """Optional native-orientation ZED RGB and camera-format depth video streams."""
     return {
         "observation.images.ego_view_left": {
             "dtype": "video", "shape": (EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH, 3),
             "names": ["height", "width", "channel"],
         },
-        "observation.depth.ego_view": {
-            "dtype": "float32", "shape": (EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH),
-            "names": ["height", "width"],
+        "observation.images.ego_view_depth": {
+            "dtype": "video", "shape": (EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH, 3),
+            "names": ["height", "width", "channel"],
         },
         "capture.ego_view_left_source_timestamp_ns": {
             "dtype": "int64", "shape": (1,), "names": ["timestamp_ns"],
@@ -709,7 +709,10 @@ def get_zed_stereo_features() -> dict:
 
 def get_zed_stereo_modality_config() -> dict:
     return {
-        "video": {"ego_view_left": {"original_key": "observation.images.ego_view_left"}},
+        "video": {
+            "ego_view_left": {"original_key": "observation.images.ego_view_left"},
+            "ego_view_depth": {"original_key": "observation.images.ego_view_depth"},
+        },
     }
 
 

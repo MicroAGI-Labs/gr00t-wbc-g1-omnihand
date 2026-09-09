@@ -75,6 +75,17 @@ from gear_sonic.utils.data_collection.zmq_state_subscriber import (
     poll_robot_config_zmq,
 )
 
+DEPTH_VIDEO_FEATURE = "observation.images.ego_view_depth"
+DEPTH_VIDEO_MAX_METERS = 10.0
+
+
+def _depth_to_video_frame(depth: np.ndarray) -> np.ndarray:
+    """Convert metric ZED depth to the same uint8 RGB video format as cameras."""
+    values = np.asarray(depth, dtype=np.float32)
+    values = np.nan_to_num(values, nan=0.0, posinf=DEPTH_VIDEO_MAX_METERS, neginf=0.0)
+    encoded = np.clip(values / DEPTH_VIDEO_MAX_METERS * 255.0, 0.0, 255.0).astype(np.uint8)
+    return np.repeat(encoded[..., None], 3, axis=2)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -127,7 +138,7 @@ class SonicDataExporterConfig:
     """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
 
     record_zed_stereo: bool = False
-    """Record native-orientation ZED left RGB, right RGB ego view, and float32 depth."""
+    """Record native-orientation ZED left RGB, right RGB ego view, and depth video."""
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
@@ -1887,7 +1898,7 @@ class GrootDataCollector:
         message = self.latest_image_msg or {}
         received = message.get("camera_received_monotonic_ns", {})
         for feature_name, feature in self.data_exporter.features.items():
-            is_depth = feature_name.startswith("observation.depth.")
+            is_depth = feature_name == DEPTH_VIDEO_FEATURE
             if feature.get("dtype") not in ("image", "video") and not is_depth:
                 continue
             name = feature_name.split(".")[-1]
@@ -1896,7 +1907,8 @@ class GrootDataCollector:
             image = source.get(source_name)
             if image is None:
                 raise RuntimeError(f"required camera {name} is unavailable")
-            if tuple(image.shape) != tuple(feature["shape"]):
+            image_shape = _depth_to_video_frame(image).shape if is_depth else image.shape
+            if tuple(image_shape) != tuple(feature["shape"]):
                 raise RuntimeError(f"camera {name} shape {image.shape} does not match {feature['shape']}")
             timestamp_key = f"capture.{source_name}_source_timestamp_ns"
             if timestamp_key in self.data_exporter.features:
@@ -1912,11 +1924,11 @@ class GrootDataCollector:
         images = self.latest_image_msg["images"]
         depths = self.latest_image_msg.get("depths", {})
         for feature_name, feature_info in self.data_exporter.features.items():
-            if feature_name.startswith("observation.depth."):
+            if feature_name == DEPTH_VIDEO_FEATURE:
                 source_name = "ego_view_depth"
                 if source_name not in depths:
                     raise ValueError(f"Required depth '{source_name}' not found in camera message")
-                frame_data[feature_name] = depths[source_name]
+                frame_data[feature_name] = _depth_to_video_frame(depths[source_name])
                 timestamp_key = f"capture.{source_name}_source_timestamp_ns"
                 if timestamp_key in self.data_exporter.features:
                     frame_data[timestamp_key] = np.asarray(
@@ -2606,6 +2618,10 @@ def main(config: SonicDataExporterConfig):
         script_config={
             **robot_config,
             "record_wrist_cameras": config.record_wrist_cameras,
+            "depth_video_encoding": (
+                {"format": "uint8_rgb", "min_m": 0.0, "max_m": DEPTH_VIDEO_MAX_METERS}
+                if config.record_zed_stereo else None
+            ),
             "hand_profile": hand_profile.name,
             "hand_config": hand_config,
             "capture": _capture_reproducibility_metadata(
