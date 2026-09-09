@@ -2131,6 +2131,13 @@ class PlannerStreamer:
         # offsets are defined from encoder feedback; substituting the planner's
         # motion target prevents the headset pose from tracking correctly.
         self.three_point.reset_with_measured_q(measured_q)
+        # Capture calibration from the same Pico frame that triggered the
+        # transition. Waiting for the next frame lets releasing A+X move the
+        # headset pose before the first VR command is generated.
+        sample = self.reader.get_latest()
+        if sample is not None:
+            self.three_point.process_smpl_pose(sample["body_poses_np"])
+            print("[PlannerLoop] VR 3PT calibration captured from transition frame")
         print("[PlannerLoop] VR 3PT recalibration scheduled with measured robot pose")
         return True
 
