@@ -2112,15 +2112,10 @@ class PlannerStreamer:
         if measured_q is None or np.asarray(measured_q).shape != (29,):
             print("[PlannerLoop] Cannot enter VR 3PT without complete 29-DOF feedback")
             return False
-        # Keep the robot's measured waist, but preserve the arm reference that
-        # was actually commanded during the base-pose transition. Recalibrating
-        # the arms to encoder feedback here creates a visible step when the
-        # second A+X enters VR teleoperation.
-        calibration_q = measured_q.copy()
-        commanded = self.commanded_transition_start()
-        if commanded is not None:
-            calibration_q[self.feedback_reader.upper_body_joint_indices] = commanded
-        self.three_point.reset_with_measured_q(calibration_q)
+        # VR calibration must use the actual measured pose. The VR solver's
+        # offsets are defined from encoder feedback; substituting the planner's
+        # motion target prevents the headset pose from tracking correctly.
+        self.three_point.reset_with_measured_q(measured_q)
         print("[PlannerLoop] VR 3PT recalibration scheduled with measured robot pose")
         return True
 

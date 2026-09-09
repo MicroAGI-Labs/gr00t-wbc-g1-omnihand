@@ -117,11 +117,7 @@ def test_vr_calibration_still_uses_measured_joints(streamer):
     captured = []
     streamer.three_point = SimpleNamespace(reset_with_measured_q=captured.append)
     assert streamer.recalibrate_for_vr3pt()
-    expected = streamer.feedback_reader.full_body_q_measured.copy()
-    expected[streamer.feedback_reader.upper_body_joint_indices] = (
-        streamer.feedback_reader.upper_body_planner_target
-    )
-    np.testing.assert_array_equal(captured[0], expected)
+    np.testing.assert_array_equal(captured[0], streamer.feedback_reader.full_body_q_measured)
 
 
 def test_vr_exit_uses_measured_pose_when_motion_target_is_unrelated(streamer):
