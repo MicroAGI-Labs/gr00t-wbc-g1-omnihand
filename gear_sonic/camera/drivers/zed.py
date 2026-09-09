@@ -4,13 +4,13 @@ The ZED SDK and its Python API are system dependencies and are intentionally
 loaded lazily. Install the SDK on the camera host, then install ``pyzed`` into
 the camera virtual environment with ``/usr/local/zed/get_python_api.py``.
 
-This first integration exposes the rectified left RGB image only. Depth needs
+This integration exposes one selected rectified RGB image. Depth needs
 its own lossless wire format and is deliberately kept out of the JPEG pipeline.
 """
 
 from dataclasses import dataclass
 import time
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -41,6 +41,7 @@ class ZEDConfig:
     image_dim: tuple[int, int] = (640, 480)
     camera_resolution: str = "HD720"
     camera_fps: int = 60
+    view: Literal["left", "right"] = "left"
 
     def __post_init__(self):
         if len(self.image_dim) != 2 or min(self.image_dim) <= 0:
@@ -49,10 +50,12 @@ class ZEDConfig:
             raise ValueError("camera_resolution must not be empty")
         if self.camera_fps <= 0:
             raise ValueError(f"camera_fps must be positive, got {self.camera_fps}")
+        if self.view not in {"left", "right"}:
+            raise ValueError(f"view must be left or right, got {self.view!r}")
 
 
 class ZEDSensor(Sensor):
-    """Rectified left-RGB stream from a Stereolabs ZED camera."""
+    """Selected rectified RGB stream from a Stereolabs ZED camera."""
 
     def __init__(
         self,
@@ -133,7 +136,7 @@ class ZEDSensor(Sensor):
 
         retrieve_status = self._camera.retrieve_image(
             self._image,
-            self._sl.VIEW.LEFT,
+            getattr(self._sl.VIEW, self.config.view.upper()),
             self._sl.MEM.CPU,
             self._output_resolution,
         )
