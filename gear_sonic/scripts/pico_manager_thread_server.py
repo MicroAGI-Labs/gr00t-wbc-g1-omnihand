@@ -2614,6 +2614,26 @@ def run_pico_manager(
                     "[Manager] Teleop frames lost; suspending teleop input. "
                     "SONIC remains running."
                 )
+                # A disconnect must use the same controlled VR return as B+Y.
+                # Sending OFF immediately would make the C++ side fall back to
+                # its base pose and visibly snap the arms.
+                disconnect_transition = None
+                if (
+                    teleop_stream_mode == StreamMode.PLANNER_VR_3PT
+                    and current_mode == StreamMode.PLANNER_VR_3PT
+                ):
+                    disconnect_transition = planner_streamer.begin_vr_return(
+                        to_base=True, duration_s=idle_base_transition_duration
+                    )
+                if isinstance(disconnect_transition, VRPoseTransition):
+                    print("[Manager] Completing two-second VR return before disconnect hold")
+                    while True:
+                        _sent, complete = planner_streamer.send_vr_return_sample(
+                            disconnect_transition, time.monotonic()
+                        )
+                        if complete:
+                            break
+                        time.sleep(1.0 / max(target_fps, 1))
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
                 current_mode = StreamMode.OFF
