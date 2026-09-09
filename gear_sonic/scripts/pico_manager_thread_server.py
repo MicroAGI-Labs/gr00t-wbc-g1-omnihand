@@ -2468,7 +2468,7 @@ def run_pico_manager(
     """
     Manager: publishes body and latest-only hand intent from one fixed-rate loop.
     Controller input:
-      A+X: Save while recording; otherwise twice within 2s advances toward teleop
+      A+X: Twice within 2s advances toward teleop; X+B saves a recording
       A+B+X+Y: Start the policy from OFF
       B+Y: Step back from teleop to base pose, then from base pose to idle
       X+B: Start/stop-success recording
@@ -2581,8 +2581,7 @@ def run_pico_manager(
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
     print(
-        f"Manager controls: A+X=save while recording; otherwise twice within 2s="
-        f"advance toward {teleop_mode.upper()} teleop, B+Y=step back toward idle, "
+        f"Manager controls: twice within 2s A+X=advance toward {teleop_mode.upper()} teleop, "
         "X+B=record/save, Y+A=only discard, "
         f"A+B+X+Y=start policy (start-only); initial gait={initial_mode.name}"
     )
@@ -2735,10 +2734,10 @@ def run_pico_manager(
             )
             start_combo = bool(a_pressed) and bool(b_pressed) and bool(x_pressed) and bool(y_pressed)
 
-            # During recording, a completed A+X is reserved for save. Otherwise,
-            # two completed A+X gestures advance one step toward teleoperation.
+            # During recording, A+X navigates from base back into teleoperation.
             ax_pressed = False
-            if face_command == "ax" and not recorder_is_recording:
+            ax_navigation = recorder_is_recording and current_mode == StreamMode.PLANNER_IDLE_BASE_POSE
+            if face_command == "ax" and (not recorder_is_recording or ax_navigation):
                 ax_pressed = ax_double_press.register()
                 if not ax_pressed:
                     print(
@@ -2746,9 +2745,10 @@ def run_pico_manager(
                         "to advance toward teleop"
                     )
 
-            # Mode changes are disabled while recording. This makes Y+A the
-            # only gesture that can discard a take.
-            by_pressed = face_command == "by" and not recorder_is_recording
+            # B+Y returns from teleoperation to base without stopping a take.
+            by_pressed = face_command == "by" and (
+                not recorder_is_recording or current_mode == StreamMode.PLANNER_VR_3PT
+            )
 
             new_mode = current_mode
             requested_transition: StreamMode | None = None
@@ -2845,7 +2845,11 @@ def run_pico_manager(
                 if by_pressed and not prev_by_pressed:
                     requested_transition = StreamMode.PLANNER_IDLE_BASE_POSE
 
-            if recorder_is_recording and (
+            recording_navigation = recorder_is_recording and (
+                (face_command == "by" and current_mode == StreamMode.PLANNER_VR_3PT)
+                or (face_command == "ax" and current_mode == StreamMode.PLANNER_IDLE_BASE_POSE)
+            )
+            if recorder_is_recording and not recording_navigation and (
                 new_mode != current_mode or requested_transition is not None
             ):
                 attempted_mode = requested_transition or new_mode
@@ -2985,7 +2989,7 @@ def run_pico_manager(
 
             # Mode-independent: send manager_state for data exporter
             recording_action = recording_face_action(
-                face_command,
+                None if recording_navigation else face_command,
                 recorder_is_recording=recorder_is_recording,
                 recording_mode_ready=(
                     upper_body_transition is None

@@ -424,6 +424,10 @@ relative to the new calibration. Measured joint tracking error does not change
 the calibration reference. In `ik-upper`, interpolation uses the last sent arm
 override and calibration continues to use measured joints.
 
+During recording, **B+Y** and then double **A+X** can be used to leave VR for the
+base pose and re-enter VR. These navigation gestures leave the episode open;
+use **X+B** to save it.
+
 Fresh 29-DOF robot feedback is required before an interpolation or calibration.
 If it is unavailable, the manager stays in its current stable state instead of
 issuing a fallback pose. The legacy `full-smpl` configuration retains its direct
