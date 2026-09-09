@@ -2636,7 +2636,10 @@ def run_pico_manager(
                 disconnect_transition = None
                 if (
                     teleop_stream_mode == StreamMode.PLANNER_VR_3PT
-                    and current_mode == StreamMode.PLANNER_VR_3PT
+                    and current_mode in {
+                        StreamMode.PLANNER,
+                        StreamMode.PLANNER_VR_3PT,
+                    }
                 ):
                     disconnect_transition = planner_streamer.begin_vr_return(
                         to_base=True, duration_s=idle_base_transition_duration
@@ -2659,15 +2662,17 @@ def run_pico_manager(
                 planner_streamer.held_vr_pose = None
                 planner_streamer.first_vr_pose = None
 
-                # OFF is local manager state only. Never send stop=True from the
-                # headset process: SONIC lifetime is owned by the operator UI or
-                # direct process termination (for example Ctrl-C).
+                # Keep the downstream controller in its explicit base-pose mode
+                # while input is disconnected. Sending OFF here would hand
+                # control to a hard-coded fallback and can cause an abrupt arm
+                # jump. SONIC lifetime is owned by the operator UI or direct
+                # process termination, not by this headset process.
                 for _ in range(3):
                     socket.send(
                         pack_pose_message(
                             {
                                 "stream_mode": np.array(
-                                    [StreamMode.OFF.value], dtype=np.int32
+                                    [StreamMode.PLANNER_IDLE_BASE_POSE.value], dtype=np.int32
                                 ),
                                 "toggle_data_collection": np.array([False], dtype=bool),
                                 "toggle_data_abort": np.array([False], dtype=bool),
