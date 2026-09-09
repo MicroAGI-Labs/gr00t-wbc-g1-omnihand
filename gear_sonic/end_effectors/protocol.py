@@ -17,6 +17,9 @@ HAND_STATE_SCHEMA = "sonic.hand_state.v1"
 HAND_SIM_FEEDBACK_SCHEMA = "sonic.hand_sim_feedback.v1"
 HAND_CONTROL_TOPIC = b"hand_control"
 HAND_CONTROL_SCHEMA = "sonic.hand_control.v1"
+DEFAULT_HAND_INTENT_PORT = 5569
+DEFAULT_HAND_STATE_PORT = 5570
+DEFAULT_HAND_CONTROL_PORT = 5572
 
 
 class HandProtocolError(ValueError):
