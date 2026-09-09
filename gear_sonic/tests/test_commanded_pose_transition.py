@@ -19,6 +19,7 @@ def streamer(monkeypatch):
     reference = np.linspace(-0.4, 0.4, 17)
     instance.feedback_reader = SimpleNamespace(
         upper_body_planner_target=reference.copy(),
+        upper_body_last_action=reference + 0.25,
         upper_body_position_target=reference + 0.15,
         full_body_q_measured=np.linspace(-0.5, 0.5, 29),
         upper_body_joint_indices=[12, 13, 14, 15, 22, 16, 23, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28],
@@ -126,3 +127,8 @@ def test_vr_exit_uses_measured_pose_when_motion_target_is_unrelated(streamer):
     # The two references intentionally differ, as they do while VR owns arms.
     assert not np.array_equal(measured, motion_target)
     np.testing.assert_array_equal(measured, streamer.feedback_reader.upper_body_position_target)
+
+
+def test_vr_handoff_uses_robot_side_last_action(streamer):
+    expected = streamer.feedback_reader.upper_body_last_action
+    np.testing.assert_array_equal(streamer.effective_vr_transition_start(), expected)

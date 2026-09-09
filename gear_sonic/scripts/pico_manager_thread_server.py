@@ -1936,6 +1936,7 @@ class FeedbackReader:
 
         self.upper_body_position_target = None
         self.upper_body_planner_target = None
+        self.upper_body_last_action: np.ndarray | None = None
         self.left_hand_position_target = None
         self.right_hand_position_target = None
         # Full body joint configuration (29 DOFs) as measured from robot,
@@ -1951,13 +1952,14 @@ class FeedbackReader:
 
     def poll_feedback(self, *, retain_last: bool = False) -> bool:
         """Poll once and report whether a complete body sample was received."""
-        upper_body, planner_target, left_hand, right_hand, full_body = (
+        upper_body, planner_target, last_action, left_hand, right_hand, full_body = (
             self._process_upper_body_position_targets()
         )
         if full_body is None and retain_last:
             return False
         self.upper_body_position_target = upper_body
         self.upper_body_planner_target = planner_target
+        self.upper_body_last_action = last_action
         self.left_hand_position_target = left_hand
         self.right_hand_position_target = right_hand
         self.full_body_q_measured = full_body
@@ -1976,12 +1978,13 @@ class FeedbackReader:
         np.ndarray | None,
         np.ndarray | None,
         np.ndarray | None,
+        np.ndarray | None,
     ]:
         data = self.poller.get_data()
 
         if data is None:
             print("[PlannerLoop] No feedback data received")
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
         unpacked = msgpack.unpackb(data, raw=False)
         full_body_q = None
@@ -2008,6 +2011,12 @@ class FeedbackReader:
             print("[PlannerLoop] body_q_target not in feedback data")
             planner_target = None
 
+        last_action = None
+        if "last_action" in unpacked:
+            candidate = np.asarray(unpacked["last_action"], dtype=np.float64)
+            if candidate.shape == (29,) and np.all(np.isfinite(candidate)):
+                last_action = candidate[self.upper_body_joint_indices]
+
         if "left_hand_q_measured" in unpacked:
             left_hand_q = unpacked["left_hand_q_measured"]
         else:
@@ -2020,7 +2029,7 @@ class FeedbackReader:
             print("[PlannerLoop] right_hand_q_measured not in feedback data")
             right_hand_q = None
 
-        return body_q, planner_target, left_hand_q, right_hand_q, full_body_q
+        return body_q, planner_target, last_action, left_hand_q, right_hand_q, full_body_q
 
 
 class PlannerStreamer:
@@ -2130,6 +2139,15 @@ class PlannerStreamer:
             override, mask = self.last_upper_body_override
             position[mask] = override[mask]
         return position
+
+    def effective_vr_transition_start(self) -> np.ndarray | None:
+        """Return the latest arm target after the robot-side VR/policy solve."""
+        if not self.poll_fresh_feedback():
+            return None
+        target = self.feedback_reader.upper_body_last_action
+        if target is None:
+            return None
+        return np.asarray(target, dtype=np.float64).copy()
 
     def prepare_ik_upper_body(self) -> bool:
         """Seed calibrated arm IK from fresh measured robot feedback."""
@@ -2733,10 +2751,12 @@ def run_pico_manager(
                     # Use the current encoder pose when leaving those modes;
                     # using the underlying motion target can jump the arms
                     # toward the legs before the interpolation begins.
-                    transition_start = np.asarray(
-                        planner_streamer.feedback_reader.upper_body_position_target,
-                        dtype=np.float64,
-                    ).copy()
+                    transition_start = planner_streamer.effective_vr_transition_start()
+                    if transition_start is None:
+                        transition_start = np.asarray(
+                            planner_streamer.feedback_reader.upper_body_position_target,
+                            dtype=np.float64,
+                        ).copy()
                 else:
                     transition_start = planner_streamer.commanded_transition_start()
                 if transition_start is not None:
