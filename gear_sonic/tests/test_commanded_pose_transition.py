@@ -29,7 +29,7 @@ def streamer(monkeypatch):
         right_hand_position_target=None,
     )
     instance.last_upper_body_override = None
-    instance.reader = SimpleNamespace(get_timestamp_ns=lambda: 123)
+    instance.reader = SimpleNamespace(get_timestamp_ns=lambda: 123, get_latest=lambda: None)
     instance.last_xrt_timestamp = None
     instance.dt = 0.02
     instance.mode = manager.LocomotionMode.IDLE

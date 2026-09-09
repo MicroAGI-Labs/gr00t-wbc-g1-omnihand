@@ -2830,7 +2830,10 @@ def run_pico_manager(
             if upper_body_transition is not None:
                 transition_sample = upper_body_transition.sample(time.monotonic())
                 planner_sent = planner_streamer.run_once(
-                    StreamMode.PLANNER,
+                    # Keep VR3PT ownership active while blending the base
+                    # target; switching to plain planner mode causes a
+                    # controller reset and an arm snap.
+                    StreamMode.PLANNER_VR_3PT,
                     upper_body_override=(
                         transition_sample.position,
                         transition_sample.velocity,
@@ -2843,10 +2846,22 @@ def run_pico_manager(
             elif new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
             elif new_mode in PLANNER_STREAM_MODES:
-                planner_sent = planner_streamer.run_once(
-                    new_mode,
-                    face_command=face_command,
-                )
+                if new_mode == StreamMode.PLANNER_IDLE_BASE_POSE:
+                    planner_sent = planner_streamer.run_once(
+                        StreamMode.PLANNER_VR_3PT,
+                        face_command=face_command,
+                        upper_body_override=(
+                            IDLE_BASE_UPPER_BODY_RAD.copy(),
+                            np.zeros(UPPER_BODY_WIDTH, dtype=np.float64),
+                            IDLE_BASE_UPPER_BODY_MASK,
+                        ),
+                        force_locomotion_idle=True,
+                    )
+                else:
+                    planner_sent = planner_streamer.run_once(
+                        new_mode,
+                        face_command=face_command,
+                    )
                 planner_report_count += int(planner_sent)
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
