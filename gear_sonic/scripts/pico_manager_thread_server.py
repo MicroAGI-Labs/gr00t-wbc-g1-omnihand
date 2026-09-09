@@ -2978,7 +2978,6 @@ def run_pico_manager(
                         new_mode,
                         face_command=face_command,
                         vr_pose_override=planner_streamer.held_vr_pose,
-                        force_locomotion_idle=True,
                     )
                 else:
                     planner_sent = planner_streamer.run_once(
