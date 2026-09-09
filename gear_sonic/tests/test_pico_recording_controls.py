@@ -14,7 +14,7 @@ from gear_sonic.scripts.run_data_exporter import unpack_pose_message
 
 @pytest.fixture
 def run_manager(monkeypatch):
-    def run(steps, *, calibration_results=None):
+    def run(steps, *, calibration_results=None, transition_results=None, teleop_mode="pose", planner_sent=None):
         steps = iter(steps)
         statuses = deque()
         frame = {}
@@ -33,6 +33,13 @@ def run_manager(monkeypatch):
             monkeypatch.setattr(manager, name, Mock())
         if calibration_results is not None:
             manager.PlannerStreamer.return_value.recalibrate_for_vr3pt.side_effect = calibration_results
+        planner = manager.PlannerStreamer.return_value
+        planner.feedback_reader.upper_body_position_target = np.zeros(17)
+        planner.feedback_reader.upper_body_planner_target = np.full(17, 0.1)
+        if transition_results is not None:
+            planner.poll_fresh_feedback.side_effect = transition_results
+        if planner_sent is not None:
+            planner.run_once.side_effect = planner_sent
         monkeypatch.setattr(manager, "get_controller_inputs", lambda _: (frame.get("pause", False), 0, 0, 0, 0))
         monkeypatch.setattr(manager, "get_axis_clicks", lambda _: (frame.get("stick", False), False))
 
@@ -49,12 +56,13 @@ def run_manager(monkeypatch):
             return tuple(key in frame.get("buttons", "") for key in "abxy")
 
         monkeypatch.setattr(manager, "get_abxy_buttons", buttons)
-        manager.run_pico_manager(input_source="isaac")
+        manager.run_pico_manager(input_source="isaac", teleop_mode=teleop_mode)
         payloads = [call.args[0] for call in pub.send.call_args_list]
         states = [unpack_pose_message(raw, topic="manager_state")
                   for raw in payloads if raw.startswith(b"manager_state")]
         holds = [call.kwargs["hold"] for call in manager.HandIntentStream.return_value.publish.call_args_list]
-        assert holds == [state["stream_mode"].item() in {0, 4} for state in states]
+        if teleop_mode == "pose":
+            assert holds == [state["stream_mode"].item() in {0, 4} for state in states]
         commands = [raw for raw in payloads if raw.startswith(b"command")]
         return states, commands
     return run
@@ -267,3 +275,125 @@ def test_policy_stop_still_works_after_rejected_vr3pt_switch(run_manager):
     ], calibration_results=[False])
     assert states[-1]["stream_mode"].item() == 0
     assert commands[-1] == manager.build_command_message(start=False, stop=True, planner=True)
+
+
+def alignment_steps():
+    return enter_mode(2) + [{"buttons": "ax"}, {}, {"buttons": "ax"}, {}, {"now": 12.0}]
+
+
+def test_staged_vr3pt_alignment_and_return_hold_hands(run_manager):
+    steps = alignment_steps() + [
+        {"buttons": "ax", "now": 12.1}, {"now": 12.2},
+        {"buttons": "ax", "now": 12.3}, {"now": 12.4},  # calibrate/VR3PT
+        {"buttons": "by", "now": 12.5}, {"now": 12.6}, {"now": 14.6},  # align
+        {"buttons": "by", "now": 14.7}, {"now": 14.8}, {"now": 16.8},  # planner
+    ]
+    states, _ = run_manager(steps, teleop_mode="vr3pt")
+    modes = [s["stream_mode"].item() for s in states]
+    assert [modes[i] for i in range(len(modes)) if i == 0 or modes[i] != modes[i-1]] == [2, 3, 5, 3, 2]
+    planner = manager.PlannerStreamer.return_value
+    planner.recalibrate_for_vr3pt.assert_called_once()
+    requests = [c.kwargs["require_planner_target"] for c in planner.poll_fresh_feedback.call_args_list]
+    assert requests == [False, False, True]
+    overrides = [c.kwargs["upper_body_override"] for c in planner.run_once.call_args_list
+                 if "upper_body_override" in c.kwargs]
+    np.testing.assert_allclose(overrides[0][0], 0.0)
+    np.testing.assert_allclose(overrides[-1][0], 0.1)
+    np.testing.assert_allclose(overrides[-1][1], 0.0)
+    holds = [c.kwargs["hold"] for c in manager.HandIntentStream.return_value.publish.call_args_list]
+    assert all(holds[:modes.index(5)])
+    assert holds[modes.index(5)] is False
+    assert all(holds[-3:])
+
+
+@pytest.mark.parametrize("interrupt", ["stop", "disconnect"])
+def test_alignment_can_be_interrupted_by_policy_stop_or_tracking_loss(run_manager, interrupt):
+    steps = alignment_steps()[:-1] + [
+        {"buttons": "abxy"} if interrupt == "stop" else {"disconnect": True}, {},
+    ]
+    states, commands = run_manager(steps, teleop_mode="vr3pt")
+    assert states[-1]["stream_mode"].item() == 0
+    assert commands[-1] == manager.build_command_message(start=False, stop=True, planner=True)
+
+
+def test_alignment_needs_fresh_feedback_and_blocks_new_recordings(run_manager):
+    states, _ = run_manager(alignment_steps(), teleop_mode="vr3pt", transition_results=[False])
+    assert all(s["stream_mode"].item() == 2 for s in states)
+    states, _ = run_manager(alignment_steps()[:-1] + [{"buttons": "xb"}, {}], teleop_mode="vr3pt")
+    assert not any(s["toggle_data_collection"].item() for s in states)
+
+
+def test_recording_vr3pt_keeps_mode_and_single_ax_saves(run_manager):
+    steps = alignment_steps() + [
+        {"buttons": "ax", "now": 12.1}, {"now": 12.2},
+        {"buttons": "ax", "now": 12.3}, {"now": 12.4},
+        {"recording": True, "buttons": "by"}, {}, {"buttons": "ax"}, {},
+    ]
+    states, _ = run_manager(steps, teleop_mode="vr3pt")
+    assert [s["stream_mode"].item() for s in states[-4:]] == [5] * 4
+    assert states[-1]["toggle_data_collection"].item()
+    assert not any(s["toggle_data_abort"].item() for s in states)
+
+
+def test_transition_does_not_complete_on_unsent_final_sample(run_manager):
+    steps = alignment_steps() + [{"now": 12.1}]
+    sent = [True] * (len(steps)-2) + [False, True]
+    states, _ = run_manager(steps, teleop_mode="vr3pt", planner_sent=sent)
+    assert states[-1]["stream_mode"].item() == 2
+    last = manager.PlannerStreamer.return_value.run_once.call_args.kwargs["upper_body_override"]
+    assert np.max(np.abs(last[0])) < 0.001
+
+
+@pytest.mark.parametrize("target", [None, [0.0]*28, [float("nan")]*29, ["bad"]*29])
+def test_return_to_planner_requires_valid_target_in_new_feedback(calibration, target):
+    streamer, packets, _ = calibration
+    packet = msgpack.packb({"body_q_measured": [0.0]*29, "body_q_target": target})
+    packets.append((0.02, packet))
+    assert not streamer.poll_fresh_feedback(require_planner_target=True)
+    streamer.three_point.reset_with_measured_q.assert_not_called()
+
+
+def test_planner_emits_smooth_arm_only_targets_and_ignores_sticks(monkeypatch):
+    from gear_sonic.utils.teleop.pose_transition import (
+        IDLE_BASE_UPPER_BODY_MASK,
+        IDLE_BASE_UPPER_BODY_RAD,
+        JointPoseTransition,
+    )
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(manager, "time", SimpleNamespace(time=lambda: clock.now, sleep=lambda _: None))
+    monkeypatch.setattr(manager, "init_hand_ik_solvers", lambda: (None, None))
+    monkeypatch.setattr(manager, "ZMQPoller", Mock())
+    monkeypatch.setattr(manager, "get_controller_axes", lambda _: (1.0, 1.0, 1.0, 1.0))
+    socket, reader = Mock(), Mock()
+    reader.get_timestamp_ns.side_effect = [1, 2, 3, 3]
+    planner = manager.PlannerStreamer(socket, reader, Mock(), poll_hz=50)
+    transition = JointPoseTransition(np.zeros(17), IDLE_BASE_UPPER_BODY_RAD, started_at=0.0, duration_s=2.0)
+    for now in (0.0, 1.0, 2.0):
+        clock.now = now
+        sample = transition.sample(now)
+        assert planner.run_once(manager.StreamMode.PLANNER, upper_body_override=(sample.position, sample.velocity))
+    messages = [unpack_pose_message(c.args[0], topic="planner") for c in socket.send.call_args_list]
+    for message in messages:
+        np.testing.assert_array_equal(message["upper_body_mask"], IDLE_BASE_UPPER_BODY_MASK)
+        np.testing.assert_array_equal(message["movement"], 0.0)
+        np.testing.assert_array_equal(message["facing"], [1.0, 0.0, 0.0])
+        assert message["mode"].item() == manager.LocomotionMode.IDLE.value
+    np.testing.assert_allclose(messages[0]["upper_body_position"], 0.0)
+    np.testing.assert_allclose(messages[1]["upper_body_position"], IDLE_BASE_UPPER_BODY_RAD / 2, atol=1e-7)
+    np.testing.assert_allclose(messages[2]["upper_body_position"], IDLE_BASE_UPPER_BODY_RAD, atol=1e-7)
+    np.testing.assert_allclose(messages[0]["upper_body_velocity"], 0.0)
+    np.testing.assert_allclose(messages[2]["upper_body_velocity"], 0.0)
+    assert not planner.run_once(manager.StreamMode.PLANNER, upper_body_override=(sample.position, sample.velocity))
+    assert socket.send.call_count == 3
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"upper_body_mask": [True]*17},
+    {"upper_body_position": [0.0]*16},
+    {"upper_body_velocity": [0.0]*16},
+    {"upper_body_position": [0.0]*17, "upper_body_mask": [True]*16},
+])
+def test_rejects_incomplete_arm_override_messages(kwargs):
+    with pytest.raises(ValueError):
+        manager.build_planner_message(0, [0, 0, 0], [0, 1, 0], **kwargs)

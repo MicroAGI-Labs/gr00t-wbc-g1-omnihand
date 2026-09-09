@@ -201,6 +201,7 @@ class G1Deploy {
     bool has_upper_body_data_ = false;
     std::array<double, 17> upper_body_joint_positions_buffer_;
     std::array<double, 17> upper_body_joint_velocities_buffer_;
+    std::array<bool, 17> upper_body_joint_mask_buffer_;
     std::vector<double> token_state_data_;  // Token buffer (size from config)
     
     // =========================================================================
@@ -784,7 +785,9 @@ class G1Deploy {
               current_motion_joint_pos[i] = motion_joint_pos[i];
             }
             for (size_t i = 0; i < 17; i++) {
-              current_motion_joint_pos[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_positions_buffer_[i];
+              if (upper_body_joint_mask_buffer_[i]) {
+                current_motion_joint_pos[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_positions_buffer_[i];
+              }
             }
             std::copy(
               current_motion_joint_pos.begin(),
@@ -861,7 +864,9 @@ class G1Deploy {
                 current_motion_joint_vel[i] = motion_joint_vel[i];
               }
               for (size_t i = 0; i < 17; i++) {
-                current_motion_joint_vel[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_velocities_buffer_[i];
+                if (upper_body_joint_mask_buffer_[i]) {
+                  current_motion_joint_vel[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_velocities_buffer_[i];
+                }
               }
               std::copy(
                 current_motion_joint_vel.begin(),
@@ -2989,6 +2994,7 @@ class G1Deploy {
       std::tie(has_right_hand_data_, right_hand_joint_buffer_) = input_interface_->GetHandPose(false);
       std::tie(has_upper_body_data_, upper_body_joint_positions_buffer_) = input_interface_->GetUpperBodyJointPositions();
       std::tie(std::ignore, upper_body_joint_velocities_buffer_) = input_interface_->GetUpperBodyJointVelocities();
+      upper_body_joint_mask_buffer_ = input_interface_->GetUpperBodyJointMask();
 
       auto last_update_time = input_interface_->GetLastUpdateTime();
       if (last_update_time.has_value()) {

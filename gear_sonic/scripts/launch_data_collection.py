@@ -139,6 +139,9 @@ class DataCollectionLaunchConfig:
     pico_input_source: str = "xrt"
     """Teleop input source for pico_manager_thread_server.py (xrt or isaac-teleop)."""
 
+    teleop_mode: Literal["pose", "vr3pt"] = "pose"
+    """VR3PT uses staged arm alignment; pose keeps the full-body controls."""
+
     pico_vis_vr3pt: bool = False
     """Enable VR 3-point visualization on the teleop streamer."""
 
@@ -251,6 +254,8 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
 
     if config.pico_input_source not in {"xrt", "isaac-teleop"}:
         errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
+    if config.teleop_mode != "pose" and not config.pico_manager:
+        errors.append("--teleop-mode vr3pt requires the PICO manager")
 
     if errors:
         print("ERROR: Prerequisites not met:\n")
@@ -470,7 +475,7 @@ def main(config: DataCollectionLaunchConfig):
         f"--input-source {config.pico_input_source}"
     )
     if config.pico_manager:
-        pico_process_cmd += " --manager"
+        pico_process_cmd += f" --manager --teleop-mode {config.teleop_mode}"
     if config.pico_vis_vr3pt:
         pico_process_cmd += " --vis_vr3pt"
     if config.pico_vis_smpl:

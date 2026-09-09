@@ -378,3 +378,32 @@ Update the IP in the PICO's XRoboToolKit app to match this machine before starti
 ```
 
 Follow the same start sequence: calibration pose → **A+B+X+Y** → two **A+X** press-and-release gestures within two seconds for POSE mode. See [Complete PICO Controls](#pico-controls) for all available commands.
+
+### Staged VR3PT arm alignment
+
+Select `--teleop-mode vr3pt` in `launch_data_collection.py` (or the manager
+entrypoint) to use the learned VR3PT controller with an intermediate arm pose.
+Rebuild the C++ deployment from the same revision first: this path needs the
+`upper_body_mask` support so the planner keeps control of the waist and legs.
+The default `--teleop-mode pose` retains the full-body controls above.
+
+1. Start with A+B+X+Y. The manager enters planner mode.
+2. Complete two A+X gestures within two seconds to move the arms to alignment.
+3. Align with the robot, then complete another A+X pair to calibrate from new
+   measured joints and enter VR3PT.
+4. B+Y returns to alignment; another B+Y returns the arms to the planner target.
+
+Each arm move uses a two-second interpolation with zero endpoint velocity.
+The alignment pose sets shoulder pitch to +20 degrees, elbow to -20 degrees,
+and other arm joints to zero, in the G1 joint convention. During alignment and
+transitions, joystick motion/yaw is suppressed and the hands hold measured
+positions. Each move requires a new valid feedback packet within 100 ms; returning
+to planner mode also requires a valid planner target. Failed requests keep the
+current mode and can be retried. New recordings are blocked during interpolation;
+while recording in VR3PT, A+X saves and B+Y cannot change the mode. A+B+X+Y still
+stops the policy immediately, including during a transition. Tracking loss keeps
+the existing stop/reconnect behavior and preserves the take's interruption policy.
+
+For direct manager use, `--idle-base-transition-duration SECONDS` changes the
+interpolation duration. Software tests cover the transitions; physical alignment
+and return-to-planner behavior still require validation before deployment.
