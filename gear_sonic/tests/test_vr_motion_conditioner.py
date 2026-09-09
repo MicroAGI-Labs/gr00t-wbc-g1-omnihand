@@ -55,6 +55,55 @@ def test_normal_motion_has_small_lag_and_quiet_jitter_is_reduced():
     assert np.std(samples[20:]) < 0.0006
 
 
+def test_cornering_and_braking_have_small_steps_and_bounded_jerk():
+    limiter, target = initial()
+    position = target[:, :3].copy()
+    previous_velocity = np.zeros((3, 3))
+    previous_acceleration = np.zeros((3, 3))
+    previous_dt = 0.02
+    now = 0.0
+    peak_speed = 0.0
+    rounded_corner = False
+    for i in range(300):
+        dt = (0.012, 0.024, 0.016, 0.028)[i % 4]
+        now += dt
+        direction = ([0.4, 0, 0] if now < 1 else
+                     [0, 0.4, 0] if now < 2 else
+                     [-0.4, 0, 0] if now < 3 else [0, 0, 0])
+        target[:, :3] += np.asarray(direction) * dt
+        # Also exercise a tracking fault while still moving: braking must
+        # preserve the same continuity and limits as an ordinary reversal.
+        if now > 3.2:
+            target[0, 0] = np.nan
+        output = limiter.update(target, now)
+        step = output[:, :3] - position
+        acceleration = (limiter.velocity - previous_velocity) / dt
+        jerk = (acceleration - previous_acceleration) / ((dt + previous_dt) / 2)
+        assert np.max(np.linalg.norm(step, axis=1)) <= limiter.limits.speed * dt + 1e-10
+        assert np.max(np.linalg.norm(acceleration, axis=1)) <= limiter.limits.acceleration + 1e-9
+        assert np.max(np.linalg.norm(jerk, axis=1)) <= 2 * limiter.limits.acceleration / limiter.limits.translation_response_s + 1e-8
+        peak_speed = max(peak_speed, np.linalg.norm(limiter.velocity[0]))
+        rounded_corner |= limiter.velocity[0, 0] > 0.02 and limiter.velocity[0, 1] > 0.02
+        position = output[:, :3].copy()
+        previous_velocity = limiter.velocity.copy()
+        previous_acceleration = acceleration
+        previous_dt = dt
+    assert peak_speed > 0.14
+    assert rounded_corner
+    assert limiter.fault and limiter.stopped
+
+
+def test_stationary_tracking_jitter_does_not_accumulate_position_bias():
+    limiter, origin = initial()
+    samples = []
+    for i in range(1, 401):
+        target = origin.copy()
+        target[:, 0] += (-1) ** i * 0.001
+        samples.append(limiter.update(target, i * 0.02)[0, 0] - origin[0, 0])
+    assert abs(np.mean(samples[-100:])) < 0.0001
+    assert np.std(samples[-100:]) < 0.0001
+
+
 def test_single_spike_is_discarded_and_persistent_jump_latches():
     limiter, origin = initial()
     spike = origin.copy()
@@ -126,15 +175,17 @@ def test_send_failure_does_not_advance_filter_state(streamer, monkeypatch):
     assert streamer.vr_conditioner.last_time == before.last_time
 
 
-def test_generated_return_completes_only_after_limited_target_arrives(streamer, monkeypatch):
+@pytest.mark.parametrize("duration_s", [0.1, 5.0])
+def test_generated_return_completes_only_after_limited_target_arrives(streamer, monkeypatch, duration_s):
     streamer.vr_conditioner, origin = initial()
     streamer.last_vr_pose = origin.copy()
     goal = origin.copy()
     goal[:2, 0] += 0.8
+    goal[:2, 3:] = Rotation.from_euler("xyz", [0.3, 0.6, -0.4]).as_quat(scalar_first=True)
     monkeypatch.setattr(streamer, "vr_pose_from_upper_body", lambda joints: goal)
     now = [0.0]
     monkeypatch.setattr(manager.time, "monotonic", lambda: now[0])
-    transition = streamer.begin_vr_return(to_base=True, duration_s=0.1)
+    transition = streamer.begin_vr_return(to_base=True, duration_s=duration_s)
     complete = False
     for i in range(1, 401):
         now[0] = i * 0.02
@@ -146,6 +197,18 @@ def test_generated_return_completes_only_after_limited_target_arrives(streamer, 
             break
     assert complete
     np.testing.assert_allclose(decode_vr(streamer.packets[-1]), goal, atol=1e-4)
+    held = streamer.held_vr_pose.copy()
+    for i in range(100):
+        now[0] += (0.016, 0.024, 0.018, 0.022)[i % 4]
+        assert streamer.run_once(manager.StreamMode.PLANNER_IDLE_BASE_POSE)
+        assert streamer.vr_conditioner.stopped
+    np.testing.assert_array_equal(streamer.held_vr_pose, held)
+    # A completed return must remain eligible for the next A+X entry.
+    monkeypatch.setattr(streamer, "poll_fresh_feedback", lambda **kwargs: True)
+    streamer.reader.get_latest = lambda: {"body_poses_np": origin.copy()}
+    monkeypatch.setattr(manager, "_process_3pt_pose", lambda sample: sample.copy())
+    streamer.three_point = manager.ThreePointPose(robot_model=object())
+    assert streamer.recalibrate_for_vr3pt()
 
 
 def test_live_fault_brakes_holds_and_reanchors_without_a_jump(streamer, monkeypatch):

@@ -323,10 +323,21 @@ acceleration. These are vector limits per target, including diagonal motion.
 An adaptive low-pass filter smooths quiet tracking at 8 Hz and opens up to
 32 Hz during faster movement. Normal movements follow the latest target;
 abrupt starts and reversals ramp within the acceleration limits.
+Translation follows a continuous trajectory with rounded direction changes and
+continuous acceleration. A 60 ms velocity response softens corners and braking;
+the publisher integrates that response between samples. At the default 50 Hz,
+the 15 cm/s speed limit allows at most 3 mm of translation per command. Wrist
+rotation retains its existing conditioning. Stationary tracking noise is filtered
+before it can accumulate a position bias in the translation limiter.
+
 Moving faster than these limits no longer freezes teleop or requires re-anchoring.
 The robot keeps following the latest target at the limited speed. Its immediate
 pursuit goal stays within 25 cm / 60°; reversing replaces the old goal immediately,
 with acceleration-limited braking. Holding your hands still lets the robot catch up.
+Following the full hand movement at a lower speed necessarily takes extra time:
+a 40 cm translation needs at least 2.7 seconds at 15 cm/s, plus acceleration and
+settling. Trajectory smoothing reduces abrupt motion; it does not eliminate that
+speed-limit delay or shorten the requested movement.
 
 An isolated tracking jump is discarded while the target brakes. Three consecutive
 jumps latch a hold. Jump thresholds are the larger of 10 cm / 30° or three times

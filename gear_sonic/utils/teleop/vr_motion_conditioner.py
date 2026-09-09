@@ -19,6 +19,7 @@ class VRMotionLimits:
     angular_jump: float = np.pi / 6
     cutoff_hz: float = 8.0
     fast_cutoff_hz: float = 32.0
+    translation_response_s: float = 0.06
 
     def __post_init__(self):
         if any(not np.isfinite(v) or v <= 0 for v in vars(self).values()):
@@ -41,6 +42,8 @@ class VRMotionConditioner:
         self.pose = None
         self.last_time = None
         self.velocity = np.zeros((3, 3))
+        self.drive_velocity = np.zeros((3, 3))
+        self.target_velocity = np.zeros((3, 3))
         self.angular_velocity = np.zeros((3, 3))
         self.fault = ""
         self.rejected = 0
@@ -48,6 +51,7 @@ class VRMotionConditioner:
     @property
     def stopped(self):
         return max(np.max(np.linalg.norm(self.velocity, axis=1)),
+                   np.max(np.linalg.norm(self.drive_velocity, axis=1)),
                    np.max(np.linalg.norm(self.angular_velocity, axis=1))) < 1e-4
 
     def seed(self, pose, now):
@@ -56,6 +60,8 @@ class VRMotionConditioner:
         self.filtered = self.pose.copy()
         self.raw = self.pose.copy()
         self.velocity[:] = self.angular_velocity[:] = 0
+        self.drive_velocity[:] = 0
+        self.target_velocity[:] = 0
         self.last_time = now
         self.fault = ""
         self.rejected = 0
@@ -128,14 +134,39 @@ class VRMotionConditioner:
             feedforward = (rotation_error(self.filtered[:, 3:], previous_filtered[:, 3:]) / dt if angular
                            else (self.filtered[:, :3] - previous_filtered[:, :3]) / dt)
             desired = cap(feedforward + cap(error / dt, braking_speed), vmax)
+            if not angular:
+                # Differentiating noisy samples directly into a saturated
+                # velocity drive can cause chatter and directional drift.
+                self.target_velocity += -np.expm1(-dt / limits.translation_response_s) * (
+                    feedforward - self.target_velocity
+                )
+                # Damped position/velocity tracking instead of switching between
+                # full acceleration and braking near the translation endpoint.
+                desired = cap(self.target_velocity + 4.0 * error, vmax)
             if braking:
                 desired[:] = 0
-            velocity += cap(desired - velocity, amax * dt)
             if angular:
+                velocity += cap(desired - velocity, amax * dt)
                 self.pose[:, 3:] = (Rotation.from_rotvec(velocity * dt) *
                     Rotation.from_quat(self.pose[:, 3:], scalar_first=True)).as_quat(scalar_first=True)
             else:
-                self.pose[:, :3] += velocity * dt
+                # Slew a bounded drive velocity, then integrate its continuous
+                # first-order response exactly over this tick. Unlike clipping
+                # each position step, this keeps translation acceleration
+                # continuous through corners, reversals, and speed saturation.
+                tau = limits.translation_response_s
+                drive_start = self.drive_velocity.copy()
+                # Ease into the slew limit as well: alternating tracking noise
+                # must not repeatedly saturate it and accumulate a position bias.
+                drive_response = 1.0 if braking else -np.expm1(-2 * dt / tau)
+                self.drive_velocity += cap(drive_response * (desired - drive_start), amax * dt)
+                drive_acceleration = (self.drive_velocity - drive_start) / dt
+                transient = velocity - drive_start + tau * drive_acceleration
+                decay = np.exp(-dt / tau)
+                self.pose[:, :3] += (drive_start * dt +
+                    drive_acceleration * (0.5 * dt * dt - tau * dt) +
+                    transient * tau * (-np.expm1(-dt / tau)))
+                velocity[:] = self.drive_velocity - tau * drive_acceleration + transient * decay
         return self.pose.copy()
 
     def reached(self, target):

@@ -2252,7 +2252,13 @@ class PlannerStreamer:
         if sent:
             self.held_vr_pose = self.last_vr_pose.copy()
         reached = self.vr_conditioner is None or self.vr_conditioner.reached(transition.goal)
-        return sent, complete and sent and reached
+        finished = complete and sent and reached
+        if finished:
+            # Keep the endpoint fixed while the final sub-tolerance velocity
+            # settles. Feeding each filtered output back as the next hold goal
+            # sustains that residual motion and can block A+X re-entry forever.
+            self.held_vr_pose = transition.goal.copy()
+        return sent, finished
 
     def commanded_transition_start(self) -> np.ndarray | None:
         """Snapshot the active joint reference, never the measured joint pose."""
@@ -2491,7 +2497,7 @@ class PlannerStreamer:
                 if next_conditioner.fault and not self.vr_conditioner.fault:
                     print(f"[PlannerLoop] {next_conditioner.fault}; braking to hold. A+X twice to re-anchor.")
                 self.vr_conditioner = next_conditioner
-                if generated_vr or next_conditioner.fault:
+                if next_conditioner.fault:
                     self.held_vr_pose = sent_vr_pose.copy()
             self.last_vr_pose = None if sent_vr_pose is None else sent_vr_pose.copy()
             if not generated_vr:
