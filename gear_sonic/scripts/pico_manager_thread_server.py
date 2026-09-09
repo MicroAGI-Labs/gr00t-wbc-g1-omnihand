@@ -2181,9 +2181,22 @@ class PlannerStreamer:
         ]))
 
     def begin_vr_return(self, *, to_base: bool, duration_s: float) -> VRPoseTransition | None:
-        if not self.poll_fresh_feedback(require_planner_target=not to_base):
+        needs_joint_start = to_base and self.last_vr_pose is None
+        if not self.poll_fresh_feedback(
+            require_planner_target=needs_joint_start or not to_base
+        ):
             return None
-        start = self.last_vr_pose if self.last_vr_pose is not None else self.feedback_reader.vr_pose
+        if self.last_vr_pose is not None:
+            start = self.last_vr_pose.copy()
+        elif needs_joint_start:
+            # The first idle -> base handoff has never sent a VR target. Seed
+            # it from the planner's current joint command, not stale/default
+            # VR feedback, so the interpolation begins at the commanded pose.
+            start = self.vr_pose_from_upper_body(
+                self.feedback_reader.upper_body_planner_target
+            )
+        else:
+            start = self.feedback_reader.vr_pose
         if start is None:
             print("[PlannerLoop] Return blocked: current VR target is unavailable")
             return None

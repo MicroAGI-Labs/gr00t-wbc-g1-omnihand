@@ -180,17 +180,21 @@ def test_vr_return_rejects_missing_reference(streamer, fault):
         streamer.feedback_reader.last_body_feedback_monotonic -= 1
     else:
         streamer.feedback_reader.vr_pose = None
+        streamer.feedback_reader.upper_body_planner_target = None
     assert streamer.begin_vr_return(to_base=True, duration_s=2) is None
     assert streamer.held_vr_pose is None
     assert not streamer.packets
 
 
-def test_initial_vr_return_uses_robot_vr_feedback_and_real_base_fk(streamer):
+def test_initial_vr_return_uses_planner_command_and_real_base_fk(streamer):
     streamer.three_point = manager.ThreePointPose()
     streamer.feedback_reader.last_body_feedback_monotonic = manager.time.monotonic()
     streamer.feedback_reader.vr_pose = vr_pose()
     transition = streamer.begin_vr_return(to_base=True, duration_s=2)
-    np.testing.assert_allclose(transition.start, streamer.feedback_reader.vr_pose)
+    expected_start = streamer.vr_pose_from_upper_body(
+        streamer.feedback_reader.upper_body_planner_target
+    )
+    np.testing.assert_allclose(transition.start, expected_start)
     # Base wrist FK is symmetric about the robot's sagittal plane.
     np.testing.assert_allclose(transition.goal[0, :3], transition.goal[1, :3] * [1, -1, 1], atol=1e-5)
     assert np.isfinite(transition.goal).all()
