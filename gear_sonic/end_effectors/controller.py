@@ -33,6 +33,7 @@ from .protocol import (
 
 STARTUP_FEEDBACK_TOLERANCE_RAD = 0.01
 HARD_MOTOR_ERROR_MASK = 0x0F
+RECOVERABLE_DISCONNECT_EXIT_CODE = 75
 
 
 def _has_hard_motor_error(masks: Sequence[int]) -> bool:
