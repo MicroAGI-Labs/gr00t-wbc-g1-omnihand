@@ -1,4 +1,4 @@
-"""Safe external open/close controller for simulated or physical OmniHand O10."""
+"""Safe external open/close controller for supported physical hand backends."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import numpy as np
 import zmq
 
 from .backends.base import HandBackend
+from .backends.dex1 import DEFAULT_WORKER, Dex1Backend
 from .backends.mujoco import MuJoCoHandTransport, MuJoCoHandTransportError, MuJoCoSimHandBackend
 from .backends.omnihand import OmniHandBackend, OmniHandHardwareError, vendor_output_to_stderr
 from .profiles import HandProfile, HandSide, get_hand_profile
@@ -282,6 +283,14 @@ def _selected_sides(value: str) -> tuple[str, ...]:
 
 def _make_hardware_device(args: argparse.Namespace, side: str, profile: HandProfile) -> HandBackend:
     p = profile.side(side)
+    if args.backend == "dex1":
+        return Dex1Backend(
+            HandSide(side),
+            p,
+            worker=args.dex1_worker,
+            transition_duration=args.dex1_transition_duration,
+            command_enabled=bool(args.enable_command),
+        )
     interface = args.left_interface if side == "left" else args.right_interface
     return OmniHandBackend(HandSide(side), p, interface, command_enabled=bool(args.enable_command))
 
@@ -340,7 +349,7 @@ def probe(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(json.dumps({"passed": False, "backend": "sim", "error": str(exc)}, indent=2))
             return 1
-    profile = get_hand_profile("omnihand_o10.v1")
+    profile = get_hand_profile("dex1.v1" if args.backend == "dex1" else "omnihand_o10.v1")
     devices: dict[str, HandBackend] = {}
     try:
         with vendor_output_to_stderr():
@@ -361,9 +370,9 @@ def probe(args: argparse.Namespace) -> int:
 
 
 def run(args: argparse.Namespace) -> int:
-    if args.backend == "omnihand" and not args.enable_command:
-        raise HandControllerError("--enable-command is required for physical OmniHand writes")
-    profile = get_hand_profile("omnihand_o10.v1")
+    if args.backend in {"omnihand", "dex1"} and not args.enable_command:
+        raise HandControllerError("--enable-command is required for physical hand writes")
+    profile = get_hand_profile("dex1.v1" if args.backend == "dex1" else "omnihand_o10.v1")
     context = zmq.Context()
     subscriber = context.socket(zmq.SUB)
     # This endpoint is shared with pose/planner/manager topics. SUB filtering
@@ -520,11 +529,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("probe", "run"):
         command = sub.add_parser(name)
-        command.add_argument("--backend", choices=("sim", "omnihand"), default="sim")
+        command.add_argument("--backend", choices=("sim", "omnihand", "dex1"), default="sim")
         command.add_argument("--sides", choices=("left", "right", "both"), default="both")
         command.add_argument("--left-interface", default="can11")
         command.add_argument("--right-interface", default="can10")
         command.add_argument("--enable-command", action="store_true")
+        command.add_argument("--dex1-worker", default=str(DEFAULT_WORKER))
+        command.add_argument("--dex1-transition-duration", type=float, default=1.5)
     runner = sub.choices["run"]
     runner.add_argument("--intent-endpoint", default="tcp://localhost:5556")
     runner.add_argument("--state-endpoint", default="tcp://*:5570")
