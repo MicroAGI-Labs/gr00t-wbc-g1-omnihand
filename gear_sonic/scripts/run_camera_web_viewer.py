@@ -628,7 +628,13 @@ class CameraFrameHub:
             if now < next_frame_time:
                 continue
 
-            images = ImageMessageSchema.deserialize(message).images
+            decoded = ImageMessageSchema.deserialize(message)
+            images = dict(decoded.images)
+            depth = decoded.depths.get("ego_view_depth")
+            if depth is not None:
+                preview = colorize_depth(depth)
+                if preview is not None:
+                    images["ego_view_depth"] = preview
             jpeg = compose_camera_jpeg(
                 images,
                 max_tile_width=self.config.max_tile_width,
@@ -985,6 +991,23 @@ def compose_camera_jpeg(images: dict[str, np.ndarray], max_tile_width: int, jpeg
         [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
     )
     return encoded.tobytes() if ok else None
+
+
+def colorize_depth(depth: np.ndarray) -> np.ndarray | None:
+    """Create a display-only RGB preview from a float depth map."""
+    values = np.asarray(depth, dtype=np.float32)
+    if values.ndim != 2 or values.size == 0:
+        return None
+    valid = np.isfinite(values) & (values > 0)
+    if not np.any(valid):
+        return None
+    low, high = np.percentile(values[valid], [2, 98])
+    if high <= low:
+        high = low + 1.0
+    normalized = np.clip((values - low) / (high - low), 0.0, 1.0)
+    normalized[~valid] = 0.0
+    # Near objects are warm and far objects are cool; invalid pixels are black.
+    return cv2.applyColorMap((normalized * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
 
 
 def make_handler(
