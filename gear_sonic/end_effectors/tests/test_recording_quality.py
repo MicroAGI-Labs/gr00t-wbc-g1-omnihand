@@ -69,7 +69,8 @@ def test_recording_start_is_blocked_outside_required_mode():
     assert collector._recording_message == "Enter VR3PT with A+X before recording"
 
 
-def test_recording_stop_acknowledges_save_and_returns_to_idle_immediately():
+@pytest.mark.parametrize("passed", [True, False])
+def test_recording_stop_reports_validation_outcome_and_returns_to_idle(passed):
     collector = GrootDataCollector.__new__(GrootDataCollector)
     collector._episode_state = EpisodeState()
     collector._episode_state.change_state()
@@ -98,7 +99,10 @@ def test_recording_stop_acknowledges_save_and_returns_to_idle_immediately():
 
     collector.data_exporter = _Exporter()
     collector.episode_finalizer = _Finalizer()
-    collector._episode_validation = lambda: {"passed": True, "errors": []}
+    collector._episode_validation = lambda: {
+        "passed": passed,
+        "errors": [] if passed else ["hand commands did not move enough"],
+    }
     collector.sonic_timing_monitor = type("_Monitor", (), {"reset": lambda self: None})()
     collector._episode_input_errors = set()
     collector._initial_yaw = 1.0
@@ -110,9 +114,14 @@ def test_recording_stop_acknowledges_save_and_returns_to_idle_immediately():
 
     assert collector._episode_state.get_state() == collector._episode_state.IDLE
     assert collector.current_episode_index == 1
-    assert audio_events == ["saved"]
+    assert audio_events == ["saved" if passed else "validation_failed"]
     assert collector.episode_finalizer.jobs[0]["episode_index"] == 0
-    assert collector.episode_finalizer.jobs[0]["success"] is True
+    assert collector.episode_finalizer.jobs[0]["success"] is passed
+    if not passed:
+        assert "failed validation: hand commands did not move enough" in collector._recording_message
+        assert "Preserved as unsuccessful" in collector._recording_message
+        assert "upload continue in background" in collector._recording_message
+        assert "discarded" not in collector._recording_message
 
 
 def test_recording_discard_acknowledges_and_finalizes_in_background():

@@ -1159,7 +1159,7 @@ class GrootDataCollector:
             print(message)
 
     def _set_recording_audio_event(self, event: str) -> None:
-        if event not in {"start", "saved", "discard", "save_failed"}:
+        if event not in {"start", "saved", "discard", "validation_failed", "save_failed"}:
             raise ValueError(f"Unsupported recording audio event: {event}")
         self._recording_audio_sequence += 1
         self._recording_audio_event = event
@@ -1512,17 +1512,20 @@ class GrootDataCollector:
             )
             self._print_and_say("Recording saved", say=False)
         else:
-            self._set_recording_audio_event("discard")
             if save:
+                self._set_recording_audio_event("validation_failed")
                 reasons = "; ".join(validation["errors"])
                 self._recording_message = (
-                    f"Episode {episode_index} failed validation and was discarded: {reasons}"
+                    f"Episode {episode_index} failed validation: {reasons}. "
+                    "Preserved as unsuccessful; saving and any configured upload continue in background"
                 )
+                self._print_and_say("Recording failed validation", say=False)
             else:
+                self._set_recording_audio_event("discard")
                 self._recording_message = (
                     f"Episode {episode_index} discarded; finalizing in background"
                 )
-            self._print_and_say("Recording discarded", say=False)
+                self._print_and_say("Recording discarded", say=False)
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""

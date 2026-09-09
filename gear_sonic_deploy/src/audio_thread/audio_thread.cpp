@@ -11,6 +11,7 @@ static const std::string WARNING_LOW_STATE_LATE = "ROBOT DATA LATE";
 static const std::string RECORDING_STARTED = "Recording started";
 static const std::string RECORDING_DISCARDED = "Recording discarded";
 static const std::string RECORDING_SAVED = "Recording saved";
+static const std::string RECORDING_VALIDATION_FAILED = "Recording failed validation";
 static const std::string RECORDING_SAVE_FAILED = "Recording save failed";
 
 AudioThread::AudioThread():
@@ -87,6 +88,8 @@ void AudioThread::PollRecordingStatus() {
         client_.TtsMaker(RECORDING_SAVED, 1);
       } else if (event == "discard") {
         client_.TtsMaker(RECORDING_DISCARDED, 1);
+      } else if (event == "validation_failed") {
+        client_.TtsMaker(RECORDING_VALIDATION_FAILED, 1);
       } else if (event == "save_failed") {
         client_.TtsMaker(RECORDING_SAVE_FAILED, 1);
       }

@@ -2051,6 +2051,10 @@ class PlannerStreamer:
         # Persistent facing buffer (unit vector on XY plane)
         self.yaw_accumulator = YawAccumulator()
         self.last_xrt_timestamp = None
+        # body_q_target feedback contains the planner reference before arm
+        # overrides. Retain the last successfully sent override to reconstruct
+        # the reference being followed when a mode transition starts.
+        self.last_upper_body_override: tuple[np.ndarray, np.ndarray] | None = None
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
@@ -2108,9 +2112,29 @@ class PlannerStreamer:
         if measured_q is None or np.asarray(measured_q).shape != (29,):
             print("[PlannerLoop] Cannot enter VR 3PT without complete 29-DOF feedback")
             return False
-        self.three_point.reset_with_measured_q(measured_q)
+        # Keep the robot's measured waist, but preserve the arm reference that
+        # was actually commanded during the base-pose transition. Recalibrating
+        # the arms to encoder feedback here creates a visible step when the
+        # second A+X enters VR teleoperation.
+        calibration_q = measured_q.copy()
+        commanded = self.commanded_transition_start()
+        if commanded is not None:
+            calibration_q[self.feedback_reader.upper_body_joint_indices] = commanded
+        self.three_point.reset_with_measured_q(calibration_q)
         print("[PlannerLoop] VR 3PT recalibration scheduled with measured robot pose")
         return True
+
+    def commanded_transition_start(self) -> np.ndarray | None:
+        """Snapshot the active joint reference, never the measured joint pose."""
+        if not self.poll_fresh_feedback(require_planner_target=True):
+            return None
+        position = np.asarray(
+            self.feedback_reader.upper_body_planner_target, dtype=np.float64
+        ).copy()
+        if self.last_upper_body_override is not None:
+            override, mask = self.last_upper_body_override
+            position[mask] = override[mask]
+        return position
 
     def prepare_ik_upper_body(self) -> bool:
         """Seed calibrated arm IK from fresh measured robot feedback."""
@@ -2287,6 +2311,20 @@ class PlannerStreamer:
                 publisher_monotonic_ns=time.monotonic_ns(),
             )
             self.socket.send(msg)
+            # A failed send must not replace the command used by the handoff.
+            # A normal planner/VR packet releases any earlier arm override.
+            self.last_upper_body_override = (
+                None
+                if upper_body_position is None
+                else (
+                    np.asarray(upper_body_position, dtype=np.float64).copy(),
+                    (
+                        np.ones(UPPER_BODY_WIDTH, dtype=bool)
+                        if upper_body_mask is None
+                        else np.asarray(upper_body_mask, dtype=bool).copy()
+                    ),
+                )
+            )
             return True
         except Exception as e:
             import traceback
@@ -2691,13 +2729,8 @@ def run_pico_manager(
 
             if requested_transition is not None:
                 needs_planner_target = requested_transition == StreamMode.PLANNER
-                if planner_streamer.poll_fresh_feedback(
-                    require_planner_target=needs_planner_target
-                ):
-                    transition_start = np.asarray(
-                        planner_streamer.feedback_reader.upper_body_position_target,
-                        dtype=np.float64,
-                    )
+                transition_start = planner_streamer.commanded_transition_start()
+                if transition_start is not None:
                     transition_goal = (
                         np.asarray(
                             planner_streamer.feedback_reader.upper_body_planner_target,

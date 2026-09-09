@@ -405,6 +405,11 @@ teleoperation. **B+Y** reverses the same flow, first returning to base pose and
 then interpolating back to idle. Locomotion is forced idle and hand intent is
 held during both interpolations.
 
+Arm interpolation starts from the active commanded pose: the planner reference
+in VR mode, or the last sent arm override in base-pose/IK mode. It does not jump
+back to measured joint positions before returning. Measured positions still
+seed operator calibration; the waist remains controlled by the planner.
+
 Fresh 29-DOF robot feedback is required before an interpolation or calibration.
 If it is unavailable, the manager stays in its current stable state instead of
 issuing a fallback pose. The legacy `full-smpl` configuration retains its direct
@@ -651,15 +656,16 @@ GR00T continues to train on the compact registered state/action contract.
 
 While recording, stale camera, robot, active teleop, hand, malformed token,
 NaN, or wrong-shaped required samples are not admitted. A dropout after an
-episode has begun marks that episode invalid. On save, the recorder also checks
-required publisher rates and, for external-hand collection, verifies that at
+episode has begun marks that episode invalid. On save, external-hand collection verifies that at
 least one requested hand joint changed by `--minimum-hand-motion-rad` (default
 `0.02`). Invalid episodes are preserved with `episode.success = 0`, listed in
 `discarded_episode_indices`, and explained in `meta/episode_quality.jsonl`.
+The voice announces "Recording failed validation" and the UI shows the reason.
+These episodes are still saved and uploaded to the configured Hugging Face
+dataset as unsuccessful. An operator discard still announces "Recording discarded".
 
 Use `--no-require-hand-activity` only for a task that genuinely contains no
-hand motion. The minimum accepted source rate defaults to 45 Hz and can be
-changed with `--minimum-recording-rate-hz`.
+hand motion. Stream rates are diagnostic and do not determine episode acceptance.
 
 ---
 
