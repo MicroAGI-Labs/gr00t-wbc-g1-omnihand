@@ -2182,10 +2182,14 @@ class PlannerStreamer:
 
     def begin_vr_return(self, *, to_base: bool, duration_s: float) -> VRPoseTransition | None:
         needs_joint_start = to_base and self.last_vr_pose is None
-        if not self.poll_fresh_feedback(
-            require_planner_target=needs_joint_start or not to_base
-        ):
-            return None
+        # A Pico disconnect must still return smoothly from the last command.
+        # Do not let a simultaneous planner-feedback timeout turn this into an
+        # immediate OFF packet, which makes the downstream controller snap to
+        # its hard-coded base pose. Feedback is only required when we have no
+        # previously commanded VR target to use as the interpolation start.
+        if self.last_vr_pose is None or not to_base:
+            if not self.poll_fresh_feedback(require_planner_target=needs_joint_start or not to_base):
+                return None
         if self.last_vr_pose is not None:
             start = self.last_vr_pose.copy()
         elif needs_joint_start:
