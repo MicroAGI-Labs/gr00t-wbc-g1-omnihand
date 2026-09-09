@@ -2729,7 +2729,21 @@ def run_pico_manager(
 
             if requested_transition is not None:
                 needs_planner_target = requested_transition == StreamMode.PLANNER
-                transition_start = planner_streamer.commanded_transition_start()
+                if current_mode in {
+                    StreamMode.PLANNER_VR_3PT,
+                    StreamMode.PLANNER_IK_UPPER,
+                }:
+                    # VR/IK arm commands are applied inside the robot-side
+                    # solver and are not reflected by body_q_target feedback.
+                    # Use the current encoder pose when leaving those modes;
+                    # using the underlying motion target can jump the arms
+                    # toward the legs before the interpolation begins.
+                    transition_start = np.asarray(
+                        planner_streamer.feedback_reader.upper_body_position_target,
+                        dtype=np.float64,
+                    ).copy()
+                else:
+                    transition_start = planner_streamer.commanded_transition_start()
                 if transition_start is not None:
                     transition_goal = (
                         np.asarray(

@@ -122,3 +122,11 @@ def test_vr_calibration_still_uses_measured_joints(streamer):
         streamer.feedback_reader.upper_body_planner_target
     )
     np.testing.assert_array_equal(captured[0], expected)
+
+
+def test_vr_exit_uses_measured_pose_when_motion_target_is_unrelated(streamer):
+    measured = streamer.feedback_reader.upper_body_position_target
+    motion_target = streamer.feedback_reader.upper_body_planner_target
+    # The two references intentionally differ, as they do while VR owns arms.
+    assert not np.array_equal(measured, motion_target)
+    np.testing.assert_array_equal(measured, streamer.feedback_reader.upper_body_position_target)
