@@ -16,11 +16,10 @@ class VRArmClutch:
         self.position_offset = np.zeros((2, 3))
         self.rotation_offset = Rotation.identity(2).as_quat(scalar_first=True)
 
-    def update(self, pose, held, grips, *, source_fresh, stopped):
-        """Anchor each press to the emitted target; wait for braking to settle.
+    def update(self, pose, held, grips, *, source_fresh):
+        """Anchor each fresh press to the last emitted target.
 
-        Returns the target and three-point brake/re-anchor masks. Direct
-        controllers capture headset heading per arm and hold the head target;
+        Direct controllers capture headset heading per arm and hold the head target;
         legacy SMPL mode retains head tracking. Commit this state only after
         sending the corresponding command successfully.
         """
@@ -39,14 +38,14 @@ class VRArmClutch:
                 self.pressed[side] = True
             if not self.pressed[side]:
                 self.tracking[side] = False
-            if self.pressed[side] and not self.tracking[side] and source_fresh and stopped[side]:
+            if self.pressed[side] and not self.tracking[side] and source_fresh:
                 if self.controller_frame:
                     head = Rotation.from_quat(pose[2, 3:], scalar_first=True).as_matrix()
                     yaw = np.arctan2(-head[0, 1], head[0, 0])
                     self.heading[side] = Rotation.from_euler("z", -yaw).as_matrix()
             if self.controller_frame:
                 pose[side, :3] = self.heading[side] @ pose[side, :3]
-            if self.pressed[side] and not self.tracking[side] and source_fresh and stopped[side]:
+            if self.pressed[side] and not self.tracking[side] and source_fresh:
                 self.position_offset[side] = held[side, :3] - pose[side, :3]
                 self.rotation_offset[side] = (
                     Rotation.from_quat(held[side, 3:], scalar_first=True)
@@ -64,4 +63,4 @@ class VRArmClutch:
                 pose[side] = held[side]
         if self.controller_frame:
             pose[2] = held[2]
-        return pose, np.r_[~self.tracking, self.controller_frame], reanchored
+        return pose

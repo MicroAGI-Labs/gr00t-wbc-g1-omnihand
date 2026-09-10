@@ -132,7 +132,7 @@ Documentation
    references/pico_controller_controls
    references/dex1_teleop
    references/sender_time_recording
-   references/atlas_controls_comparison
+   references/data_collection_architecture
    user_guide/configuration
    references/conventions
    references/training_code

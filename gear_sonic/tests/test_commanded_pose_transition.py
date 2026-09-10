@@ -36,9 +36,6 @@ def streamer(monkeypatch):
     instance.held_vr_pose = None
     instance.first_vr_pose = None
     instance.disconnect_idle_pose = vr_pose()
-    # These geometry/FSM tests isolate calibration from motion conditioning;
-    # dedicated conditioner integration tests exercise the production filter.
-    instance.vr_conditioner = None
     instance.controller_tracking = False
     instance.controller_input_lost = False
     instance.vr_arm_clutch = manager.VRArmClutch()
@@ -244,7 +241,7 @@ def test_every_reentry_reanchors_pico_and_preserves_first_packet(streamer, monke
         sample[:, :3] += (entry + 1) * 0.4
         sample[:, 3:] = Rotation.from_euler("xyz", [0.3, -0.5, 0.7 + entry]).as_quat(scalar_first=True)
         streamer.reader.get_latest = lambda: {"body_poses_np": sample}
-        streamer.vr_arm_clutch.update(sample, target, (1, 1), source_fresh=True, stopped=(True,) * 3)
+        streamer.vr_arm_clutch.update(sample, target, (1, 1), source_fresh=True)
         assert streamer.recalibrate_for_vr3pt()
         assert not streamer.vr_arm_clutch.tracking.any()
         assert streamer.held_vr_pose is None

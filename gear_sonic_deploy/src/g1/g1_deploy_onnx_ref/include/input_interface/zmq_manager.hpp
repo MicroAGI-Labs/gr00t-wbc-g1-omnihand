@@ -1272,12 +1272,10 @@ class ZMQManager : public InputInterface {
       // is the legacy wire name; the publisher supplies the final idle pose.
       // Reject malformed fallback data without replacing the previous target.
       std::optional<std::array<double, 14>> base_pose;
-      std::optional<std::array<double, 4>> motion_limits;
-      std::optional<std::array<double, 2>> jerk_limits;
       for (size_t i = 0; i < hdr.fields.size(); ++i) {
         const auto& field = hdr.fields[i];
-        const size_t count = field.name == "vr_base_pose" ? 14 : field.name == "vr_motion_limits" ? 4 : field.name == "vr_jerk_limits" ? 2 : 0;
-        if (!count || field.shape != std::vector<size_t>{count}) continue;
+        constexpr size_t count = 14;
+        if (field.name != "vr_base_pose" || field.shape != std::vector<size_t>{count}) continue;
         const size_t width = field.dtype == "f32" ? 4 : field.dtype == "f64" ? 8 : 0;
         if (!width || i >= bufs.size() || bufs[i].size != count * width) continue;
         std::array<double, 14> candidate{};
@@ -1296,16 +1294,6 @@ class ZMQManager : public InputInterface {
           // Keep validation effective in the deployment's -ffast-math build.
           valid &= (std::bit_cast<uint64_t>(candidate[j]) & 0x7ff0000000000000ULL) != 0x7ff0000000000000ULL;
         }
-        if (count == 2) {
-          valid &= candidate[0] > 0 && candidate[1] > 0;
-          if (valid) jerk_limits = {candidate[0], candidate[1]};
-          continue;
-        }
-        if (count == 4) {
-          for (size_t j = 0; j < 4; ++j) valid &= candidate[j] > 0;
-          if (valid) motion_limits = {candidate[0], candidate[1], candidate[2], candidate[3]};
-          continue;
-        }
         for (size_t offset : {size_t{3}, size_t{10}}) {
           double norm = 0;
           for (size_t j = 0; j < 4; ++j) norm += candidate[offset + j] * candidate[offset + j];
@@ -1320,8 +1308,6 @@ class ZMQManager : public InputInterface {
       // Update buffer directly (no queue) and set timestamp
       std::lock_guard<std::mutex> lock(planner_mutex_);
       if (base_pose) vr_base_pose_ = base_pose;
-      if (motion_limits) vr_return_limits_ = *motion_limits;
-      if (jerk_limits) vr_return_jerk_limits_ = *jerk_limits;
       latest_planner_message_ = msg;
       latest_planner_message_.timestamp = std::chrono::steady_clock::now();
     }
@@ -1338,29 +1324,9 @@ class ZMQManager : public InputInterface {
         std::cout << "[ZMQManager] Pico lost for 15s; returning arms to resting pose" << std::endl;
         return_announced_ = true;
       }
-      // Quintic peak derivatives are 1.875, 10/sqrt(3), and 60. Match the
-      // configured 3PT limits cached from the publisher, even after it exits.
-      double duration = 5.0;
-      for (size_t side = 0; side < 2; ++side) {
-        double distance_squared = 0;
-        for (size_t axis = 0; axis < 3; ++axis) {
-          double d = (*vr_base_pose_)[7 * side + axis] - timeout_vr_position_[3 * side + axis];
-          distance_squared += d * d;
-        }
-        const double distance = std::sqrt(distance_squared);
-        const size_t q = 4 * side, b = 7 * side + 3;
-        Eigen::Quaterniond start(timeout_vr_orientation_[q], timeout_vr_orientation_[q+1], timeout_vr_orientation_[q+2], timeout_vr_orientation_[q+3]);
-        Eigen::Quaterniond goal((*vr_base_pose_)[b], (*vr_base_pose_)[b+1], (*vr_base_pose_)[b+2], (*vr_base_pose_)[b+3]);
-        // Dot-product distance avoids Eigen's conjugate sign-mask path, which
-        // can lose a sign with this deployment's -ffast-math build.
-        const double angle = 2.0 * std::acos(std::clamp(std::abs(start.normalized().dot(goal)), 0.0, 1.0));
-        duration = std::max({duration, 1.875 * distance / vr_return_limits_[0],
-            std::sqrt(10.0 / std::sqrt(3.0) * distance / vr_return_limits_[1]),
-            1.875 * angle / vr_return_limits_[2],
-            std::sqrt(10.0 / std::sqrt(3.0) * angle / vr_return_limits_[3]),
-            std::cbrt(60.0 * distance / vr_return_jerk_limits_[0]),
-            std::cbrt(60.0 * angle / vr_return_jerk_limits_[1])});
-      }
+      // Legacy body tracking returns over five seconds. Direct-controller
+      // packets cache the held pose itself, so an outage keeps both arms held.
+      constexpr double duration = 5.0;
       const double u = std::clamp((elapsed - 15.0) / duration, 0.0, 1.0);
       const double blend = u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
       auto position = timeout_vr_position_;
@@ -1505,8 +1471,6 @@ class ZMQManager : public InputInterface {
     std::array<double, 12> timeout_vr_orientation_{};
     bool return_announced_ = false;
     std::string status_announcement_;
-    std::array<double, 4> vr_return_limits_{0.15, 0.6, M_PI / 2, 2.0 * M_PI};
-    std::array<double, 2> vr_return_jerk_limits_{6.0, 20.0 * M_PI};
 };
 
 #endif // ZMQ_MANAGER_HPP

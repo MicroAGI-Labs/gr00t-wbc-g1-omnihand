@@ -11,7 +11,6 @@ from gear_sonic.scripts.run_data_exporter import unpack_pose_message
 from gear_sonic.tests.test_commanded_pose_transition import streamer, vr_pose, decode_vr
 from gear_sonic.utils.teleop.pico_controls import PicoHandGate, PicoLocomotion, controller_poses, fresh_controller_sample
 from gear_sonic.utils.teleop.vr_arm_clutch import VRArmClutch
-from gear_sonic.utils.teleop.vr_motion_conditioner import VRMotionConditioner
 
 
 def test_direct_pose_basis_and_invalid_tracking():
@@ -27,19 +26,19 @@ def test_each_arm_refreshes_headset_heading_only_on_its_own_press():
     clutch = VRArmClutch(controller_frame=True)
     pose, held = vr_pose(), vr_pose()
     pose[2, 3:] = [1, 0, 0, 0]
-    options = dict(source_fresh=True, stopped=(True,) * 3)
+    options = dict(source_fresh=True)
     # Held-at-start buttons cannot engage until released.
-    assert clutch.update(pose, held, (1, 1), **options)[1][:2].all()
+    np.testing.assert_array_equal(clutch.update(pose, held, (1, 1), **options), held)
+    assert not clutch.tracking.any()
     clutch.update(pose, held, (0, 0), **options)
     clutch.update(pose, held, (1, 0), **options)
     pose[2, 3:] = Rotation.from_euler("z", np.pi / 2).as_quat(scalar_first=True)
     clutch.update(pose, held, (1, 1), **options)
     pose[:2, 0] += 0.03
-    result, brake, _ = clutch.update(pose, held, (1, 1), **options)
+    result = clutch.update(pose, held, (1, 1), **options)
     np.testing.assert_allclose(result[0, :3] - held[0, :3], [0.03, 0, 0], atol=1e-12)
     np.testing.assert_allclose(result[1, :3] - held[1, :3], [0, -0.03, 0], atol=1e-12)
     np.testing.assert_array_equal(result[2], held[2])
-    assert brake[2]  # Settle residual waist motion after a generated home return.
 
 
 @pytest.mark.parametrize("gesture, action", [(("a",), "a"), (("b",), "b"), (("x",), "x"),
@@ -164,8 +163,6 @@ def direct_streamer(streamer, monkeypatch):
 
 def test_direct_streamer_holds_head_and_recovers_with_release_not_ax(direct_streamer):
     streamer, state, tick = direct_streamer
-    streamer.vr_conditioner = VRMotionConditioner()
-    streamer.vr_conditioner.seed(streamer.last_vr_pose, state.now)
     tick()
     state.grips[:] = [1, 1]
     tick()
@@ -181,7 +178,7 @@ def test_direct_streamer_holds_head_and_recovers_with_release_not_ax(direct_stre
     state.pose[:2, 0] += 1
     for _ in range(100):
         tick()
-    assert streamer.controller_input_lost and streamer.vr_conditioner.stopped
+    assert streamer.controller_input_lost
     assert not streamer.vr_arm_clutch.tracking.any()
     held = streamer.last_vr_pose.copy()
     state.grips[:] = [0, 0]
@@ -270,8 +267,6 @@ def test_slow_turn_halves_yaw_without_translation(direct_streamer):
 
 def test_latched_tracking_loss_reanchors_after_stopping_without_ax(direct_streamer):
     streamer, state, tick = direct_streamer
-    streamer.vr_conditioner = VRMotionConditioner()
-    streamer.vr_conditioner.seed(streamer.last_vr_pose, state.now)
     tick()
     state.grips[:] = [1, 1]
     tick()
@@ -280,7 +275,7 @@ def test_latched_tracking_loss_reanchors_after_stopping_without_ax(direct_stream
         tick()
     for _ in range(80):
         tick(fresh=False)
-    assert streamer.vr_conditioner.fault and streamer.vr_conditioner.stopped
+    assert streamer.controller_input_lost
     held = streamer.last_vr_pose.copy()
     state.advance()
     state.pose[:2, 0] += 1.
@@ -289,7 +284,7 @@ def test_latched_tracking_loss_reanchors_after_stopping_without_ax(direct_stream
     state.grips[:] = [0, 0]
     assert streamer.recalibrate_for_vr3pt()
     np.testing.assert_allclose(tick(), held, atol=1e-7)
-    assert not streamer.vr_conditioner.fault and not streamer.vr_arm_clutch.tracking.any()
+    assert not streamer.controller_input_lost and not streamer.vr_arm_clutch.tracking.any()
     state.grips[:] = [0, 0]
     tick()
     state.grips[:] = [1, 1]
@@ -297,9 +292,8 @@ def test_latched_tracking_loss_reanchors_after_stopping_without_ax(direct_stream
     assert streamer.vr_arm_clutch.tracking.all()
 
 
-def test_unfiltered_timeout_holds_at_100ms_and_requires_recalibration(direct_streamer):
+def test_tracking_timeout_holds_at_100ms_and_requires_recalibration(direct_streamer):
     streamer, state, tick = direct_streamer
-    assert streamer.vr_conditioner is None
     state.pose[2, 3:] = [1, 0, 0, 0]
     streamer.locomotion.enabled = True
     tick()

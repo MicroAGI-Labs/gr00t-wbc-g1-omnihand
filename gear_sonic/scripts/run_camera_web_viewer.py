@@ -144,7 +144,7 @@ _INDEX_HTML = """<!doctype html>
         </table></div>
       </div>
       <div id="pico-detail"></div>
-      <div class="rate-note">Positions received from PICO, before robot alignment or motion limiting. The last frame remains visible when stale. Standing still is normal; freshness is checked using the body timestamp.</div>
+      <div class="rate-note">Positions received from PICO, before robot alignment. The last frame remains visible when stale. Standing still is normal; freshness is checked using the body timestamp.</div>
     </details>
     <section class="control-card dataset-card">
       <span id="dataset-state">SETUP</span>

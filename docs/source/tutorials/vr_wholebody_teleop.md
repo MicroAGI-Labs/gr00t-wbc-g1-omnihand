@@ -199,6 +199,7 @@ There are 4 modes and 2 control chains. Each chain forms a triangle: **A+X** (or
 
 (calibration-pose)=
 
+(vr-3pt-calibration-hint)=
 ### VR_3PT Calibration Hint
 
 The `VR_3PT` mode depends on accurate calibration. Two calibration events occur:
@@ -300,9 +301,8 @@ corresponding arm. Each press aligns that controller to the arm's held robot
 target and captures a fresh headset heading for that arm. Calibration happens
 once per engagement; movement follows the reference while the button stays held.
 
-Release to brake that arm smoothly and hold its target. You can reposition your
-controller and press again without a target jump. If you press before braking
-finishes, tracking starts with a fresh reference once that arm has stopped.
+Release to hold that arm's last emitted target immediately. Reposition your
+controller and press again to capture a fresh reference without a target jump.
 Both arms and hands start held on VR entry, requiring released side buttons
 before engagement. The other arm's reference is unaffected. Head motion does
 not drive the waist. Each hand holds on grip release; after engagement, release
@@ -312,8 +312,7 @@ The default controller profile needs no A+X mode-entry sequence. Use AXBY to
 start, A for home, and fresh grip engagement after tracking loss. The older
 SMPL/A+X behavior remains selectable with `--legacy-vr-controls`.
 These clutches affect VR 3-point tracking; they do not gate full-body POSE or
-upper-body IK modes. Smooth release braking uses the default VR motion limiter;
-with that limiter disabled, release holds the last emitted target immediately.
+upper-body IK modes. Calibrated VR targets pass through directly.
 Holding a VR target does not lock arm joints against whole-body balancing.
 
 ## Emergency Stop
@@ -324,73 +323,24 @@ Holding a VR target does not lock arm joints against whole-body balancing.
 | **Keyboard** (C++ terminal) | Press **`O`** for immediate stop |
 | **Process control** | Terminate the SONIC control process |
 
-Loss of PICO tracking during VR teleop holds the last commanded wrist
-and head targets and stops locomotion when SONIC's one-second input watchdog
-expires. The robot says **"Pico connection lost. Holding position."** once.
-After **15 seconds of holding**, SONIC returns the arms smoothly over **at least
-five seconds** to the arms-on-legs planner resting pose, keeping the head target unchanged.
-This is the final planner idle endpoint, distinct from A's ready/base pose.
-Longer returns take additional time to respect the configured motion limits.
-It announces the return and continues holding the resting endpoint throughout
-the outage. The timer and return run in SONIC, even if the Python Pico manager
-is killed. The manager caches the planner resting wrists before calibration
-and refreshes them on a manual return to planner idle. It supplies this endpoint
-to SONIC in advance; if none was received, SONIC retains the original hold.
-Reconnecting does not resume arm movement: release the side buttons and center
-the sticks, then engage each arm afresh. Legacy controls use **A+X twice** to
-resume, or **B+Y** to return to planner idle. The autonomous return requires
-rebuilding the C++ deployment as well as restarting
-the Python manager after updating. Legacy full-body POSE reconnect still returns
-the manager to OFF and requires **A+B+X+Y** to start.
+In the default controller profile, valid Pico input that becomes **100 ms old**
+latches the last commanded arm targets, stops locomotion, gates hand input, and
+cancels any home/rest return. Fresh packets alone cannot resume movement: release
+both grips and center the sticks, then engage each arm to recalibrate it.
+SONIC's separate publisher watchdog holds the same arm targets if the Python
+manager stops sending. Long disconnects keep holding; **B** explicitly requests
+the arms-on-legs return.
 
-### Responsive 3PT smoothing
+The optional legacy SMPL profile retains its disconnect sequence: after a
+one-second publisher timeout, hold the wrists; after 15 seconds, return to the
+cached planner resting pose over five seconds, keeping the head target. If no
+resting pose was received, continue holding. Legacy VR recovery requires
+**A+X twice** to recalibrate, or **B+Y** to return to planner idle. Full-body POSE
+reconnect returns the manager to OFF and requires **A+B+X+Y** to start.
 
-VR 3PT conditions the calibrated left wrist, right wrist, and head targets before
-sending them to SONIC. Defaults are **0.15 m/s** translation speed, **0.6 m/s²**
-translation acceleration, **90°/s** angular speed, and **360°/s²** angular
-acceleration. These are vector limits per target, including diagonal motion.
-An adaptive low-pass filter smooths quiet tracking at 8 Hz and opens up to
-32 Hz during faster movement. Normal movements follow the latest target;
-abrupt starts and reversals ramp within the acceleration limits.
-Translation follows a continuous trajectory with rounded direction changes and
-continuous acceleration. A 60 ms velocity response softens corners and braking;
-the publisher integrates that response between samples. At the default 50 Hz,
-the 15 cm/s speed limit allows at most 3 mm of translation per command. Wrist
-rotation retains its existing conditioning. Stationary tracking noise is filtered
-before it can accumulate a position bias in the translation limiter.
-
-Moving faster than these limits no longer freezes teleop or requires re-anchoring.
-The robot keeps following the latest target at the limited speed. Its immediate
-pursuit goal stays within 25 cm / 60°; reversing replaces the old goal immediately,
-with acceleration-limited braking. Holding your hands still lets the robot catch up.
-Following the full hand movement at a lower speed necessarily takes extra time:
-a 40 cm translation needs at least 2.7 seconds at 15 cm/s, plus acceleration and
-settling. Trajectory smoothing reduces abrupt motion; it does not eliminate that
-speed-limit delay or shorten the requested movement.
-
-An isolated tracking jump is discarded while the target brakes. Three consecutive
-jumps latch a hold. Jump thresholds are the larger of 10 cm / 30° or three times
-the configured speed times the sample interval. An invalid pose or a control
-gap longer than 100 ms also causes braking
-to a hold and forces locomotion idle. The manager logs the reason. It does not
-replay accumulated motion: once stopped, release the side buttons and center
-the sticks, then engage again. Legacy controls use **A+X twice** to re-anchor.
-
-Override the defaults with Pico manager arguments:
-
-```bash
---vr-max-speed 0.15 --vr-max-acceleration 0.6 \
---vr-max-angular-speed-deg 90 --vr-max-angular-acceleration-deg 360
-```
-
-Generated VR returns use the same limits. SONIC caches these limits for its
-autonomous disconnect return, including when the manager is killed. Automatic
-returns take at least five seconds; manual transitions default to two
-seconds through `--idle-base-transition-duration` and can take longer to settle
-under the motion limits. These limits
-bound the 3PT reference sent to the policy; they do not impose arm joint torque
-limits or guarantee the same bounds on physical robot motion. Hardware tuning
-is still required.
+Manual home/rest transitions use `--idle-base-transition-duration` (two seconds
+by default). These are explicit return motions; live calibrated controller
+poses are sent directly.
 
 ---
 

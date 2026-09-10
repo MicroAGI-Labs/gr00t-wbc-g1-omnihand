@@ -412,12 +412,10 @@ ready/base pose. It keeps locomotion available and continues an active
 recording. The return follows the configured smooth
 transition duration; release/repress the side buttons afterward.
 
-VR motion filtering is off by default. Pico data stale for 100 ms latches the
-last arm targets, stops locomotion, and cancels any arm return. After fresh data
-returns, release both side buttons and center both sticks, then press a side
-button to recalibrate that arm. Long disconnects keep holding. Add
-`--no-disable-vr-motion-limiter` to the launcher to enable motion filtering;
-the independent Pico timeout remains active either way.
+Calibrated VR targets pass through directly. Pico data stale for 100 ms latches
+the last arm targets, stops locomotion, and cancels any arm return. After fresh
+data returns, release both side buttons and center both sticks, then press a
+side button to recalibrate that arm. Long disconnects keep holding.
 
 **B** smoothly returns the arms to the saved arms-on-legs planner resting pose
 while holding the grippers and preserving the waist target. Locomotion and

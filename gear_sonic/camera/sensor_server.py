@@ -52,21 +52,6 @@ class PoseData:
             tz=data.get("tz", 0.0),
         )
 
-    def to_array(self) -> np.ndarray:
-        return np.array([self.qx, self.qy, self.qz, self.qw, self.tx, self.ty, self.tz])
-
-    @staticmethod
-    def from_array(arr: np.ndarray) -> "PoseData":
-        return PoseData(
-            qx=float(arr[0]),
-            qy=float(arr[1]),
-            qz=float(arr[2]),
-            qw=float(arr[3]),
-            tx=float(arr[4]),
-            ty=float(arr[5]),
-            tz=float(arr[6]),
-        )
-
 
 @dataclass
 class PoseMessageSchema:

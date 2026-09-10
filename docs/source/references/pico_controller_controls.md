@@ -51,17 +51,14 @@ the direction you intend to use as forward when engaging, including when it is
 worn around the neck. Reposition the controller while released, then engage
 again to acquire a new reference without a target jump.
 
-VR motion filtering is **off by default**: calibrated targets pass through
-without speed, acceleration, jerk, or tracking-jump filtering. To enable it,
-add `--no-disable-vr-motion-limiter` to `launch_data_collection.py`, or
-`--enable-vr-motion-limiter` to the Pico manager. When enabled, releasing a grip
-brakes that arm smoothly; a press during braking waits for the arm to stop.
+Calibrated controller targets pass through directly. Releasing a grip holds
+that arm's last emitted target immediately. A fresh press captures a new
+reference without moving the held target.
 
 An independent watchdog latches a hold when the latest valid Pico sample is
 **100 ms old**, checked on each manager tick (normally 50 Hz). It holds the last
 commanded arm targets, stops locomotion, gates hand input, and cancels any A/B
-return. With the optional filter enabled, arms brake into the hold. Fresh data
-alone cannot resume motion: release **both** side buttons and center both
+return. Fresh data alone cannot resume motion: release **both** side buttons and center both
 sticks, then hold a side button to recalibrate and enable that arm. A+X is not
 needed. A prolonged disconnect keeps the held target; returning to the legs
 requires B. The 100 ms check requires the manager loop to be running; publisher

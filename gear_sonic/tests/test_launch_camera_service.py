@@ -51,9 +51,7 @@ def test_running_camera_without_stream_reports_readiness_failure_without_sudo(mo
         launcher._switch_camera_source(launcher.DataCollectionLaunchConfig())
 
 
-@pytest.mark.parametrize("speed", [None, 0.5])
-@pytest.mark.parametrize("filter_enabled", [False, True])
-def test_launcher_forwards_jerk_and_trace_settings_inside_restart_loop(monkeypatch, speed, filter_enabled):
+def test_launcher_keeps_direct_vr_controls_inside_restart_loop(monkeypatch):
     import shlex
 
     commands = {}
@@ -66,28 +64,14 @@ def test_launcher_forwards_jerk_and_trace_settings_inside_restart_loop(monkeypat
     monkeypatch.setattr(launcher.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1))
     config = launcher.DataCollectionLaunchConfig(
         hand_backend="none", camera_viewer=False, camera_server_logs=False,
-        vr_max_angular_jerk_deg=7200,
-        vr_motion_log_dir="/tmp/VR trials literal $path",
     )
-    assert config.disable_vr_motion_limiter
-    if filter_enabled:
-        config.disable_vr_motion_limiter = False
-    if speed is not None:
-        config.vr_max_speed = speed
-        config.vr_max_acceleration = 0.75
-        config.vr_max_jerk = 12
     launcher.main(config)
     lexer = shlex.shlex(commands[1], posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     args = list(lexer)
-    assert float(args[args.index("--vr-max-speed") + 1]) == (0.5 if speed is None else speed)
-    assert args.index("do") < args.index("--vr-max-speed") < args.index("done")
-    assert float(args[args.index("--vr-max-acceleration") + 1]) == (0.9 if speed is None else 0.75)
-    assert args.index("do") < args.index("--vr-max-acceleration") < args.index("done")
-    assert float(args[args.index("--vr-max-jerk") + 1]) == (9 if speed is None else 12)
-    assert args[args.index("--vr-max-angular-jerk-deg") + 1] == "7200"
-    assert args[args.index("--vr-motion-log-dir") + 1] == config.vr_motion_log_dir
-    assert args.index("do") < args.index("--vr-max-jerk") < args.index("done")
-    flag = "--enable-vr-motion-limiter" if filter_enabled else "--disable-vr-motion-limiter"
-    assert args.index("do") < args.index(flag) < args.index("done")
-    assert ("--disable-vr-motion-limiter" in args) != filter_enabled
+    for flag, expected in (("--teleop-mode", "vr3pt"), ("--initial-locomotion-mode", "slow_walk"),
+                           ("--teleop-control-port", str(config.teleop_control_port))):
+        assert args.index("do") < args.index(flag) < args.index("done")
+        assert args[args.index(flag) + 1] == expected
+    assert "--manager" in args
+    assert not any("limiter" in arg or arg.startswith("--vr-max-") for arg in args)

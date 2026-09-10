@@ -202,24 +202,6 @@ class DataCollectionLaunchConfig:
     idle_base_transition_duration: float = 2.0
     """Seconds for smooth arm motion into and out of the teleop alignment pose."""
 
-    disable_vr_motion_limiter: bool = True
-    """Bypass VR motion filtering; --no-disable-vr-motion-limiter enables it. Pico stale-input hold stays active."""
-
-    vr_max_speed: float = 0.5
-    """Operating Cartesian translation speed limit in m/s (hard ceiling = 1.5x)."""
-
-    vr_max_acceleration: float = 0.9
-    """Operating Cartesian translation acceleration in m/s^2 (hard ceiling = 1.5x)."""
-
-    vr_max_jerk: float = 9.0
-    """Fixed Cartesian translation jerk ceiling in m/s^3."""
-
-    vr_max_angular_jerk_deg: float = 3600.0
-    """Fixed Cartesian angular jerk ceiling in degrees/s^3."""
-
-    vr_motion_log_dir: str | None = None
-    """Optional directory for full-rate before/after VR motion traces."""
-
     # Data exporter options
     task_prompt: str = DEFAULT_TASK_PROMPT
     """Language task prompt for the data exporter."""
@@ -390,10 +372,6 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
         errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
     if config.idle_base_transition_duration <= 0.0:
         errors.append("--idle-base-transition-duration must be positive")
-    for name in ("vr_max_speed", "vr_max_acceleration", "vr_max_jerk", "vr_max_angular_jerk_deg"):
-        value = getattr(config, name)
-        if not math.isfinite(value) or value <= 0:
-            errors.append(f"--{name.replace('_', '-')} must be positive and finite")
 
     if errors:
         print("ERROR: Prerequisites not met:\n")
@@ -657,13 +635,6 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Deploy input:    {config.deploy_input_type}")
     print(f"  Teleop input:    {config.pico_input_source}")
     print(f"  Body control:    {config.body_control_mode}")
-    print(f"  VR limiter:      {'DISABLED' if config.disable_vr_motion_limiter else 'enabled'}")
-    if not config.disable_vr_motion_limiter:
-        print(f"  VR speed limit:  {config.vr_max_speed:g} m/s (hard ceiling {1.5 * config.vr_max_speed:g} m/s)")
-        print(f"  VR acceleration: {config.vr_max_acceleration:g} m/s^2 (hard ceiling {1.5 * config.vr_max_acceleration:g} m/s^2)")
-        print(f"  VR jerk limits:  {config.vr_max_jerk:g} m/s^3, {config.vr_max_angular_jerk_deg:g} deg/s^3")
-    if config.vr_motion_log_dir:
-        print(f"  VR motion logs:  {config.vr_motion_log_dir}")
     print(f"  Hand backend:    {config.hand_backend}")
     print(f"  Hand server:     {config.hand_server_host or 'local (managed by launcher)'}")
     if config.deploy_checkpoint:
@@ -754,20 +725,10 @@ def main(config: DataCollectionLaunchConfig):
         f"--teleop-control-port {config.teleop_control_port} "
         f"--teleop-mode {pico_teleop_mode} "
         f"--idle-base-transition-duration {config.idle_base_transition_duration} "
-        f"--vr-max-speed {config.vr_max_speed} "
-        f"--vr-max-acceleration {config.vr_max_acceleration} "
-        f"--vr-max-jerk {config.vr_max_jerk} "
-        f"--vr-max-angular-jerk-deg {config.vr_max_angular_jerk_deg} "
         "--initial-locomotion-mode slow_walk"
     )
     if config.pico_manager:
         pico_process_cmd += " --manager"
-    if config.disable_vr_motion_limiter:
-        pico_process_cmd += " --disable-vr-motion-limiter"
-    else:
-        pico_process_cmd += " --enable-vr-motion-limiter"
-    if config.vr_motion_log_dir:
-        pico_process_cmd += f" --vr-motion-log-dir {shlex.quote(config.vr_motion_log_dir)}"
     if config.pico_vis_vr3pt:
         pico_process_cmd += " --vis_vr3pt"
     if config.pico_vis_smpl:
