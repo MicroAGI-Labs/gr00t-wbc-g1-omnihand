@@ -16,7 +16,7 @@ manager and remote hand-server restart for the v3 hand-intent protocol.
 On the prepared Thor checkout, run:
 
 ```bash
-cd /home/unitree/repos/gr00t-wbc-g1-omnihand
+cd /home/unitree/worktrees/gr00t-wbc-g1-pr3-wrist-cameras
 python gear_sonic/scripts/launch_data_collection.py --hand-backend dex1 --remote-ui
 ```
 

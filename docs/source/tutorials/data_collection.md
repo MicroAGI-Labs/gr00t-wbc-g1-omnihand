@@ -1,6 +1,9 @@
 # Data Collection for VLA
 
-Record teleop demonstrations as [LeRobot](https://github.com/huggingface/lerobot) datasets for post-training with [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T). The data exporter runs alongside the SONIC deployment and VR teleop stack, capturing robot state, SMPL teleop poses, and camera images at a configurable frequency.
+Record teleop demonstrations as [LeRobot](https://github.com/huggingface/lerobot) datasets for post-training with [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T). The data exporter runs alongside the SONIC deployment and VR teleop stack, capturing robot state, mode-dependent planner/VR or SMPL targets, hand state/actions, and camera images at a configurable frequency.
+
+For the complete Thor/Orin operating procedure and design explanation, start
+with the [Data-collection PR handbook](https://github.com/MicroAGI-Labs/gr00t-wbc-g1-omnihand/blob/data-collection/README_DATA_COLLECTION.md).
 
 ```{admonition} Deployment model
 :class: important
@@ -263,26 +266,29 @@ Images are JPEG-compressed (quality 80) and either base64-encoded strings or raw
 
 ## Architecture
 
-In the Thor setup, all application processes below run onboard Thor.
+In the daily setup, body control, PICO, cameras, and recording run on Thor.
+External DEX 1 hands can run on Orin.
 
-```mermaid
-flowchart LR
-    Pico[PICO server] --> Sonic[SONIC deploy]
-    Pico --> Exporter[Data exporter]
-    Sonic --> Exporter
-    ZED[ZED camera] --> Camera[Camera server]
-    Camera --> Exporter
+```text
+PICO manager ------> SONIC deploy ------> G1 body
+    |                     |
+    |                     +-----------------> Data exporter
+    +---------------------------------------> Data exporter
+    +----> External hand controller --------> Data exporter
+                    |                         ^
+                    v                         |
+                Grippers          ZED / wrists -> Camera server
 ```
 
 | Source | Runs on | ZMQ Topic | Default Port | Provides |
 |---|---|---|---|---|
 | C++ deployment | Thor | `g1_debug` | 5557 | Joint positions, velocities, IMU quaternion |
 | C++ deployment | Thor | `robot_config` | 5557 | Robot configuration at startup |
-| PICO teleop streamer | Thor | `pose` | 5556 | SMPL body parameters |
+| PICO teleop streamer | Thor | `manager_state`, `planner`, `pose` | 5556 | Mode and active planner/VR or SMPL targets |
 | PICO teleop streamer | Thor | `hand_intent` | 5569 | Latest left/right open-close intent |
-| OmniHand controller | Thor | `hand_state` | 5570 | Hand connection, feedback, and health state |
+| External hand controller | Thor, or Orin for remote DEX 1 | `hand_config`, `hand_state` | 5570 | Hand profile, connection, feedback, and health state |
 | Browser UI | Thor | `hand_control` | 5572 | Manual clean-reconnect request |
-| Camera server | Thor | *(raw TCP)* | 5555 | JPEG-compressed camera images |
+| Camera server | Thor | ZMQ camera packets | 5555 | Images, depth payloads, and capture timestamps |
 
 ---
 
@@ -292,23 +298,26 @@ There are two ways to run the data collection stack: an **all-in-one tmux launch
 
 ### Option A: All-in-One Tmux Launch (Recommended)
 
-The launcher starts all components in a single tmux session with four panes:
+The launcher starts one tiled tmux window with four core panes and optional
+simulator, hand, and camera-log panes. Screen positions depend on terminal size.
 
-```text
-┌───────────────────────┬───────────────────────┐
-│ Pane 0: C++ Deploy    │ Pane 2: Data Exporter │
-│ (gear_sonic_deploy)   │ (.venv_data_collection)│
-├───────────────────────┼───────────────────────┤
-│ Pane 1: PICO Teleop   │ Pane 3: Camera Viewer │
-│ (.venv_teleop)        │ (.venv_data_collection)│
-└───────────────────────┴───────────────────────┘
-```
+| Pane | Role |
+|---|---|
+| 0 | C++ deployment |
+| 1 | PICO manager and its worker restart loop |
+| 2 | Data exporter, including background finalization/upload |
+| 3 | Browser or native camera viewer |
+| 4 on daily hardware setup | Local hand supervisor or SSH to the Orin hand server |
+| 5 on daily hardware setup | Read-only camera service journal |
+
+Simulation inserts its process at pane 4 and moves any hand pane after it.
+Reusing an existing remote hand service omits the launcher-owned hand pane.
 
 ```{note}
 Requires `tmux` to be installed (`sudo apt install tmux`).
 ```
 
-**For simulation** (the launcher starts `run_sim_loop.py` in a separate tmux window automatically):
+**For simulation** (the launcher starts `run_sim_loop.py` in an extra pane in the same window):
 
 ```bash
 python gear_sonic/scripts/launch_data_collection.py --sim
@@ -330,7 +339,10 @@ python gear_sonic/scripts/launch_data_collection.py \
 ```
 
 Add `--record-zed-stereo` when the ego camera is a ZED to record its left eye
-and float32 depth map alongside the existing right-eye ego video.
+and depth visualization alongside the existing right-eye ego video. Although
+the camera transport supports float32 metric depth, the recorder stores
+`observation.images.ego_view_depth` as a three-channel uint8 video, not lossless
+metric depth.
 
 **With physical OmniHands and the browser controls:**
 
@@ -360,7 +372,7 @@ Common options:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--task-prompt` | `"demo"` | Language task description (e.g., `"pick up the cup"`) |
+| `--task-prompt` | Tote/conveyor task from `hub_config.py` | Language task description (e.g., `"pick up the cup"`) |
 | `--dataset-name` | *(auto: timestamp)* | Dataset name; omit to auto-generate |
 | `--sim / --no-sim` | `False` | Run deploy.sh in sim mode (also starts the sim loop) |
 | `--camera-host` | `localhost` | Camera server host; set the Thor IP only for a remote client |
@@ -378,7 +390,7 @@ Common options:
 | `--deploy-planner` | *(default)* | Custom planner model path for deploy.sh |
 | `--deploy-motion-data` | *(default)* | Custom motion data path for deploy.sh |
 | `--record-wrist-cameras` | `False` | Record left/right wrist camera streams in the dataset |
-| `--record-zed-stereo` | `False` | Record ZED left-eye RGB and float32 depth |
+| `--record-zed-stereo` | `False` | Record ZED left-eye RGB and depth visualization videos |
 | `--no-text-to-speech` | *(on)* | Disable voice feedback via espeak |
 
 Run `python gear_sonic/scripts/launch_data_collection.py --help` for all options.
@@ -536,7 +548,7 @@ All options are provided via CLI flags — no interactive prompts.  Key flags:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--task-prompt` | `"demo"` | Language task description for this session |
+| `--task-prompt` | Tote/conveyor task from `hub_config.py` | Language task description for this session |
 | `--dataset-name` | *(auto: timestamp)* | Dataset name.  Omit to create a new one, or pass an existing name to append episodes |
 | `--data-collection-frequency` | `50` | Recording frequency (Hz) |
 | `--root-output-dir` | `outputs` | Parent directory for saved datasets |
@@ -618,7 +630,7 @@ Key options:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--task-prompt` | `"demo"` | Language task description for annotation |
+| `--task-prompt` | Tote/conveyor task from `hub_config.py` | Language task description for annotation |
 | `--dataset-name` | *(auto: timestamp)* | Dataset name; omit to auto-generate, or reuse an existing name to append |
 | `--data-collection-frequency` | `50` | Recording frequency in Hz |
 | `--camera-host` | `localhost` | Camera server hostname |
@@ -639,14 +651,14 @@ Datasets are saved in the [LeRobot v2.1](https://github.com/huggingface/lerobot)
 ```text
 outputs/2026-04-03-14-30-00-G1-robot01/
 ├── data/
-│   ├── train-00000.parquet      # Tabular data (joint states, actions, annotations)
+│   ├── chunk-000/episode_000000.parquet  # Per-episode tabular data
 │   └── ...
 ├── videos/
-│   ├── observation.images.ego_view/
+│   ├── chunk-000/observation.images.ego_view/
 │   │   ├── episode_000000.mp4   # H264-encoded ego camera video
 │   │   └── ...
-│   ├── observation.images.left_wrist/   # (only with --record-wrist-cameras)
-│   └── observation.images.right_wrist/  # (only with --record-wrist-cameras)
+│   ├── chunk-000/observation.images.left_wrist/   # (only with --record-wrist-cameras)
+│   └── chunk-000/observation.images.right_wrist/  # (only with --record-wrist-cameras)
 └── meta/
     ├── info.json                # Dataset metadata (fps, features, sizes)
     ├── modality.json            # GR00T modality configuration
@@ -669,13 +681,13 @@ Each frame contains:
 | `observation.omnihand_{left,right}_raw` | `(10,)` | Native measured OmniHand positions (rad) |
 | `observation.images.ego_view` | `(480, 640, 3)` | Ego camera image (saved as MP4 video) |
 | `observation.images.ego_view_left` | `(480, 640, 3)` | ZED rectified left-eye image (with `--record-zed-stereo`) |
-| `observation.depth.ego_view` | `(480, 640)` | ZED float32 depth map (with `--record-zed-stereo`) |
+| `observation.images.ego_view_depth` | `(480, 640, 3)` | ZED depth visualization video, not metric-depth storage (with `--record-zed-stereo`) |
 | `observation.images.left_wrist` | `(480, 640, 3)` | Left wrist camera (only with `--record-wrist-cameras`) |
 | `observation.images.right_wrist` | `(480, 640, 3)` | Right wrist camera (only with `--record-wrist-cameras`) |
 | `action.motion_token` | `(64,)` | SONIC universal motion token |
 | `teleop.{left,right}_hand_joints` | `(10,)` | Requested native OmniHand actions (rad) |
 | `action.omnihand_{left,right}_raw` | `(10,)` | Named copies of the requested native actions |
-| `control.hand_applied_position` | `(20,)` | Safety-limited command actually applied |
+| `control.hand_applied_position` | `(20,)` with OmniHand | Applied hand position command, distinct from requested and measured positions |
 | `episode.success` | `(1,)` | Successful save (`1`) or discarded/invalid (`0`) |
 | `capture.*` | `(1,)` | Source sequences and source/receive timestamps |
 | `task_index` | `(1,)` | Index of the language task in `tasks.jsonl` |
@@ -717,10 +729,11 @@ but flagged in `meta/info.json`. By default, the processing script removes these
 flagged episodes so they are excluded from fine-tuning:
 
 ```bash
-# Clean a single dataset (removes discarded episodes + stale SMPL frames)
+# Clean a default VR3PT dataset; keep its intentional zero SMPL fields.
 python gear_sonic/scripts/process_dataset.py \
     --dataset-path outputs/my_dataset \
-    --output-path outputs/my_dataset_cleaned
+    --output-path outputs/my_dataset_cleaned \
+    --no-remove-stale-smpl
 ```
 
 To keep discarded episodes (e.g., for inspection), pass `--no-remove-discarded`.

@@ -128,6 +128,7 @@ Documentation
    :maxdepth: 2
    :caption: Reference Documentation
 
+   Data-collection PR handbook <https://github.com/MicroAGI-Labs/gr00t-wbc-g1-omnihand/blob/data-collection/README_DATA_COLLECTION.md>
    references/index
    references/pico_controller_controls
    references/dex1_teleop

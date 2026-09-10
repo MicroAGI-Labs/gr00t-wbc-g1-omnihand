@@ -23,6 +23,12 @@
 
 # GR00T-WholeBodyControl
 
+**Using this fork for G1 teleop and data collection? Start with the
+[Data-collection PR handbook](README_DATA_COLLECTION.md).** It explains the
+daily Thor/Orin launch, controller controls, terminal processes, hand recovery,
+camera timing, collector algorithms, dataset schema, and design decisions for
+[PR #30](https://github.com/MicroAGI-Labs/gr00t-wbc-g1-omnihand/pull/30).
+
 This is the codebase for the **GR00T Whole-Body Control (WBC)** projects. It hosts model checkpoints and scripts for training, evaluating, and deploying advanced whole-body controllers for humanoid robots. We currently support:
 
 - **Decoupled WBC**: the decoupled controller (RL for lower body, and IK for upper body) used in NVIDIA GR00T [N1.5](https://research.nvidia.com/labs/gear/gr00t-n1_5/) and [N1.6](https://research.nvidia.com/labs/gear/gr00t-n1_6/) models;

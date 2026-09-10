@@ -1,5 +1,12 @@
 # Data collection code tour
 
+For the full operator and design guide, read the
+[Data-collection PR handbook](https://github.com/MicroAGI-Labs/gr00t-wbc-g1-omnihand/blob/data-collection/README_DATA_COLLECTION.md).
+It covers daily launch, every dashboard process, controller state transitions,
+hand recovery, both collector techniques, timestamps, dataset fields, background
+saving/uploading, and the reasons behind these choices. This page is a short
+code index.
+
 The `data-collection` branch connects PICO teleoperation, SONIC whole-body
 control, external hands, cameras, and dataset recording. Start with
 [the collection guide](../tutorials/data_collection.md) for launch commands and
@@ -15,9 +22,10 @@ control, external hands, cameras, and dataset recording. Start with
 | SONIC receiver | `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/zmq_manager.hpp` | Accepts planner and VR commands, feeds whole-body control, and handles publisher loss. |
 | External hands | `gear_sonic/end_effectors/server.py`, `supervisor.py`, `controller.py`, `backends/` | Runs local or SSH-hosted hand workers, applies measured holds, reports feedback, and recovers transport failures. |
 | Cameras | `gear_sonic/camera/sensor_server.py`, `composed_camera.py`, `drivers/` | Publishes selected wrist, ZED RGB, and depth streams with source timestamps and device identities. |
-| Recorder | `gear_sonic/scripts/run_data_exporter.py`, `gear_sonic/data/features_sonic_vla.py`, `exporter.py` | Selects inputs, aligns observations/actions, manages episodes, and finalizes videos and metadata. |
+| Recorder | `gear_sonic/scripts/run_data_exporter.py`, `gear_sonic/data/features_sonic_vla.py`, `exporter.py` | Selects inputs, builds observations/actions with timing provenance, and manages episode data. |
+| Finalization and upload | `gear_sonic/data/episode_finalizer.py`, `hub_uploader.py`, `gear_sonic/scripts/upload_dataset_snapshot.py` | Owns detached buffers, commits local episodes, and uploads immutable snapshots in the background. |
 | Sender-time synchronization | `gear_sonic/data/clock_sync.py`, `sender_sync.py` | Provides optional clock exchange and selection by producer timestamps. |
-| Operator UI and uploads | `gear_sonic/scripts/run_camera_web_viewer.py`, `gear_sonic/utils/data_collection/` | Displays camera/recorder/hand state, controls takes, and uploads finalized episodes. |
+| Operator UI | `gear_sonic/scripts/run_camera_web_viewer.py`, `gear_sonic/utils/data_collection/` | Displays camera/recorder/hand state and sends recording, dataset, and recovery commands. |
 
 ## Direct control and fault handling
 
