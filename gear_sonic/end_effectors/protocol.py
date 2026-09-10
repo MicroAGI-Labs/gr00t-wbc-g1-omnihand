@@ -15,7 +15,7 @@ HAND_SIM_FEEDBACK_TOPIC = b"hand_sim_feedback"
 DEFAULT_HAND_INTENT_PORT = 5569
 DEFAULT_HAND_STATE_PORT = 5570
 DEFAULT_HAND_CONTROL_PORT = 5572
-HAND_INTENT_SCHEMA = "sonic.hand_intent.v2"
+HAND_INTENT_SCHEMA = "sonic.hand_intent.v3"
 HAND_CONFIG_SCHEMA = "sonic.hand_config.v1"
 HAND_STATE_SCHEMA = "sonic.hand_state.v1"
 HAND_CONTROL_SCHEMA = "sonic.hand_control.v1"
@@ -49,7 +49,10 @@ def decode(raw: bytes, topic: bytes | str, schema: str) -> dict[str, Any]:
 
 
 def decode_intent(raw: bytes) -> dict[str, Any]:
-    payload = decode(raw, HAND_INTENT_TOPIC, HAND_INTENT_SCHEMA)
+    try:
+        payload = decode(raw, HAND_INTENT_TOPIC, HAND_INTENT_SCHEMA)
+    except HandProtocolError:
+        payload = decode(raw, HAND_INTENT_TOPIC, "sonic.hand_intent.v2")
     for field in ("sequence", "monotonic_ns"):
         if isinstance(payload.get(field), bool) or not isinstance(payload.get(field), int):
             raise HandProtocolError(f"{field} must be an integer")
@@ -63,6 +66,8 @@ def decode_intent(raw: bytes) -> dict[str, Any]:
             raise HandProtocolError(f"{side} intent is missing")
         if not isinstance(value.get("valid"), bool) or not isinstance(value.get("closed"), bool):
             raise HandProtocolError(f"{side} valid/closed must be booleans")
+        if not isinstance(value.get("hold", False), bool):
+            raise HandProtocolError(f"{side} hold must be a boolean")
         trigger = value.get("trigger")
         if isinstance(trigger, bool) or not isinstance(trigger, (int, float)) or not 0.0 <= float(trigger) <= 1.0:
             raise HandProtocolError(f"{side} trigger must be in [0, 1]")

@@ -21,7 +21,7 @@ import zmq
 from gear_sonic.data.clock_sync import clock_id
 
 from .backends.base import HandBackend
-from .backends.dex1 import DEFAULT_WORKER, Dex1Backend, Dex1SafetyError
+from .backends.dex1 import DEFAULT_WORKER, Dex1Backend, Dex1SafetyError, Dex1TransportError
 from .backends.mujoco import MuJoCoHandTransport, MuJoCoSimHandBackend
 from .backends.omnihand import OmniHandBackend, vendor_output_to_stderr
 from .profiles import HandProfile, HandSide, get_hand_profile
@@ -271,6 +271,7 @@ class SafeHandController:
         self.errors: dict[str, str | None] = {side: None for side in self.devices}
         self.fault_latched = False
         self.explicit_hold = False
+        self.side_hold = {side: False for side in self.devices}
         self._hold_write_pending: set[str] = set()
         self._connect_hold()
 
@@ -322,8 +323,9 @@ class SafeHandController:
                 continue
             self.last_valid_intent_at[side] = received_at
             accepted = True
-            if hold:
-                if not self.explicit_hold:
+            side_hold = hold or bool(side_intent.get("hold", False))
+            if side_hold:
+                if not self.side_hold[side]:
                     # Cancel an in-progress open/close slew at the latest
                     # measured position. Merely stopping new intent would
                     # leave the previous motor setpoint active.
@@ -334,7 +336,9 @@ class SafeHandController:
                     self.requested[side] = frozen.copy()
                     self.applied[side] = frozen.copy()
                     self._hold_write_pending.add(side)
+                self.side_hold[side] = True
                 continue
+            self.side_hold[side] = False
             side_profile = self.profile.side(side)
             target = side_profile.target(bool(side_intent["closed"]), self.close_scale)
             if not np.array_equal(target, self.requested[side]):
@@ -347,8 +351,8 @@ class SafeHandController:
         self.last_intent_sequence = sequence
         if accepted:
             self.last_intent_at = received_at
-            self.explicit_hold = hold
-            self.mode = "hold" if hold else "tracking"
+            self.explicit_hold = all(self.side_hold.values())
+            self.mode = "hold" if self.explicit_hold else "tracking"
         return accepted
 
     def step(self, *, now: float | None = None) -> dict[str, Any]:
@@ -378,7 +382,8 @@ class SafeHandController:
                 # its earlier open/close target immediately.
                 device.write_positions(self.applied[side])
                 self._hold_write_pending.remove(side)
-            elif not stale_by_side[side] and self.mode == "tracking" and not self.fault_latched:
+            elif (not stale_by_side[side] and not self.side_hold[side]
+                  and self.mode == "tracking" and not self.fault_latched):
                 target = np.clip(self.requested[side], side_profile.lower_rad, side_profile.upper_rad)
                 maximum = np.asarray(side_profile.velocity_rad_s) * self.velocity_scale[side] * dt
                 safe = self.applied[side] + np.clip(target - self.applied[side], -maximum, maximum)
@@ -395,7 +400,7 @@ class SafeHandController:
             if set_control_mode is not None:
                 set_control_mode(
                     "fault" if self.fault_latched
-                    else "hold" if stale_by_side[side] or self.mode == "hold"
+                    else "hold" if stale_by_side[side] or self.side_hold[side] or self.mode == "hold"
                     else "tracking"
                 )
             self.measured[side] = np.asarray(device.read_positions(), dtype=np.float64).copy()
@@ -467,6 +472,7 @@ class SafeHandController:
                     "connected": True,
                     "error": self.errors[side],
                     "intent_closed": self.intent_closed[side],
+                    "explicit_hold": self.side_hold[side],
                     "input_stale": stale_by_side[side],
                     "input_age_s": (
                         None
@@ -743,7 +749,7 @@ def run(args: argparse.Namespace) -> int:
                         device.close()
                     last_error = str(exc)
                     fault_latched = isinstance(exc, Dex1SafetyError)
-                    next_reconnect_at = started + args.reconnect_interval
+                    next_reconnect_at = time.monotonic() + args.reconnect_interval
                     recovery = (
                         "use Reconnect hands after checking the fault" if fault_latched
                         else f"retrying in {args.reconnect_interval:.1f}s"
@@ -764,12 +770,14 @@ def run(args: argparse.Namespace) -> int:
                     state_publisher.update_state(state)
                 except Exception as exc:
                     last_error = str(exc)
-                    print(
-                        f"[Hands] Transport failed: {last_error}; "
-                        "requesting a clean worker restart"
-                    )
+                    print(f"[Hands] Control stopped: {last_error}")
                     controller.close()
                     controller = None
+                    if isinstance(exc, Dex1TransportError):
+                        next_reconnect_at = time.monotonic() + args.reconnect_interval
+                        state_publisher.update_state(disconnected_state(time.monotonic()))
+                        print(f"[Hands] USB communication lost; reconnecting in {args.reconnect_interval:.1f}s")
+                        continue
                     if isinstance(exc, Dex1SafetyError):
                         fault_latched = True
                         state_publisher.update_state(disconnected_state(time.monotonic()))
@@ -804,7 +812,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--right-interface", default="can10")
         command.add_argument("--enable-command", action="store_true")
         command.add_argument("--dex1-worker", default=str(DEFAULT_WORKER))
-        command.add_argument("--dex1-transition-duration", type=float, default=1.5)
+        command.add_argument("--dex1-transition-duration", type=float, default=1.35)
     runner = sub.choices["run"]
     runner.add_argument(
         "--intent-endpoint", default=f"tcp://localhost:{DEFAULT_HAND_INTENT_PORT}"

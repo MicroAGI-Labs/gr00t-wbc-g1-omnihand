@@ -154,7 +154,7 @@ class DataCollectionLaunchConfig:
     omnihand_transition_duration: float = 0.2
     """Seconds for OmniHand to open or close; lower values respond faster."""
 
-    dex1_transition_duration: float = 1.5
+    dex1_transition_duration: float = 1.35
     """Seconds per DEX 1 stroke (1.35–30) for locally or SSH-launched hands."""
 
     check_only: bool = False
@@ -199,13 +199,13 @@ class DataCollectionLaunchConfig:
     pico_waist_tracking: bool = False
     """Enable waist tracking on the teleop streamer."""
 
-    idle_base_transition_duration: float = 5.0
+    idle_base_transition_duration: float = 2.0
     """Seconds for smooth arm motion into and out of the teleop alignment pose."""
 
-    disable_vr_motion_limiter: bool = False
-    """Bypass VR motion limits for this launch, including worker restarts."""
+    disable_vr_motion_limiter: bool = True
+    """Bypass VR motion filtering; --no-disable-vr-motion-limiter enables it. Pico stale-input hold stays active."""
 
-    vr_max_speed: float = 0.35
+    vr_max_speed: float = 0.5
     """Operating Cartesian translation speed limit in m/s (hard ceiling = 1.5x)."""
 
     vr_max_acceleration: float = 0.9
@@ -224,8 +224,8 @@ class DataCollectionLaunchConfig:
     task_prompt: str = DEFAULT_TASK_PROMPT
     """Language task prompt for the data exporter."""
 
-    dataset_name: str = "episode-dataset"
-    """Dataset name for the data exporter."""
+    dataset_name: str | None = None
+    """Omit to create a new timestamped dataset; set explicitly to resume one."""
 
     data_exporter_frequency: int = 50
     """Data collection frequency (Hz) for the data exporter."""
@@ -764,6 +764,8 @@ def main(config: DataCollectionLaunchConfig):
         pico_process_cmd += " --manager"
     if config.disable_vr_motion_limiter:
         pico_process_cmd += " --disable-vr-motion-limiter"
+    else:
+        pico_process_cmd += " --enable-vr-motion-limiter"
     if config.vr_motion_log_dir:
         pico_process_cmd += f" --vr-motion-log-dir {shlex.quote(config.vr_motion_log_dir)}"
     if config.pico_vis_vr3pt:

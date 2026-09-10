@@ -16,7 +16,7 @@ from gear_sonic.end_effectors.controller import (
     _has_hard_motor_error,
     build_parser,
 )
-from gear_sonic.end_effectors.profiles import OMNIHAND_O10, HandSide
+from gear_sonic.end_effectors.profiles import DEX1, OMNIHAND_O10, HandSide
 from gear_sonic.end_effectors.protocol import (
     HAND_CONTROL_SCHEMA,
     HAND_CONTROL_TOPIC,
@@ -317,6 +317,41 @@ def test_explicit_hold_cancels_an_in_progress_transition():
     assert state["mode"] == "tracking"
     assert state["explicit_hold"] is False
     assert controller.applied["left"][0] > frozen[0]
+
+
+@pytest.mark.parametrize("profile", [DEX1, OMNIHAND_O10])
+def test_side_hold_stops_one_hand_while_the_other_keeps_closing(profile):
+    devices = {side: SimHandBackend(profile.side(side)) for side in ("left", "right")}
+    controller = SafeHandController(profile, devices, backend_name="sim", close_scale=1.,
+        target_timeout_s=2., transition_duration_s=1., clock=lambda: 0.)
+    controller.accept_intent(_intent(1, left_closed=True, right_closed=True), now=0.)
+    controller.step(now=0.1)
+    frozen = controller.measured["left"].copy()
+    right_before = controller.applied["right"].copy()
+    intent = _intent(2, left_closed=False, right_closed=True)
+    intent["left"]["hold"] = True
+    controller.accept_intent(decode_intent(encode(HAND_INTENT_TOPIC, intent)), now=0.1)
+    state = controller.step(now=0.2)
+    np.testing.assert_array_equal(devices["left"].commands[-1], frozen)
+    assert not np.array_equal(controller.applied["right"], right_before)
+    assert state["sides"]["left"]["explicit_hold"]
+    assert not state["sides"]["right"]["explicit_hold"]
+    for t in (0.3, 0.4):
+        controller.step(now=t)
+        np.testing.assert_array_equal(controller.applied["left"], frozen)
+    controller.accept_intent(_intent(3, left_closed=False, right_closed=False), now=0.4)
+    controller.step(now=0.5)
+    assert not np.array_equal(controller.applied["left"], frozen)
+
+
+def test_intent_v3_side_hold_validation_and_legacy_v2_decode():
+    intent = _intent(1, left_closed=True, right_closed=False)
+    intent["schema"] = "sonic.hand_intent.v2"
+    assert not decode_intent(encode(HAND_INTENT_TOPIC, intent))["left"].get("hold", False)
+    intent["schema"] = HAND_INTENT_SCHEMA
+    intent["left"]["hold"] = "false"
+    with pytest.raises(HandProtocolError, match="hold"):
+        decode_intent(encode(HAND_INTENT_TOPIC, intent))
 
 
 def test_startup_feedback_far_outside_limits_fails_closed():

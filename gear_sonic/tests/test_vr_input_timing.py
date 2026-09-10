@@ -11,6 +11,29 @@ from gear_sonic.tests.test_commanded_pose_transition import streamer, vr_pose, d
 from gear_sonic.utils.teleop.vr_motion_conditioner import VRMotionConditioner, rotation_error
 
 
+@pytest.mark.parametrize("tracking_delay", [0.3, 10.0])
+def test_controller_connect_waits_for_async_tracking_without_resubscribing(monkeypatch, tracking_delay):
+    clock = SimpleNamespace(now=0.)
+    subscriptions = []
+    def sleep(seconds):
+        clock.now += seconds
+        assert clock.now < tracking_delay + 1.0
+    monkeypatch.setattr(manager, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep))
+    monkeypatch.setattr(manager, "_ensure_robotics_service", lambda: None)
+    monkeypatch.setattr(manager, "_close_xrt", lambda: pytest.fail("Must retain a live subscription"))
+    monkeypatch.setattr(manager, "xrt", SimpleNamespace(
+        init=lambda: subscriptions.append(clock.now),
+        get_time_stamp_ns=lambda: int(clock.now * 1e9),
+        get_left_controller_pose=lambda: [0., 0., 0., 0., 0., 0., 1.],
+        get_right_controller_pose=lambda: [0., 0., 0., 0., 0., 0., 1.],
+        get_headset_pose=lambda: ([0.] * 7 if clock.now < tracking_delay
+                                  else [0., 0., 0., 0., 0., 0., 1.]),
+    ))
+    manager._connect_xrt_body_stream(controller_tracking=True)
+    assert subscriptions == [0.]
+    assert clock.now > tracking_delay  # Require an advancing, valid pose stream.
+
+
 def test_sdk_snapshot_retries_when_body_changes_during_pose_read(monkeypatch):
     stamp = [10]
     calls = []
@@ -68,10 +91,12 @@ def test_legacy_sdk_retries_when_packet_changes_during_pose_read(monkeypatch):
 
 
 def prepare_streamer(streamer, monkeypatch):
-    monkeypatch.setattr(manager, "get_controller_inputs", lambda reader: (False, 0, 0, 0, 0))
+    monkeypatch.setattr(manager, "get_controller_inputs", lambda reader: (False, 0, 0, 1, 1))
     monkeypatch.setattr(manager, "compute_hand_joints_from_inputs", lambda *args: (np.zeros(7), np.zeros(7)))
     streamer.left_hand_ik_solver = streamer.right_hand_ik_solver = None
     streamer.three_point = SimpleNamespace(process_smpl_pose=lambda pose: pose.copy())
+    streamer.last_vr_pose = vr_pose()
+    streamer.vr_arm_clutch.update(vr_pose(), vr_pose(), (1, 1), source_fresh=True, stopped=(True,) * 3)
 
 
 def test_zero_body_clock_sdk_can_teleoperate_and_still_detect_packet_loss(streamer, monkeypatch):

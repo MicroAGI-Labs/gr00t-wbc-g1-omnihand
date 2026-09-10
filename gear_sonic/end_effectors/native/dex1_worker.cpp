@@ -24,6 +24,7 @@ using Clock = std::chrono::steady_clock;
 volatile std::sig_atomic_t interrupted = 0;
 constexpr float kTorque = 1.0f, kSpeed = 9.0f, kP = 8.0f, kD = .35f;
 constexpr double kWatchdog = .25;
+constexpr int kTransportExitCode = 75;
 void on_signal(int) { interrupted = 1; }
 void check(bool ok, const std::string& why) { if (!ok) throw std::runtime_error(why); }
 struct CommunicationError : std::runtime_error { using std::runtime_error::runtime_error; };
@@ -80,6 +81,8 @@ struct Motor {
         : id(motor_id), port_name(port), lower(lo), upper(hi) {
         // Kernel exclusivity prevents new opens by other services/test tools.
         lock_fd = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+        if (lock_fd < 0 && (errno == ENOENT || errno == ENODEV || errno == EIO))
+            throw CommunicationError("serial device unavailable: " + port);
         check(lock_fd >= 0, "cannot open " + port);
         if (flock(lock_fd, LOCK_EX | LOCK_NB)) {
             ::close(lock_fd); lock_fd = -1;
@@ -107,13 +110,13 @@ struct Motor {
         check(voltage() >= 24 && voltage() <= 64, "supply outside 24-64 V");
         check(data.temp < 55 && data.get_motor_recv_data()[4] < 80, "temperature limit");
         check(q() >= lower && q() <= upper, "position limit");
-        check(std::abs(dq()) < kSpeed && std::abs(tau()) < 1.30f, "speed/torque limit");
         if (mode == 1 && !enabling) check(data.mode == 1 && data.timeout == 0, "drive not enabled");
     }
     void establish_feedback() {
         // USB enumeration does not mean the motor is ready to reply yet.
         // Retry only this initial, disabled handshake. Never retry a health
-        // violation or a communication fault after this handshake succeeds.
+        // violation. Later communication failures stop this worker; the
+        // Python service may start a new disabled handshake and measured hold.
         const auto deadline = Clock::now() + std::chrono::seconds(1);
         int retries = 0;
         while (true) {
@@ -125,7 +128,7 @@ struct Motor {
             } catch (const CommunicationError& e) {
                 if (Clock::now() >= deadline)
                     throw CommunicationError(std::string(e.what()) +
-                        "; startup timed out with drive disabled; check motor power and data cable, then reconnect");
+                        "; startup timed out with drive disabled; check motor power and data cable");
                 ++retries;
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
@@ -258,6 +261,9 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_until(next);
         }
         return 0; // Motor destructor sends stop packets, including on exceptions.
+    } catch (const CommunicationError& e) {
+        std::cerr << "DEX1 TRANSPORT: " << e.what() << '\n';
+        return kTransportExitCode; // Fresh worker must validate feedback before enabling.
     } catch (const std::exception& e) {
         std::cerr << "DEX1 FAULT: " << e.what() << '\n';
         return 2; // Requires explicit UI reconnect; never silently re-enable.

@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clock-port", type=int, default=0,
                         help="Read-only recording clock service port; 0 disables it")
     parser.add_argument("--dex1-worker", type=Path, default=DEFAULT_WORKER)
-    parser.add_argument("--dex1-transition-duration", type=float, default=1.5)
+    parser.add_argument("--dex1-transition-duration", type=float, default=1.35)
     parser.add_argument("--enable-command", action="store_true")
     parser.add_argument("--check-only", action="store_true", help="Run the offline worker self-test; no motor I/O")
     return parser

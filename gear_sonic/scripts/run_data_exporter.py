@@ -21,6 +21,7 @@ Usage (from repo root):
 
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -104,8 +105,8 @@ class SonicDataExporterConfig:
     """CLI config for the ROS-free Sonic data exporter."""
 
     # Dataset
-    dataset_name: str | None = "episode-dataset"
-    """Dataset name used when no explicit name is supplied."""
+    dataset_name: str | None = None
+    """Omit to create a new timestamped dataset; set explicitly to resume one."""
 
     task_prompt: str = DEFAULT_TASK_PROMPT
     """Language task prompt."""
@@ -2772,6 +2773,9 @@ def _validate_recording_dataset_mode(root: Path, expected_features: dict, sender
 
 
 def main(config: SonicDataExporterConfig):
+    if config.dataset_name is None:
+        config.dataset_name = datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
+
     if config.sender_time_recording:
         if any(host not in {"localhost", "127.0.0.1", "::1"} for host in
                (config.camera_host, config.state_zmq_host, config.sonic_zmq_host)):
@@ -2889,8 +2893,5 @@ def main(config: SonicDataExporterConfig):
 
 if __name__ == "__main__":
     config = tyro.cli(SonicDataExporterConfig)
-
-    if config.dataset_name is None:
-        config.dataset_name = "episode-dataset"
 
     main(config)

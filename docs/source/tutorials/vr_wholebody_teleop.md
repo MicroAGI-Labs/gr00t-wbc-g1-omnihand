@@ -1,5 +1,11 @@
 # PICO VR Whole-body Teleop 
 
+For the data-collection stack's default `--teleop-mode vr3pt`, use the
+[Pico controller controls](../references/pico_controller_controls.md): AXBY
+starts SONIC, middle-finger buttons calibrate/enable individual arms and hands,
+and A returns home with locomotion available. No A+X calibration is required.
+The full-body control diagrams below describe the older SMPL workflow.
+
 Full whole-body teleoperation using PICO VR headset and controllers. To teleop, use the option  `--input-type zmq_manager` during deployment. The `zmq_manager` input type switches between a **planner mode** (locomotion commands via ZMQ) and a **streamed motion mode** (full-body SMPL poses from PICO).
 
 ## SONIC Low Latency
@@ -287,6 +293,29 @@ Active in **PLANNER**, **PLANNER_FROZEN_UPPER**, and **VR_3PT**:
 
 ---
 
+## Per-arm tracking buttons in VR 3-point mode
+
+Hold the **middle-finger side button** (`left_grip` / `right_grip`) to move the
+corresponding arm. Each press aligns that controller to the arm's held robot
+target and captures a fresh headset heading for that arm. Calibration happens
+once per engagement; movement follows the reference while the button stays held.
+
+Release to brake that arm smoothly and hold its target. You can reposition your
+controller and press again without a target jump. If you press before braking
+finishes, tracking starts with a fresh reference once that arm has stopped.
+Both arms and hands start held on VR entry, requiring released side buttons
+before engagement. The other arm's reference is unaffected. Head motion does
+not drive the waist. Each hand holds on grip release; after engagement, release
+then press its **index trigger** to resume binary opening/closing.
+
+The default controller profile needs no A+X mode-entry sequence. Use AXBY to
+start, A for home, and fresh grip engagement after tracking loss. The older
+SMPL/A+X behavior remains selectable with `--legacy-vr-controls`.
+These clutches affect VR 3-point tracking; they do not gate full-body POSE or
+upper-body IK modes. Smooth release braking uses the default VR motion limiter;
+with that limiter disabled, release holds the last emitted target immediately.
+Holding a VR target does not lock arm joints against whole-body balancing.
+
 ## Emergency Stop
 
 | Method | Action |
@@ -295,22 +324,22 @@ Active in **PLANNER**, **PLANNER_FROZEN_UPPER**, and **VR_3PT**:
 | **Keyboard** (C++ terminal) | Press **`O`** for immediate stop |
 | **Process control** | Terminate the SONIC control process |
 
-Loss of PICO body tracking during VR teleop holds the last commanded wrist
+Loss of PICO tracking during VR teleop holds the last commanded wrist
 and head targets and stops locomotion when SONIC's one-second input watchdog
 expires. The robot says **"Pico connection lost. Holding position."** once.
 After **15 seconds of holding**, SONIC returns the arms smoothly over **at least
 five seconds** to the arms-on-legs planner resting pose, keeping the head target unchanged.
-This is the final idle endpoint reached by **B+Y**, then **B+Y** again from
-teleop; it is distinct from the intermediate calibration base pose.
+This is the final planner idle endpoint, distinct from A's ready/base pose.
 Longer returns take additional time to respect the configured motion limits.
 It announces the return and continues holding the resting endpoint throughout
 the outage. The timer and return run in SONIC, even if the Python Pico manager
 is killed. The manager caches the planner resting wrists before calibration
 and refreshes them on a manual return to planner idle. It supplies this endpoint
 to SONIC in advance; if none was received, SONIC retains the original hold.
-Reconnecting does not resume movement: use
-**A+X twice** to recalibrate and resume teleop, or **B+Y** for a smooth return to
-planner idle. This requires rebuilding the C++ deployment as well as restarting
+Reconnecting does not resume arm movement: release the side buttons and center
+the sticks, then engage each arm afresh. Legacy controls use **A+X twice** to
+resume, or **B+Y** to return to planner idle. The autonomous return requires
+rebuilding the C++ deployment as well as restarting
 the Python manager after updating. Legacy full-body POSE reconnect still returns
 the manager to OFF and requires **A+B+X+Y** to start.
 
@@ -344,8 +373,8 @@ jumps latch a hold. Jump thresholds are the larger of 10 cm / 30° or three time
 the configured speed times the sample interval. An invalid pose or a control
 gap longer than 100 ms also causes braking
 to a hold and forces locomotion idle. The manager logs the reason. It does not
-replay accumulated motion: once stopped, use **A+X twice** to re-anchor and resume,
-or **B+Y** to request the normal return.
+replay accumulated motion: once stopped, release the side buttons and center
+the sticks, then engage again. Legacy controls use **A+X twice** to re-anchor.
 
 Override the defaults with Pico manager arguments:
 
@@ -356,8 +385,9 @@ Override the defaults with Pico manager arguments:
 
 Generated VR returns use the same limits. SONIC caches these limits for its
 autonomous disconnect return, including when the manager is killed. Automatic
-returns take at least five seconds; manual transitions also default to five
-seconds through `--idle-base-transition-duration`. These limits
+returns take at least five seconds; manual transitions default to two
+seconds through `--idle-base-transition-duration` and can take longer to settle
+under the motion limits. These limits
 bound the 3PT reference sent to the policy; they do not impose arm joint torque
 limits or guarantee the same bounds on physical robot motion. Hardware tuning
 is still required.

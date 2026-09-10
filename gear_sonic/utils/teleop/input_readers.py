@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 
+from .pico_controls import controller_poses
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -340,6 +342,38 @@ def _build_controller_dict(raw: dict[str, Any] | None) -> dict[str, Any] | None:
     return out
 
 
+def isaac_controller_sample(raw):
+    """Use one DeviceIO update for poses/buttons; invalid tracking is never an identity pose."""
+    poses = []
+    for key in ("left_controller", "right_controller", "head"):
+        tracked = raw.get(key)
+        if key != "head":
+            tracked = next((pose for name in ("aim_pose", "grip_pose")
+                            if (pose := _attr_or_item(tracked, name)) is not None
+                            and _attr_or_item(pose, "is_valid", False)), None)
+        if not _attr_or_item(tracked, "is_valid", False):
+            raise ValueError(f"invalid {key} tracking")
+        pose = _attr_or_item(tracked, "pose")
+        position = _vec3(_attr_or_item(pose, "position"))
+        rotation = _quat_xyzw(_attr_or_item(pose, "orientation"))
+        if position is None or rotation is None:
+            raise ValueError(f"missing {key} pose")
+        poses.append((*position, *rotation))
+    controls = _build_controller_dict(raw)
+    if controls is None or not all(f"{side}_trigger_value" in controls for side in ("left", "right")):
+        raise ValueError("missing controller buttons")
+    inputs = (False, *(float(controls[key]) for key in
+              ("left_trigger_value", "right_trigger_value", "left_squeeze_value", "right_squeeze_value")))
+    axes = (*controls["left_thumbstick"], *controls["right_thumbstick"])
+    if not np.all(np.isfinite((*inputs, *axes))):
+        raise ValueError("non-finite controller inputs")
+    return dict(controller_poses=controller_poses(*poses), controller_inputs=inputs,
+                controller_axes=axes,
+                face_buttons=tuple(bool(controls[key]) for key in
+                    ("right_primary_click", "right_secondary_click", "left_primary_click", "left_secondary_click")),
+                axis_clicks=tuple(bool(controls[f"{side}_thumbstick_click"]) for side in ("left", "right")))
+
+
 class IsaacTeleopReader:
     """Background reader using the in-process IsaacTeleop / CloudXR DeviceIO session.
 
@@ -356,8 +390,10 @@ class IsaacTeleopReader:
         max_queue_size: int = 15,
         use_adb: bool = False,
         poll_hz: float = 90.0,
+        controller_tracking: bool = False,
     ):
         del max_queue_size
+        self.controller_tracking = controller_tracking
 
         if IsaacTeleopClient is None:
             raise RuntimeError(
@@ -422,6 +458,8 @@ class IsaacTeleopReader:
     def _run(self) -> None:
         last_report = time.time()
         while not self._stop.is_set():
+            if time.monotonic() - self._last_new_data_time > self.STALE_TIMEOUT:
+                self._disconnected.set()
             try:
                 raw = self._client._get_tracker_data()  # noqa: SLF001 — internal API by design
             except Exception:
@@ -447,8 +485,17 @@ class IsaacTeleopReader:
                 with self._ctrl_lock:
                     self._latest_controller = controller
 
-            body_poses = _body_data_to_24x7(raw.get("full_body"))
-            if body_poses is None:
+            direct_sample = {}
+            if self.controller_tracking:
+                try:
+                    direct_sample = isaac_controller_sample(raw)
+                except (ValueError, TypeError, KeyError):
+                    time.sleep(self._period)
+                    continue
+                body_poses = None
+            else:
+                body_poses = _body_data_to_24x7(raw.get("full_body"))
+            if body_poses is None and not self.controller_tracking:
                 if not self._unrecognised_logged and not _attr_or_item(
                     raw.get("full_body"), "joint_positions"
                 ):
@@ -469,6 +516,7 @@ class IsaacTeleopReader:
                 self._disconnected.clear()
 
             sample = {
+                **direct_sample,
                 "body_poses_np": body_poses,
                 "timestamp_realtime": time.time(),
                 "timestamp_monotonic": time.monotonic(),
@@ -489,5 +537,4 @@ class IsaacTeleopReader:
                 last_report = now
 
             time.sleep(self._period)
-
 

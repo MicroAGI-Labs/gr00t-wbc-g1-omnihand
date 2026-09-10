@@ -39,6 +39,9 @@ def streamer(monkeypatch):
     # These geometry/FSM tests isolate calibration from motion conditioning;
     # dedicated conditioner integration tests exercise the production filter.
     instance.vr_conditioner = None
+    instance.controller_tracking = False
+    instance.controller_input_lost = False
+    instance.vr_arm_clutch = manager.VRArmClutch()
     instance.reader = SimpleNamespace(get_timestamp_ns=lambda: 123, get_latest=lambda: None)
     instance.last_xrt_timestamp = None
     instance.dt = 0.02
@@ -241,7 +244,9 @@ def test_every_reentry_reanchors_pico_and_preserves_first_packet(streamer, monke
         sample[:, :3] += (entry + 1) * 0.4
         sample[:, 3:] = Rotation.from_euler("xyz", [0.3, -0.5, 0.7 + entry]).as_quat(scalar_first=True)
         streamer.reader.get_latest = lambda: {"body_poses_np": sample}
+        streamer.vr_arm_clutch.update(sample, target, (1, 1), source_fresh=True, stopped=(True,) * 3)
         assert streamer.recalibrate_for_vr3pt()
+        assert not streamer.vr_arm_clutch.tracking.any()
         assert streamer.held_vr_pose is None
         calibrated = streamer.three_point.process_smpl_pose(sample)
         np.testing.assert_allclose(calibrated, target, atol=1e-12)
@@ -252,9 +257,8 @@ def test_every_reentry_reanchors_pico_and_preserves_first_packet(streamer, monke
         np.testing.assert_allclose(decode_vr(streamer.packets[-1]), target, atol=1e-7)
         streamer.reader.get_timestamp_ns = lambda: entry * 10 + 1
         assert streamer.run_once(manager.StreamMode.PLANNER_VR_3PT)
-        expected = target.copy()
-        expected[0, :3] += Rotation.from_quat(sample[2, 3:], scalar_first=True).inv().apply([0.1, 0, 0])
-        np.testing.assert_allclose(decode_vr(streamer.packets[-1]), expected, atol=1e-7)
+        # Re-entry resets both clutches; unpressed arms keep the held target.
+        np.testing.assert_allclose(decode_vr(streamer.packets[-1]), target, atol=1e-7)
 
 
 def test_failed_vr_return_send_retains_previous_hold(streamer, monkeypatch):
@@ -386,6 +390,7 @@ def test_manager_gesture_flow_keeps_pico_out_of_return_and_base(streamer, monkey
         manager.zmq, "Context", lambda: SimpleNamespace(socket=lambda *args: socket, term=lambda: None)
     )
     manager.run_pico_manager(
+        legacy_vr_controls=True,
         teleop_mode="vr3pt", input_source="isaac", target_fps=50,
         idle_base_transition_duration=2.0,  # Fixed timeline for this gesture scenario.
     )

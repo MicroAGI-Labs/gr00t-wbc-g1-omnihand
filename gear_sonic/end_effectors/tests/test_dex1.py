@@ -23,6 +23,8 @@ from gear_sonic.data.features_sonic_vla import (
     get_modality_config_sonic_vla,
 )
 from gear_sonic.end_effectors.backends import dex1
+from gear_sonic.end_effectors.backends.sim import SimHandBackend
+from gear_sonic.end_effectors import controller as hand_controller
 from gear_sonic.end_effectors.controller import SafeHandController
 from gear_sonic.end_effectors.profiles import DEX1, HandSide, dataset_robot_type
 from gear_sonic.scripts import launch_data_collection as launcher
@@ -112,7 +114,8 @@ def test_native_startup_retries_only_disabled_communication(fake_worker, tmp_pat
             input="C 1 0 2.5\n", capture_output=True, text=True, timeout=3,
             env={**os.environ, fault: value, "DEX1_TEST_EXCHANGE_LOG": str(log)},
         )
-        assert result.returncode == (0 if success else 2), result.stderr
+        expected_exit = 0 if success else 2 if fault == "DEX1_TEST_LOW_VOLTAGE" else dex1.TRANSPORT_EXIT_CODE
+        assert result.returncode == expected_exit, result.stderr
         assert detail in result.stderr
         modes = [int(line) for line in log.read_text().splitlines()]
         if fault == "DEX1_TEST_STARTUP_FAILURES" and success:
@@ -179,6 +182,31 @@ def test_contact_holds_at_capped_torque_and_accepts_release(motor):
     assert len(commands) > 250  # Motor I/O continues between 50 Hz caller updates.
 
 
+@pytest.mark.parametrize(
+    "variable,value,health_key",
+    [
+        ("DEX1_TEST_FEEDBACK_SPEED", "12", "velocity_rad_s"),
+        ("DEX1_TEST_FEEDBACK_SPEED", "-12", "velocity_rad_s"),
+        ("DEX1_TEST_FEEDBACK_TORQUE", "2", "torque_nm"),
+        ("DEX1_TEST_FEEDBACK_TORQUE", "-2", "torque_nm"),
+    ],
+)
+def test_high_speed_or_torque_feedback_keeps_hand_connected(monkeypatch, request, variable, value, health_key):
+    monkeypatch.setenv(variable, value)
+    backend, log = request.getfixturevalue("motor")
+    controller = SafeHandController(DEX1, {"left": backend}, backend_name="dex1")
+    controller.accept_intent(intent(1))
+    for _ in range(6):
+        state = controller.step()
+        assert state["sides"]["left"]["connected"] is True
+        assert state["sides"]["left"][health_key] == pytest.approx([float(value)])
+        time.sleep(0.02)
+    assert backend._process.poll() is None
+    commands = [line.split() for line in log.read_text().splitlines()]
+    assert any(int(mode) == 1 for mode, _ in commands)
+    assert max(abs(float(torque)) for _, torque in commands) <= 1
+
+
 def test_native_watchdog_stops_without_python_cleanup(motor):
     backend, log = motor
     backend.write_positions(np.array([0.12]))
@@ -188,6 +216,106 @@ def test_native_watchdog_stops_without_python_cleanup(motor):
     assert_stopped(log)
     with pytest.raises(dex1.Dex1SafetyError, match="exited"):
         backend.read_health()
+
+
+@pytest.mark.parametrize("read_method", ["read_positions", "read_health"])
+def test_native_usb_failure_is_recoverable_and_stops_motor(monkeypatch, request, read_method):
+    monkeypatch.setenv("DEX1_TEST_ACTIVE_FAILURE", "1")
+    backend, _ = request.getfixturevalue("motor")
+    backend.write_positions(np.array([2.5]))
+    # A failed enabled exchange must stop the worker, not retry torque commands.
+    with pytest.raises(dex1.Dex1TransportError, match="USB communication lost"):
+        backend.read_positions()
+        backend._process.wait(timeout=1)
+        getattr(backend, read_method)()
+    assert backend._process.returncode == dex1.TRANSPORT_EXIT_CODE
+
+
+def test_missing_adapter_is_recoverable(tmp_path, monkeypatch):
+    monkeypatch.setitem(dex1.USB_PORTS, "left", str(tmp_path / "absent-adapter"))
+    with pytest.raises(dex1.Dex1TransportError, match="adapter unavailable"):
+        dex1.Dex1Backend(HandSide.LEFT, DEX1.left)
+
+
+@pytest.mark.parametrize("exit_code,error", [(75, dex1.Dex1TransportError), (2, dex1.Dex1SafetyError)])
+def test_command_pipe_exit_race_preserves_native_fault(motor, monkeypatch, exit_code, error):
+    backend, _ = motor
+    backend.write_positions(np.array([2.5]))
+    calls = [0]
+    def poll():
+        calls[0] += 1
+        return None if calls[0] == 1 else exit_code
+    def broken_pipe(*args):
+        raise BrokenPipeError()
+    with monkeypatch.context() as patch:
+        patch.setattr(backend._process, "poll", poll)
+        patch.setattr(backend._process, "wait", lambda **kwargs: exit_code)
+        patch.setattr(dex1.os, "write", broken_pipe)
+        with pytest.raises(error):
+            backend.read_positions()
+
+
+@pytest.mark.parametrize("phase", ["startup", "runtime"])
+@pytest.mark.parametrize("recoverable", [True, False])
+def test_service_retries_usb_failures_but_latches_motor_faults(monkeypatch, phase, recoverable):
+    attempts, devices, states, queue = [], [], [], []
+    clock = [0.]
+    fault = dex1.Dex1TransportError if recoverable else dex1.Dex1SafetyError
+
+    class Device(SimHandBackend):
+        def __init__(self, fails):
+            super().__init__(DEX1.left, initial=np.array([2.5]))
+            self.fails = fails
+            self.reads = 0
+
+        def read_health(self):
+            self.reads += 1
+            if self.fails and self.reads > 1:
+                raise fault("injected runtime fault")
+            return super().read_health()
+
+    def connect(*args):
+        attempts.append(clock[0])
+        assert len(attempts) <= 3
+        queue.append(b"old queued intent must be discarded before decoding")
+        if phase == "startup" and len(attempts) <= 2:
+            raise fault("injected startup fault")
+        device = Device(phase == "runtime" and len(attempts) <= 2)
+        devices.append(device)
+        return {"left": device}
+
+    class Publisher:
+        def __init__(self, *args): pass
+        def start(self): pass
+        def close(self): pass
+        def update_config(self, config): pass
+        def update_state(self, state):
+            states.append(state)
+            if state["sides"]["left"]["connected"]:
+                assert state["mode"] == "hold"
+                assert state["sides"]["left"]["measured_position_rad"] == [2.5]
+                raise KeyboardInterrupt
+            if sum(s["mode"] == "fault" for s in states) >= 100:
+                raise KeyboardInterrupt  # More than one retry interval elapsed.
+
+    subscriber = SimpleNamespace(setsockopt=lambda *a: None, connect=lambda *a: None,
+                                 poll=lambda *a: bool(queue), recv=lambda *a: queue.pop(0),
+                                 close=lambda **kw: None)
+    context = SimpleNamespace(socket=lambda *a: subscriber, term=lambda: None)
+    monkeypatch.setattr(hand_controller.zmq, "Context", lambda: context)
+    monkeypatch.setattr(hand_controller, "FixedRateHandStatePublisher", Publisher)
+    monkeypatch.setattr(hand_controller, "_make_devices", connect)
+    monkeypatch.setattr(hand_controller, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+    args = hand_controller.build_parser().parse_args(["run", "--backend", "dex1", "--sides", "left",
+                                                      "--enable-command"])
+    assert hand_controller.run(args) == 0
+    assert len(attempts) == (3 if recoverable else 1)
+    assert all(b - a >= args.reconnect_interval for a, b in zip(attempts, attempts[1:]))
+    assert all(device.closed for device in devices)
+    for device in devices:
+        np.testing.assert_array_equal(device.commands, [[2.5]])
+    assert any(state["mode"] == "fault" for state in states) == (not recoverable)
 
 
 def test_parent_pipe_eof_stops_motor(motor):
@@ -282,7 +410,7 @@ def test_launcher_selects_dex1_worker_and_preserves_omnihand():
     venv, command = _hand_worker_command(config)
     assert venv == ".venv_data_collection"
     assert "--backend dex1" in command and "--enable-command" in command
-    assert "--dex1-transition-duration 1.5" in command
+    assert "--dex1-transition-duration 1.35" in command
     venv, command = _hand_worker_command(DataCollectionLaunchConfig(hand_backend="omnihand"))
     assert venv == ".venv_omnihand"
     assert "--transition-duration 0.2" in command

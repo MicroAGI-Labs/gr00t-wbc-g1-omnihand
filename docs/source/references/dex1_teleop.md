@@ -2,9 +2,14 @@
 
 The physical DEX 1 pair uses the same headset input, SONIC body controller,
 camera/recording UI, and hand-reconnect button as the working OmniHand stack.
-Each gripper has one active motor. Press either the index trigger or side grip
-to close the corresponding gripper; release both to open it. Input uses the
-existing 0.60/0.40 hysteresis and pause/idle behavior.
+Each gripper has one active motor. In the default VR 3-point mode, hold the
+corresponding middle-finger side button to calibrate and enable that arm/hand.
+Release then press the index trigger to start hand input: press fully closes,
+release fully opens, using the existing 0.60/0.40 hysteresis. Releasing the side
+button holds both that arm and hand. **A** opens both hands and returns arms/waist
+home while locomotion remains available. See the complete
+[Pico controller controls](pico_controller_controls.md), including the required
+manager and remote hand-server restart for the v3 hand-intent protocol.
 
 ## Start
 
@@ -131,7 +136,10 @@ the measured startup holds, watchdogs, torque caps, and explicit fault recovery.
 At startup each worker retries missing replies for at most one second using
 drive-disabled queries. A valid reply must pass voltage, temperature, position,
 and motor-error checks before startup completes. Health violations and later
-communication failures still stop immediately and require **Reconnect hands**.
+communication failures still stop immediately. USB communication failures retry
+automatically after one second, including while the adapter is absent. Each
+attempt validates both motors and seeds measured holds before accepting fresh
+headset intent. Health violations still require **Reconnect hands**.
 If startup times out, check motor power and the adapter-to-motor cable even if
 the USB adapter appears in `/dev/serial/by-id`. The fault includes its port and
 motor ID. USB presence alone does not establish motor communication.
@@ -206,7 +214,7 @@ these values are not universal factory calibration. No calibration is written.
 Do not run the stock DDS gripper service or the standalone movement tools at
 the same time. Each native worker claims its port exclusively against new opens.
 
-The default stroke duration is 1.5 seconds. `--dex1-transition-duration` accepts
+The default stroke duration is 1.35 seconds. `--dex1-transition-duration` accepts
 1.35–30 seconds. Targets replace the current trajectory immediately and start a
 new smooth ramp from measured position. The tested 1.0 N·m output torque cap is
 retained. Closing against an object can hold at that cap; an obstructed opening
@@ -225,20 +233,25 @@ it does not depend on local changes to the SDK constructors.
 - Stale headset input (0.5 seconds), pause, and safe idle cancel motion and
   hold measured position. The paused controller continues its heartbeat.
 - A missing Python heartbeat (0.25 seconds), invalid/replayed command,
-  feedback/control delay (60 ms), motor error, position/speed/torque violation,
+  feedback/control delay (60 ms), motor error, position violation,
   or voltage/temperature limit stops the worker. The other hand is stopped by
   the Python controller as well.
-- Worker failures latch in the UI. Check the Hands pane and device, then use
-  **Reconnect hands**. Reconnect starts fresh workers, seeds measured holds,
-  and discards queued input before accepting fresh headset intent.
+- USB communication failures stop both workers and retry automatically after
+  one second, without a retry-count limit. Missing adapters and failed disabled
+  handshakes are retried too. Recovery starts fresh workers, seeds measured
+  holds, and discards queued input before accepting fresh headset intent.
+- Motor health, command validation, watchdog, and other worker faults latch in
+  the UI. Check the Hands pane and device, then use **Reconnect hands**.
 - Normal shutdown, EOF, and handled SIGINT/SIGTERM/SIGHUP send three stop
   packets per motor. SIGKILL, power loss, and an unresponsive transport cannot
   guarantee delivery of a software stop packet.
 
-The initial motor checks retain the utility's 24–64 V supply range, housing
-temperature below 55 °C, drive temperature below 80 °C, output speed below
-9 rad/s, and measured output torque below 1.30 N·m. These are the local test
-profile's limits, not newly established manufacturer operating ratings.
+The motor checks retain the utility's 24–64 V supply range, housing
+temperature below 55 °C, and drive temperature below 80 °C. These are the local
+test profile's limits, not newly established manufacturer operating ratings.
+Measured speed and torque remain in telemetry but do not trigger a shutdown
+when they reach the former 9 rad/s or 1.30 N·m thresholds. Commanded output
+torque remains capped at 1.0 N·m.
 
 ## Recording and validation
 

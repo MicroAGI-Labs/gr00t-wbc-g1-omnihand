@@ -29,10 +29,12 @@ def test_limiter_is_optional_and_enabled_by_default(monkeypatch, disabled):
 
 
 def test_disabled_limiter_sends_live_pose_without_lag(streamer, monkeypatch):
-    monkeypatch.setattr(manager, "get_controller_inputs", lambda reader: (False, 0, 0, 0, 0))
+    monkeypatch.setattr(manager, "get_controller_inputs", lambda reader: (False, 0, 0, 1, 1))
     monkeypatch.setattr(manager, "compute_hand_joints_from_inputs", lambda *args: (np.zeros(7), np.zeros(7)))
     streamer.left_hand_ik_solver = streamer.right_hand_ik_solver = None
     target = vr_pose()
+    streamer.last_vr_pose = target.copy()
+    streamer.vr_arm_clutch.update(target, target, (1, 1), source_fresh=True, stopped=(True,) * 3)
     streamer.reader.get_latest = lambda: {"body_poses_np": target}
     streamer.three_point = SimpleNamespace(process_smpl_pose=lambda pose: pose.copy())
     for stamp, offset in enumerate((0.0, 0.3, -0.2), start=1):
@@ -277,10 +279,12 @@ def test_short_source_pause_brakes_and_resumes_without_reanchoring():
 
 
 def test_streamer_publishes_between_source_samples_and_stops_on_source_timeout(streamer, monkeypatch):
-    monkeypatch.setattr(manager, "get_controller_inputs", lambda reader: (False, 0, 0, 0, 0))
+    monkeypatch.setattr(manager, "get_controller_inputs", lambda reader: (False, 0, 0, 1, 1))
     monkeypatch.setattr(manager, "compute_hand_joints_from_inputs", lambda *args: (np.zeros(7), np.zeros(7)))
     streamer.left_hand_ik_solver = streamer.right_hand_ik_solver = None
     streamer.vr_conditioner, origin = initial()
+    streamer.last_vr_pose = origin.copy()
+    streamer.vr_arm_clutch.update(origin, origin, (1, 1), source_fresh=True, stopped=(True,) * 3)
     target = origin.copy()
     target[0, 0] += 0.05
     streamer.reader.get_latest = lambda: {"body_poses_np": target}
@@ -480,7 +484,7 @@ def test_generated_return_completes_only_after_limited_target_arrives(streamer, 
 
 def test_live_fault_brakes_holds_and_reanchors_without_a_jump(streamer, monkeypatch):
     monkeypatch.setattr(manager, "_process_3pt_pose", lambda sample: sample.copy())
-    monkeypatch.setattr(manager, "get_controller_inputs", lambda reader: (False, 0, 0, 0, 0))
+    monkeypatch.setattr(manager, "get_controller_inputs", lambda reader: (False, 0, 0, 1, 1))
     monkeypatch.setattr(manager, "compute_hand_joints_from_inputs", lambda *args: (np.zeros(7), np.zeros(7)))
     monkeypatch.setattr(manager, "get_controller_axes", lambda reader: (0, 1, 0, 0))
     streamer.three_point = manager.ThreePointPose(robot_model=object())
@@ -492,7 +496,7 @@ def test_live_fault_brakes_holds_and_reanchors_without_a_jump(streamer, monkeypa
     now = [0.0]
     monkeypatch.setattr(manager.time, "monotonic", lambda: now[0])
     streamer.reader.get_latest = lambda: {"body_poses_np": sample}
-    streamer.reader.get_timestamp_ns = lambda: int(now[0] * 1e9)
+    streamer.reader.get_timestamp_ns = lambda: 1_000_000_000 + int(now[0] * 1e9)
     assert streamer.recalibrate_for_vr3pt()
     assert streamer.run_once(manager.StreamMode.PLANNER_VR_3PT)
     for i in range(1, 6):

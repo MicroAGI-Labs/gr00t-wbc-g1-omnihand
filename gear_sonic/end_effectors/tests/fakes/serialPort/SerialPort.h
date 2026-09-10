@@ -42,6 +42,8 @@ struct SerialPort {
         if (std::getenv("DEX1_TEST_ACTIVE_FAILURE") && c->mode == 1) return false;
         d->correct = true; d->motor_id = c->id; d->mode = c->mode;
         d->tau = c->tau; d->bytes[5] = 50; d->bytes[4] = 30;
+        if (const auto* speed = std::getenv("DEX1_TEST_FEEDBACK_SPEED")) d->dq = std::stof(speed)*25;
+        if (const auto* torque = std::getenv("DEX1_TEST_FEEDBACK_TORQUE")) d->tau = std::stof(torque)/25;
         if (std::getenv("DEX1_TEST_LOW_VOLTAGE")) d->bytes[5] = 20;
         if (const auto* log = std::getenv("DEX1_TEST_MOTOR_LOG"))
             std::ofstream(log,std::ios::app) << c->mode << ' ' << c->tau*25 << '\n';

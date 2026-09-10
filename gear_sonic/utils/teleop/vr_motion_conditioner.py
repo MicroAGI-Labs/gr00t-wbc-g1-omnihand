@@ -93,10 +93,14 @@ class VRMotionConditioner:
 
     @property
     def stopped(self):
-        return max(np.max(np.linalg.norm(self.velocity, axis=1)),
-                   np.max(np.linalg.norm(self.angular_velocity, axis=1)),
-                   np.max(np.linalg.norm(self.acceleration, axis=1)),
-                   np.max(np.linalg.norm(self.angular_acceleration, axis=1))) < 1e-4
+        return bool(np.all(self.stopped_points))
+
+    @property
+    def stopped_points(self):
+        return np.maximum.reduce([
+            np.linalg.norm(state, axis=1) for state in
+            (self.velocity, self.angular_velocity, self.acceleration, self.angular_acceleration)
+        ]) < 1e-4
 
     def seed(self, pose, now):
         """Use a known stationary held target, never an uncalibrated Pico frame."""
@@ -118,7 +122,8 @@ class VRMotionConditioner:
         self.fault = ""
         self.rejected = 0
 
-    def update(self, target, now, *, live=True, source_fresh=True, source_timestamp_ns=None):
+    def update(self, target, now, *, live=True, source_fresh=True, source_timestamp_ns=None,
+               brake_mask=(False, False, False), reanchor_mask=(False, False, False)):
         if self.pose is None:
             raise RuntimeError("3PT conditioner must be seeded from the held target")
         elapsed = now - self.last_time
@@ -168,6 +173,16 @@ class VRMotionConditioner:
         except (ValueError, TypeError):
             self.fault = "invalid 3PT pose"
             target = self.pose.copy()
+        brake_mask = np.asarray(brake_mask, dtype=bool)
+        reset_reference = brake_mask | np.asarray(reanchor_mask, dtype=bool)
+        # A clutch release discards the old pursuit goal. A new anchor starts
+        # at the emitted pose and must not look like a tracking jump or velocity.
+        # Preserve actual velocity/acceleration so braking remains continuous.
+        self.raw[reset_reference] = self.pose[reset_reference]
+        previous_raw[reset_reference] = self.pose[reset_reference]
+        self.raw_velocity[:, reset_reference] = 0
+        self.target_velocity[:, reset_reference] = 0
+        self.velocity_qualified[:, reset_reference] = False
         if live and source_fresh and not self.fault:
             delta = target[:, :3] - self.raw[:, :3]
             angle = rotation_error(target[:, 3:], self.raw[:, 3:])
@@ -193,8 +208,8 @@ class VRMotionConditioner:
 
         # Brief interruptions brake for this update, then follow fresh input
         # again without discarding calibration. Only a full timeout latches.
-        braking = (bool(self.fault) or self.rejected > 0 or brief_gap
-                   or (live and now - self.last_source_time > 0.1))
+        braking = brake_mask | (bool(self.fault) or self.rejected > 0 or brief_gap
+                               or (live and now - self.last_source_time > 0.1))
         for angular, velocity, acceleration, vmax, amax, jmax in (
             (False, self.velocity, self.acceleration, limits.speed, limits.acceleration, limits.jerk),
             (True, self.angular_velocity, self.angular_acceleration, limits.angular_speed, limits.angular_acceleration, limits.angular_jerk),
@@ -222,9 +237,8 @@ class VRMotionConditioner:
                     qualified = np.linalg.norm(target_acceleration, axis=1) <= amax
                     self.target_velocity[int(angular), ~(qualified & self.velocity_qualified[int(angular)])] = 0
                     self.velocity_qualified[int(angular)] = qualified
-            if braking:
-                self.target_velocity[int(angular)] = 0
-                self.velocity_qualified[int(angular)] = False
+            self.target_velocity[int(angular), braking] = 0
+            self.velocity_qualified[int(angular), braking] = False
             target_velocity = self.raw_velocity[int(angular)]
             hard_speed = vmax * limits.hard_limit_factor
             hard_acceleration = amax * limits.hard_limit_factor
@@ -232,7 +246,7 @@ class VRMotionConditioner:
                       (np.linalg.norm(exact_acceleration, axis=1) <= amax) &
                       (np.linalg.norm(exact_acceleration - acceleration, axis=1) <= jmax * dt) &
                       (np.linalg.norm(exact_velocity, axis=1) + np.sum(exact_acceleration ** 2, axis=1) / (2 * jmax) <= hard_speed) &
-                      (not braking))
+                      ~braking)
             # Rejoining must allow acceleration to settle as well as matching
             # one pose. Otherwise repeated one-tick snaps create a limit cycle.
             joining_acceleration = (target_velocity - exact_velocity) / dt
@@ -251,8 +265,7 @@ class VRMotionConditioner:
             # the command away from that pose or invent a sideways goal.
             direction = error / np.maximum(np.linalg.norm(error, axis=1, keepdims=True), 1e-12)
             desired_velocity = direction * np.maximum(0, np.sum(desired_velocity * direction, axis=1, keepdims=True))
-            if braking:
-                desired_velocity[:] = 0
+            desired_velocity[braking] = 0
             desired_jerk = 3 * response ** 2 * (desired_velocity - velocity) - 3 * response * acceleration
             desired_acceleration = cap(acceleration + desired_jerk * dt, amax)
             if brief_gap:

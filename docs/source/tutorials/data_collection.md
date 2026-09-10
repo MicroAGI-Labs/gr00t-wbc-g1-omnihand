@@ -397,41 +397,50 @@ python gear_sonic/scripts/launch_data_collection.py \
 python gear_sonic/scripts/launch_data_collection.py --body-control-mode full-smpl
 ```
 
-In the planner-owned `vr3pt` and `ik-upper` configurations, **A+B+X+Y** starts
-SONIC in idle. A confirmed **A+X** then moves the arms smoothly over two seconds
-to `IDLE_BASE_POSE` (20-degree shoulder pitch moves the elbows behind the torso
-for balance, a negative elbow offset produces the 110-degree bend with the
-forearms pointing forward, and neutral wrists keep the hands parallel to the
-forearms while the palms face each other). The operator
-physically matches that robot pose and confirms **A+X** again; only then does
-the manager calibrate the operator and enter
-teleoperation. **B+Y** reverses the same flow, first returning to base pose and
-then interpolating back to idle. Locomotion is forced idle and hand intent is
-held during both interpolations.
+In the default `vr3pt` configuration, **A+B+X+Y** starts SONIC and enters
+VR control with both arms and hands held. There is no A+X calibration step.
+Release then hold each **middle-finger side button** to calibrate and enable
+that arm and hand independently. Each engagement captures fresh controller
+poses and headset heading against the held robot target. Releasing brings
+that arm to a hold and holds that hand. After engagement, release then press
+the **index trigger** to resume binary hand control: pressed closes, released
+opens.
 
-In `vr3pt`, base return starts from the last sent wrist/head VR target. It
-interpolates wrist positions and orientations to the base target over two
-seconds, with zero endpoint velocity and acceleration, while holding the head
-target. Pico body motion and sticks are ignored throughout return and base hold.
-The manager sends VR targets throughout this flow, without joint overrides;
-SONIC stays on its VR control path. Returning from base to idle also keeps a
-held VR target, with joystick locomotion available again after the return.
+**A** opens both hands and smoothly returns arms and waist to the existing
+ready/base pose. It keeps locomotion available and continues an active
+recording. The return follows the configured smooth
+transition duration; release/repress the side buttons afterward.
 
-Every confirmed **A+X** entry (two presses within two seconds) captures fresh Pico
-calibration against the held VR target, including its head pose. The first
-teleop packet preserves that target; subsequent packets follow Pico movement
-relative to the new calibration. Measured joint tracking error does not change
-the calibration reference. In `ik-upper`, interpolation uses the last sent arm
-override and calibration continues to use measured joints.
+VR motion filtering is off by default. Pico data stale for 100 ms latches the
+last arm targets, stops locomotion, and cancels any arm return. After fresh data
+returns, release both side buttons and center both sticks, then press a side
+button to recalibrate that arm. Long disconnects keep holding. Add
+`--no-disable-vr-motion-limiter` to the launcher to enable motion filtering;
+the independent Pico timeout remains active either way.
 
-During recording, **B+Y** and then double **A+X** can be used to leave VR for the
-base pose and re-enter VR. These navigation gestures leave the episode open;
-use **X+B** to save it.
+**B** smoothly returns the arms to the saved arms-on-legs planner resting pose
+while holding the grippers and preserving the waist target. Locomotion and
+recording remain available. Release/repress the side buttons to resume tracking.
 
-Fresh 29-DOF robot feedback is required before an interpolation or calibration.
-If it is unavailable, the manager stays in its current stable state instead of
-issuing a fallback pose. The legacy `full-smpl` configuration retains its direct
-POSE/PLANNER switch.
+**Left stick click** toggles locomotion. **Left stick up/down** commands
+forward/backward, and **right stick left/right** commands turning. Only one
+of these four actions is accepted at a time; simultaneous walking and turning
+inputs stop motion until unambiguous. **X** toggles normal/slow speed. Center
+the sticks after a mode/speed change. **X+B** records/saves; **Y+A** discards.
+See [all Pico controller controls](../references/pico_controller_controls.md)
+for input-loss recovery, trigger re-arming, and hand-server compatibility.
+
+Fresh robot feedback seeds initial VR targets; a grip press anchors against the
+last emitted target, preserving continuity despite measured tracking error.
+The manager sends Cartesian VR targets throughout home return, and SONIC keeps
+its whole-body balancing control. The headset provides alignment only and does
+not continuously drive the waist in this profile.
+
+The `ik-upper` configuration and Pico manager's `--legacy-vr-controls` option
+retain the older flow: **AXBY** starts in planner idle; double **A+X** returns to
+base; another double **A+X** calibrates and enters teleop. **B+Y** steps back
+through base to idle, with locomotion stopped during transitions. Full-body
+`full-smpl` retains its POSE/PLANNER switching behavior.
 
 After updating an existing checkout, rebuild the deployment and refresh the
 teleop environment once so the masked arm command and IK dependencies match:
@@ -535,7 +544,9 @@ All options are provided via CLI flags — no interactive prompts.  Key flags:
 
 ```{tip}
 Datasets are saved under `<root-output-dir>/<dataset-name>/`.  If `--dataset-name`
-is not specified, a timestamped name is generated automatically.
+is not specified, a new name is generated from the local date and time
+(`YYYY-MM-DD-HH-MM-SS-microseconds`). Each launch creates a separate dataset;
+pass an explicit name only when you want to append to an existing dataset.
 ```
 
 ### Recording Controls
@@ -546,19 +557,21 @@ There are two ways to control recording: **PICO VR controllers** (recommended du
 
 | Input | Action |
 |---|---|
-| **X + B** | **Toggle on release** — starts a new episode only while the A+X teleop mode is active, or stops and saves the current one |
+| **X + B** | **Toggle on release** — starts a new episode only while the selected teleop mode is active, or stops and saves the current one |
 | **Y + A** | **Discard on release** — saves the active episode flagged for removal during post-processing |
 
 Recording is locked to the launch-selected teleop mode (POSE, VR3PT, or IK
-upper). Mode changes are rejected while recording, so save or discard the take
-before using **B+Y** to leave teleoperation. Idle, base-pose, and interpolation
-frames cannot enter a successful take.
+upper). In the default VR controller profile, **A** returns home within VR3PT
+and the episode continues, including the return. **Y+A** never triggers A's
+home action, and **X+B** never triggers X's speed change. UI safe-idle aborts
+an active take. Legacy VR base navigation can keep a take open; other legacy
+mode changes require saving or discarding first.
 
 **Keyboard over ZMQ:**
 
 | Key | Action |
 |---|---|
-| `c` | **Toggle** recording (same as X + B; start requires the selected A+X mode) |
+| `c` | **Toggle** recording (same as X + B; start requires the selected teleop mode) |
 | `x` | **Discard** episode (same as Y + A — flagged for removal) |
 
 ```{note}

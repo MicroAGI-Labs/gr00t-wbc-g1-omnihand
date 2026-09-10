@@ -55,6 +55,10 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_rotation_matrix,
 )
 from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.teleop.vr_arm_clutch import VRArmClutch
+from gear_sonic.utils.teleop.pico_controls import (
+    PicoHandGate, PicoLocomotion, controller_poses, fresh_controller_sample,
+)
 from gear_sonic.utils.teleop.vr_motion_conditioner import VRMotionConditioner, VRMotionLimits
 from gear_sonic.utils.teleop.vr_motion_trace import VRMotionTrace
 from gear_sonic.utils.teleop.pico_body_diagnostics import DEFAULT_PICO_BODY_PORT, PicoBodyPublisher
@@ -199,11 +203,12 @@ DEFAULT_TELEOP_CONTROL_PORT = 5573
 
 
 class FaceChordTracker:
-    """Confirm a two-button face chord only after the whole gesture is released.
+    """Confirm a face gesture only after the whole gesture is released.
 
     Any third face button cancels the candidate. This lets the four-button
-    policy chord be pressed and released in any order without leaking one of
-    its two-button subsets into mode selection or data collection.
+    policy chord be pressed and released in any order without leaking subsets.
+    The controller profile also supports solo A, B and X, with union-based tracking
+    so staggered chord releases cannot become solo actions.
     """
 
     CHORDS = {
@@ -215,12 +220,17 @@ class FaceChordTracker:
         frozenset(("x", "y")): "xy",
     }
 
-    def __init__(self) -> None:
+    def __init__(self, *, singles=False) -> None:
+        self.singles = singles
+        self._armed = False
+        self._gesture = set()
         self._active = False
         self._candidate: str | None = None
         self._cancelled = False
 
     def reset(self) -> None:
+        self._armed = False
+        self._gesture.clear()
         self._active = False
         self._candidate = None
         self._cancelled = False
@@ -229,6 +239,18 @@ class FaceChordTracker:
         pressed = frozenset(
             name for name, down in (("a", a), ("b", b), ("x", x), ("y", y)) if down
         )
+        if self.singles:
+            if not self._armed:
+                self._armed = not pressed
+                return None
+            if pressed:
+                self._gesture.update(pressed)
+                return None
+            gesture = frozenset(self._gesture)
+            self.reset()
+            self._armed = True
+            return {frozenset(("a",)): "a", frozenset(("b",)): "b", frozenset(("x",)): "x",
+                    frozenset(("x", "b")): "xb", frozenset(("y", "a")): "ya"}.get(gesture)
         if not pressed:
             confirmed = self._candidate if self._active and not self._cancelled else None
             self.reset()
@@ -260,24 +282,35 @@ class HandIntentStream:
         self.sequence = time.monotonic_ns()
         self.last_source_timestamp_ns: int | None = None
         self.hysteresis = TriggerHysteresis()
+        self.gate = PicoHandGate()
 
-    def publish(self, socket, reader, *, hold: bool = False) -> None:
-        _, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(reader)
+    def publish(self, socket, reader, *, hold: bool = False, engaged=None, force_open=False) -> None:
+        sample = reader.get_latest() if engaged is not None else None
+        inputs = (sample["controller_inputs"] if sample is not None and engaged is not None
+                  else get_controller_inputs(reader))
+        _, left_trigger, right_trigger, left_grip, right_grip = inputs
         try:
-            source_timestamp_ns = int(reader.get_timestamp_ns())
+            source_timestamp_ns = int(sample["timestamp_ns"] if sample is not None
+                                      else reader.get_timestamp_ns())
         except Exception:
             source_timestamp_ns = 0
         valid = source_timestamp_ns > 0 and source_timestamp_ns != self.last_source_timestamp_ns
         if valid:
             self.last_source_timestamp_ns = source_timestamp_ns
-        # Preserve the familiar teleop fist control on the side grip while
-        # also accepting the index trigger. The external hand protocol is a
-        # binary open/close contract, so the stronger input is the close
-        # demand passed through hysteresis.
-        left_close = float(np.clip(max(left_trigger, left_grip), 0.0, 1.0))
-        right_close = float(np.clip(max(right_trigger, right_grip), 0.0, 1.0))
+        # Middle-finger grips clutch the arms; index triggers alone grasp.
+        left_close = float(np.clip(left_trigger, 0.0, 1.0))
+        right_close = float(np.clip(right_trigger, 0.0, 1.0))
         left_closed = self.hysteresis.update("left", left_close, valid)
         right_closed = self.hysteresis.update("right", right_close, valid)
+        side_holds, opening = (False, False), (False, False)
+        if engaged is not None:
+            fresh = fresh_controller_sample(sample, time.monotonic())
+            engaged = np.asarray(engaged, dtype=bool) & (np.asarray((left_grip, right_grip)) > 0.4) & (not hold)
+            side_holds, opening = self.gate.update(
+                (left_close, right_close), engaged, valid=fresh and not hold, force_open=force_open and not hold,
+            )
+            if not fresh:
+                valid = False
         self.sequence += 1
         socket.send(
             encode_hand_message(
@@ -290,12 +323,14 @@ class HandIntentStream:
                     "hold": hold,
                     "left": {
                         "valid": valid,
-                        "closed": left_closed,
+                        "closed": False if opening[0] else left_closed,
+                        "hold": bool(side_holds[0]),
                         "trigger": left_close,
                     },
                     "right": {
                         "valid": valid,
-                        "closed": right_closed,
+                        "closed": False if opening[1] else right_closed,
+                        "hold": bool(side_holds[1]),
                         "trigger": right_close,
                     },
                 },
@@ -787,6 +822,8 @@ _ISAAC_TELEOP_READERS = (input_readers.IsaacTeleopReader,)
 
 def get_controller_inputs(reader=None):
     """Fetch controller button/trigger states from XRoboToolkit or IsaacTeleop."""
+    if getattr(reader, "controller_tracking", False):
+        return (reader.get_latest() or {}).get("controller_inputs", (False, 0., 0., 0., 0.))
     if isinstance(reader, _ISAAC_TELEOP_READERS):
         ctrl = reader.get_controller_data()
         if ctrl is None:
@@ -808,6 +845,8 @@ def get_controller_inputs(reader=None):
 
 def get_controller_axes(reader=None):
     """Fetch joystick axes (lx, ly, rx, ry). Falls back to zeros if not available."""
+    if getattr(reader, "controller_tracking", False):
+        return (reader.get_latest() or {}).get("controller_axes", (0.,) * 4)
     if isinstance(reader, _ISAAC_TELEOP_READERS):
         ctrl = reader.get_controller_data()
         if ctrl is None:
@@ -855,6 +894,8 @@ def get_menu_buttons(reader=None):
 
 def get_axis_clicks(reader=None):
     """Fetch both axis click buttons (left, right). Falls back to False if not available."""
+    if getattr(reader, "controller_tracking", False):
+        return (reader.get_latest() or {}).get("axis_clicks", (False, False))
     if isinstance(reader, _ISAAC_TELEOP_READERS):
         ctrl = reader.get_controller_data()
         if ctrl is None:
@@ -900,6 +941,8 @@ def get_face_buttons(reader=None):
 
 def get_abxy_buttons(reader=None):
     """Fetch A,B,X,Y face buttons as booleans (a,b,x,y)."""
+    if getattr(reader, "controller_tracking", False):
+        return (reader.get_latest() or {}).get("face_buttons", (False,) * 4)
     if isinstance(reader, _ISAAC_TELEOP_READERS):
         ctrl = reader.get_controller_data()
         if ctrl is None:
@@ -976,7 +1019,8 @@ class PicoReader:
 
     STALE_TIMEOUT = 2.0
 
-    def __init__(self, max_queue_size: int = 15):
+    def __init__(self, max_queue_size: int = 15, *, controller_tracking=False):
+        self.controller_tracking = controller_tracking
         del max_queue_size
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -1022,7 +1066,7 @@ class PicoReader:
         with self._lock:
             self._latest = None
         _close_xrt()
-        _connect_xrt_body_stream()
+        _connect_xrt_body_stream(controller_tracking=self.controller_tracking)
         self.clear_disconnect()
         self.start()
 
@@ -1039,6 +1083,23 @@ class PicoReader:
         Use packet timing until a positive body clock has actually been seen.
         Once verified, a missing body clock must still trigger stale braking.
         """
+        if self.controller_tracking:
+            for _ in range(3):
+                stamp = int(xrt.get_time_stamp_ns())
+                if self._latest is not None and stamp == self._latest["timestamp_ns"]:
+                    return self._latest
+                pose = controller_poses(xrt.get_left_controller_pose(), xrt.get_right_controller_pose(),
+                                        xrt.get_headset_pose())
+                inputs, axes = get_controller_inputs(), get_controller_axes()
+                buttons, clicks = get_abxy_buttons(), get_axis_clicks()
+                if not np.all(np.isfinite((*inputs, *axes))):
+                    raise ValueError("non-finite Pico controls")
+                if stamp > 0 and stamp == int(xrt.get_time_stamp_ns()):
+                    return dict(controller_poses=pose, controller_inputs=inputs, controller_axes=axes,
+                                face_buttons=buttons, axis_clicks=clicks, timestamp_ns=stamp,
+                                source_timestamp_ns=stamp, body_timestamp_ns=None,
+                                timestamp_monotonic=time.monotonic(), timestamp_realtime=time.time())
+            return None
         body_clock = getattr(xrt, "get_body_timestamp_ns", None)
         for _ in range(3):
             packet_stamp = int(xrt.get_time_stamp_ns())
@@ -1069,7 +1130,7 @@ class PicoReader:
         last_report = time.time()
         while not self._stop.is_set():
             try:
-                body_available = xrt.is_body_data_available()
+                body_available = self.controller_tracking or xrt.is_body_data_available()
             except Exception as exc:
                 print(f"[PicoReader] availability error: {exc}")
                 body_available = False
@@ -1082,7 +1143,7 @@ class PicoReader:
             try:
                 sample = self._read_sample()
                 if sample is None:
-                    self._flag_disconnect_if_stale("No consistent body snapshot")
+                    self._flag_disconnect_if_stale("No consistent tracking snapshot")
                     time.sleep(0.001)
                     continue
                 stamp_ns = sample["timestamp_ns"]
@@ -1095,7 +1156,7 @@ class PicoReader:
             previous_body_stamp = None if self._latest is None else self._latest.get("body_timestamp_ns")
             if (prev_stamp_ns is not None and stamp_ns == prev_stamp_ns
                     and sample["body_timestamp_ns"] == previous_body_stamp):
-                self._flag_disconnect_if_stale("Body timestamps stopped")
+                self._flag_disconnect_if_stale("Tracking timestamps stopped")
                 time.sleep(0.000001)
                 continue
             # Compute device-based dt/fps using timestamp deltas (ns -> s)
@@ -1105,16 +1166,17 @@ class PicoReader:
                 self._fps_ema = inst if self._fps_ema == 0.0 else (0.9 * self._fps_ema + 0.1 * inst)
             self._last_stamp_ns = stamp_ns
             try:
-                _record_pico_body_diagnostics(
-                    available=True, poses=sample["body_poses_np"], packet_stamp=stamp_ns,
-                    body_stamp=sample["body_timestamp_ns"],
-                )
+                if not self.controller_tracking:
+                    _record_pico_body_diagnostics(
+                        available=True, poses=sample["body_poses_np"], packet_stamp=stamp_ns,
+                        body_stamp=sample["body_timestamp_ns"],
+                    )
                 sample.update(dt=device_dt, fps=self._fps_ema)
                 with self._lock:
                     self._latest = sample
                 self._last_new_data_time = time.monotonic()
                 if self._disconnected.is_set():
-                    print("[PicoReader] Fresh body data received; connection restored")
+                    print("[PicoReader] Fresh tracking received; connection restored")
                     self._disconnected.clear()
                 now = time.time()
                 if now - last_report >= 5.0:
@@ -1903,8 +1965,8 @@ def _close_xrt() -> None:
         print(f"[XRT] SDK close warning: {exc}")
 
 
-def _connect_xrt_body_stream() -> None:
-    """Keep resubscribing until live, advancing full-body timestamps arrive."""
+def _connect_xrt_body_stream(*, controller_tracking=False) -> None:
+    """Keep resubscribing until advancing controller or body samples arrive."""
     if xrt is None:
         raise ImportError(
             "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run Pico streaming."
@@ -1919,15 +1981,40 @@ def _connect_xrt_body_stream() -> None:
             xrt.init()
             deadline = time.monotonic() + XRT_CONNECT_ATTEMPT_SECONDS
             first_stamp_ns = None
+            last_packet_ns = None
+            next_tracking_report = 0.0
             while time.monotonic() < deadline:
-                body_available = xrt.is_body_data_available()
-                _record_pico_body_diagnostics(available=body_available)
+                body_available = controller_tracking or xrt.is_body_data_available()
+                if not controller_tracking:
+                    _record_pico_body_diagnostics(available=body_available)
                 if body_available:
                     stamp_ns = int(xrt.get_time_stamp_ns())
+                    if controller_tracking:
+                        # init() subscribes asynchronously: empty initial poses
+                        # are normal. Keep the subscription alive while packets
+                        # arrive, even if a controller/headset is not tracked yet.
+                        now = time.monotonic()
+                        if stamp_ns > 0 and stamp_ns != last_packet_ns:
+                            deadline = now + XRT_CONNECT_ATTEMPT_SECONDS
+                            last_packet_ns = stamp_ns
+                        try:
+                            controller_poses(xrt.get_left_controller_pose(), xrt.get_right_controller_pose(),
+                                             xrt.get_headset_pose())
+                        except (ValueError, TypeError) as exc:
+                            first_stamp_ns = None
+                            if now >= next_tracking_report:
+                                print(f"[XRT] Waiting for controller/headset tracking: {exc}")
+                                next_tracking_report = now + 2.0
+                            time.sleep(0.1)
+                            continue
+                        if stamp_ns <= 0:
+                            time.sleep(0.1)
+                            continue
                     if first_stamp_ns is None:
                         first_stamp_ns = stamp_ns
                     elif stamp_ns != first_stamp_ns:
-                        print("[XRT] Live full-body stream connected")
+                        print("[XRT] Live controller stream connected" if controller_tracking
+                              else "[XRT] Live full-body stream connected")
                         return
                 time.sleep(0.1)
         except KeyboardInterrupt:
@@ -1938,7 +2025,7 @@ def _connect_xrt_body_stream() -> None:
 
         _close_xrt()
         print(
-            "[XRT] No live body frames. Pane 1 will keep retrying; "
+            "[XRT] No live tracking frames. Pane 1 will keep retrying; "
             "start/restart streaming on the PICO to this PC."
         )
         time.sleep(1.0)
@@ -1947,10 +2034,11 @@ def _connect_xrt_body_stream() -> None:
 def _init_input_source(
     input_source: str,
     buffer_size: int,
+    controller_tracking: bool = False,
 ) -> "PicoReader | input_readers.IsaacTeleopReader":
     """Create, start, and wait for readiness of the requested teleop input source."""
     if input_source == "isaac-teleop":
-        reader = input_readers.IsaacTeleopReader(max_queue_size=buffer_size)
+        reader = input_readers.IsaacTeleopReader(max_queue_size=buffer_size, controller_tracking=controller_tracking)
         reader.start()
         print("Using Isaac Teleop (in-process CloudXR / DeviceIO), waiting for data...")
         while reader.get_latest() is None:
@@ -1963,10 +2051,11 @@ def _init_input_source(
             "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run Pico streaming."
         )
 
-    print("Waiting for live body tracking data...")
-    _connect_xrt_body_stream()
+    print("Waiting for live controller tracking..." if controller_tracking
+          else "Waiting for live body tracking data...")
+    _connect_xrt_body_stream(controller_tracking=controller_tracking)
 
-    reader = PicoReader(max_queue_size=buffer_size)
+    reader = PicoReader(max_queue_size=buffer_size, controller_tracking=controller_tracking)
     reader.start()
     return reader
 
@@ -2160,11 +2249,15 @@ class PlannerStreamer:
         ik_upper_body: bool = False,
         vr_motion_limits: VRMotionLimits | None = VRMotionLimits(),
         vr_motion_trace: VRMotionTrace | None = None,
+        controller_tracking: bool = False,
     ):
         self.socket = socket
         self.vr_motion_trace = vr_motion_trace
         self.reader = reader
         self.three_point = three_point
+        self.controller_tracking = controller_tracking
+        self.locomotion = PicoLocomotion()
+        self.locomotion.slow = initial_mode == LocomotionMode.SLOW_WALK
         self.feedback_reader = FeedbackReader(
             zmq_feedback_host=zmq_feedback_host, zmq_feedback_port=zmq_feedback_port
         )
@@ -2185,6 +2278,8 @@ class PlannerStreamer:
         self.held_vr_pose: np.ndarray | None = None
         self.first_vr_pose: np.ndarray | None = None
         self.disconnect_idle_pose: np.ndarray | None = None
+        self.controller_input_lost = False
+        self.vr_arm_clutch = VRArmClutch(controller_frame=controller_tracking)
         self.vr_conditioner = (
             VRMotionConditioner(vr_motion_limits) if vr_motion_limits is not None else None
         )
@@ -2200,6 +2295,22 @@ class PlannerStreamer:
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
         self.yaw_accumulator.reset()
+
+    @property
+    def vr_fault(self) -> bool:
+        return self.controller_input_lost or bool(self.vr_conditioner is not None and self.vr_conditioner.fault)
+
+    def hold_for_controller_loss(self):
+        """Latch loss independently of the optional motion conditioner."""
+        self.locomotion.invalidate()
+        if self.last_vr_pose is None or self.controller_input_lost:
+            return
+        self.controller_input_lost = True
+        self.vr_arm_clutch = VRArmClutch(controller_frame=True)
+        self.first_vr_pose = None
+        self.held_vr_pose = self.last_vr_pose.copy()
+        print("[PlannerLoop] Pico input stale for 100 ms; holding arms and stopping locomotion. "
+              "Release both grips and center sticks, then press a grip to recalibrate that arm.")
 
     def save_upper_body_position_target(self):
         """Poll feedback and save upper body position target."""
@@ -2240,6 +2351,16 @@ class PlannerStreamer:
             return False
         sample = self.reader.get_latest()
         target = self.last_vr_pose if self.last_vr_pose is not None else self.feedback_reader.vr_pose
+        if self.controller_tracking:
+            if not fresh_controller_sample(sample, time.monotonic()):
+                return False
+            if self.controller_input_lost and (
+                max(sample["controller_inputs"][3:]) > 0.4
+                or max(abs(v) for v in sample["controller_axes"]) > JOYSTICK_DEADZONE
+            ):
+                return False
+            if self.last_vr_pose is None:
+                target = self.vr_pose_from_upper_body(self.feedback_reader.upper_body_planner_target)
         if sample is None or target is None:
             print("[PlannerLoop] Cannot calibrate without Pico input and a current VR target")
             return False
@@ -2247,10 +2368,13 @@ class PlannerStreamer:
             self.disconnect_idle_pose = self.vr_pose_from_upper_body(
                 self.feedback_reader.upper_body_planner_target
             )
-        self.three_point.calibrate_to_vr_target(sample["body_poses_np"], target)
+        if not self.controller_tracking:
+            self.three_point.calibrate_to_vr_target(sample["body_poses_np"], target)
+        self.vr_arm_clutch = VRArmClutch(controller_frame=self.controller_tracking)
         self.first_vr_pose = target.copy()
         self.held_vr_pose = None
         self.last_vr_source_timestamp_ns = None
+        self.controller_input_lost = False
         if self.vr_conditioner is not None:
             self.vr_conditioner.seed(target, time.monotonic())
         print("[PlannerLoop] Pico recalibrated to held VR target; first command preserved")
@@ -2269,7 +2393,8 @@ class PlannerStreamer:
         ]))
 
     def begin_vr_return(
-        self, *, to_base: bool, duration_s: float, goal_override: np.ndarray | None = None
+        self, *, to_base: bool, duration_s: float, goal_override: np.ndarray | None = None,
+        return_head_home: bool = False,
     ) -> VRPoseTransition | None:
         needs_joint_start = to_base and self.last_vr_pose is None
         # A Pico disconnect must still return smoothly from the last command.
@@ -2310,22 +2435,35 @@ class PlannerStreamer:
         if not to_base:
             self.disconnect_idle_pose = goal.copy()
         # Returning the arms must not command a new head/waist orientation.
-        goal[2] = start[2]
+        if not return_head_home:
+            goal[2] = start[2]
         transition = VRPoseTransition(start, goal, started_at=time.monotonic(), duration_s=duration_s)
         self.first_vr_pose = None
         self.held_vr_pose = start.copy()
-        print("[PlannerLoop] Frozen VR return; Pico motion ignored until A+X calibration")
+        print("[PlannerLoop] Smooth VR return; release/repress grips afterward" if self.controller_tracking
+              else "[PlannerLoop] Frozen VR return; Pico motion ignored until A+X calibration")
         return transition
 
-    def send_vr_return_sample(self, transition: VRPoseTransition, now: float) -> tuple[bool, bool]:
+    def begin_vr_rest_return(self, *, duration_s: float) -> VRPoseTransition | None:
+        """Return to the saved planner resting arms, keeping the current waist target."""
+        if self.disconnect_idle_pose is None:
+            print("[PlannerLoop] Cannot return arms to legs without a saved planner resting pose")
+            return None
+        return self.begin_vr_return(
+            to_base=True, duration_s=duration_s, goal_override=self.disconnect_idle_pose,
+        )
+
+    def send_vr_return_sample(self, transition: VRPoseTransition, now: float,
+                              *, allow_locomotion=False, face_command=None) -> tuple[bool, bool]:
         pose, complete = transition.sample(now)
         sent = self.run_once(
-            StreamMode.PLANNER, vr_pose_override=pose, force_locomotion_idle=True
+            StreamMode.PLANNER, vr_pose_override=pose, force_locomotion_idle=not allow_locomotion,
+            face_command=face_command,
         )
         if sent:
             self.held_vr_pose = self.last_vr_pose.copy()
         reached = self.vr_conditioner is None or self.vr_conditioner.reached(transition.goal)
-        finished = complete and sent and reached
+        finished = complete and sent and reached and not self.vr_fault
         if finished:
             # Keep the endpoint fixed while the final sub-tolerance velocity
             # settles. Feeding each filtered output back as the next hold goal
@@ -2379,6 +2517,21 @@ class PlannerStreamer:
     ) -> bool:
         """Execute one iteration of the planner control loop."""
         try:
+            source_fresh = True
+            sample = None
+            source_timestamp_ns = None
+            controller_fresh = True
+            if self.controller_tracking:
+                sample = self.reader.get_latest()
+                controller_fresh = fresh_controller_sample(sample, time.monotonic())
+                if not controller_fresh:
+                    self.hold_for_controller_loss()
+                if self.controller_input_lost:
+                    # This also interrupts a generated A/B return. Fresh packets
+                    # alone cannot resume motion against the old calibration.
+                    vr_pose_override = self.held_vr_pose
+                    force_locomotion_idle = True
+                source_timestamp_ns = (sample or {}).get("timestamp_ns", 0)
             if vr_pose_override is None and self.held_vr_pose is not None:
                 vr_pose_override = self.held_vr_pose
             if vr_pose_override is not None and upper_body_override is not None:
@@ -2391,13 +2544,11 @@ class PlannerStreamer:
                 or self.first_vr_pose is not None
                 or stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE
             )
-            source_fresh = True
-            sample = None
-            source_timestamp_ns = None
             # Generated targets must remain sendable while the native Pico
             # client is disconnected (including timestamp API failures).
             if not generated_vr:
-                sample = self.reader.get_latest()
+                if not self.controller_tracking:
+                    sample = self.reader.get_latest()
                 # Keep the pose and freshness decision tied to this snapshot.
                 # The fallback supports readers without timestamped samples.
                 xrt_timestamp = (sample["timestamp_ns"] if sample is not None and "timestamp_ns" in sample
@@ -2412,8 +2563,10 @@ class PlannerStreamer:
                 previous_stamp = (getattr(self, "last_vr_source_timestamp_ns", None)
                                   if stream_mode == StreamMode.PLANNER_VR_3PT else self.last_xrt_timestamp)
                 source_fresh = freshness_stamp > 0 and freshness_stamp != previous_stamp
+                if self.controller_tracking:
+                    source_fresh &= controller_fresh
                 continuous_vr = (stream_mode == StreamMode.PLANNER_VR_3PT
-                                 and self.vr_conditioner is not None)
+                                 and (self.controller_tracking or self.vr_conditioner is not None))
                 if not source_fresh and not transition_or_base_pose and not continuous_vr:
                     return False
 
@@ -2430,10 +2583,20 @@ class PlannerStreamer:
             if force_locomotion_idle:
                 lx, ly, rx, ry = (0.0, 0.0, 0.0, 0.0)
             else:
-                lx, ly, rx, ry = get_controller_axes(self.reader)
+                lx, ly, rx, ry = (sample["controller_axes"] if self.controller_tracking and sample
+                                  else get_controller_axes(self.reader))
+
+            if self.controller_tracking:
+                ly, rx = self.locomotion.update(
+                    (lx, ly, rx, ry), (sample or {}).get("axis_clicks", (False, False))[0], face_command,
+                    fresh=controller_fresh and not force_locomotion_idle,
+                )
+                lx = ry = 0.
+                self.mode = LocomotionMode.SLOW_WALK if self.locomotion.slow else LocomotionMode.WALK
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
-            facing = self.yaw_accumulator.update(rx, self.dt)
+            turn_dt = self.dt * (0.5 if self.controller_tracking and self.locomotion.slow else 1.)
+            facing = self.yaw_accumulator.update(rx, turn_dt)
 
             raw_mag = np.hypot(lx, ly)
             raw_mag = np.clip(raw_mag, 0.0, 1.0)
@@ -2448,7 +2611,7 @@ class PlannerStreamer:
                 mode_to_send = self.mode
 
                 if self.mode == LocomotionMode.SLOW_WALK:
-                    speed = 0.1 + 0.5 * mag  # 0.1 .. 0.6
+                    speed = 0.1 + 0.5 * mag  # 0.1 .. 0.6 m/s
                 elif self.mode == LocomotionMode.WALK:
                     speed = -1.0
                 elif self.mode == LocomotionMode.RUN:
@@ -2498,28 +2661,43 @@ class PlannerStreamer:
             vr_3pt_orientation = None
             vr_3pt_compliance = None
             sent_vr_pose = None
+            next_clutch = None
+            clutch_brake = clutch_reanchor = (False, False, False)
             if generated_vr:
                 sent_vr_pose = validate_vr_pose(vr_pose_override)
                 vr_3pt_position = sent_vr_pose[:, :3].flatten().tolist()
                 vr_3pt_orientation = sent_vr_pose[:, 3:].flatten().tolist()
             elif stream_mode == StreamMode.PLANNER_VR_3PT:
-                if self.first_vr_pose is not None:
-                    vr_3pt_pose = self.first_vr_pose.copy()
-                else:
-                    if sample is None:
-                        return False
-                    vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
-                sent_vr_pose = vr_3pt_pose
-
-                # Compute hand joints from trigger/grip inputs so operator can
-                # control hand open/close while in VR 3PT mode
+                if sample is None:
+                    return False
+                vr_3pt_pose = (sample["controller_poses"] if self.controller_tracking
+                               else self.three_point.process_smpl_pose(sample["body_poses_np"]))
                 (
                     left_menu_button,
                     left_trigger,
                     right_trigger,
                     left_grip,
                     right_grip,
-                ) = get_controller_inputs(self.reader)
+                ) = (sample["controller_inputs"] if self.controller_tracking
+                     else get_controller_inputs(self.reader))
+                held = self.first_vr_pose if self.first_vr_pose is not None else self.last_vr_pose
+                if held is None:
+                    raise RuntimeError("VR arm clutches require a calibrated held target")
+                next_clutch = deepcopy(self.vr_arm_clutch)
+                try:
+                    sent_vr_pose, clutch_brake, clutch_reanchor = next_clutch.update(
+                        vr_3pt_pose, held, (left_grip, right_grip), source_fresh=source_fresh,
+                        stopped=(self.vr_conditioner.stopped_points if self.vr_conditioner is not None
+                                 else (True, True, True)),
+                    )
+                except (ValueError, TypeError):
+                    # Let the conditioner latch invalid tracking and brake;
+                    # never consume a press against an invalid reference.
+                    next_clutch = None
+                    sent_vr_pose = vr_3pt_pose
+                if self.first_vr_pose is not None:
+                    sent_vr_pose = self.first_vr_pose.copy()
+                # Index triggers control hand opening/closing independently.
                 lh_joints, rh_joints = compute_hand_joints_from_inputs(
                     self.left_hand_ik_solver,
                     self.right_hand_ik_solver,
@@ -2551,9 +2729,12 @@ class PlannerStreamer:
                     # Commit filter state only after the corresponding packet is sent.
                     next_conditioner = deepcopy(self.vr_conditioner)
                     sent_vr_pose = next_conditioner.update(
-                        sent_vr_pose, command_time, live=not generated_vr,
-                        source_fresh=source_fresh,
+                        sent_vr_pose, command_time,
+                        live=not generated_vr or self.controller_input_lost,
+                        source_fresh=source_fresh and controller_fresh and not self.controller_input_lost,
                         source_timestamp_ns=source_timestamp_ns,
+                        brake_mask=(True, True, True) if self.controller_input_lost else clutch_brake,
+                        reanchor_mask=clutch_reanchor,
                     )
                     if next_conditioner.fault:
                         mode_to_send = LocomotionMode.IDLE
@@ -2562,7 +2743,12 @@ class PlannerStreamer:
                     sent_vr_pose = validate_vr_pose(sent_vr_pose)
                 vr_3pt_position = sent_vr_pose[:, :3].flatten().tolist()
                 vr_3pt_orientation = sent_vr_pose[:, 3:].flatten().tolist()
-                if self.disconnect_idle_pose is not None:
+                if self.controller_tracking:
+                    # SONIC caches this fallback for a publisher outage. Keep
+                    # holding indefinitely, including while the SDK reconnects;
+                    # the arms-on-legs pose remains available through B only.
+                    base_pose = sent_vr_pose[:2].reshape(-1).tolist()
+                elif self.disconnect_idle_pose is not None:
                     # Keep the legacy wire name; the endpoint is planner idle,
                     # matching the second B+Y return, not calibration base.
                     base_pose = self.disconnect_idle_pose[:2].reshape(-1).tolist()
@@ -2593,17 +2779,23 @@ class PlannerStreamer:
                 ),
             )
             self.socket.send(msg)
+            if next_clutch is not None:
+                self.vr_arm_clutch = next_clutch
             if not generated_vr:
                 self.last_xrt_timestamp = xrt_timestamp
                 if stream_mode == StreamMode.PLANNER_VR_3PT:
                     self.last_vr_source_timestamp_ns = freshness_stamp
             if next_conditioner is not None:
                 if next_conditioner.fault and not self.vr_conditioner.fault:
-                    print(f"[PlannerLoop] {next_conditioner.fault}; braking to hold. A+X twice to re-anchor.")
+                    recovery = ("Release grips and center sticks to re-arm." if self.controller_tracking
+                                else "A+X twice to re-anchor.")
+                    print(f"[PlannerLoop] {next_conditioner.fault}; braking to hold. {recovery}")
                 self.vr_conditioner = next_conditioner
                 if next_conditioner.fault:
                     self.held_vr_pose = sent_vr_pose.copy()
             self.last_vr_pose = None if sent_vr_pose is None else sent_vr_pose.copy()
+            if self.controller_input_lost and sent_vr_pose is not None:
+                self.held_vr_pose = sent_vr_pose.copy()
             if input_vr_pose is not None and getattr(self, "vr_motion_trace", None) is not None:
                 self.vr_motion_trace.record(
                     input_vr_pose, sent_vr_pose, next_conditioner, now=command_time,
@@ -2659,7 +2851,7 @@ def run_pico_manager(
     recording_status_port: int = 5581,
     teleop_control_host: str = "localhost",
     teleop_control_port: int = DEFAULT_TELEOP_CONTROL_PORT,
-    idle_base_transition_duration: float = 5.0,
+    idle_base_transition_duration: float = 2.0,
     vr_max_speed: float = 0.15,
     vr_max_acceleration: float = 0.6,
     vr_max_angular_speed_deg: float = 90.0,
@@ -2667,16 +2859,15 @@ def run_pico_manager(
     vr_max_jerk: float = 6.0,
     vr_max_angular_jerk_deg: float = 3600.0,
     vr_motion_log_dir: str | None = None,
-    disable_vr_motion_limiter: bool = False,
+    disable_vr_motion_limiter: bool = True,
+    legacy_vr_controls: bool = False,
 ):
     """
     Manager: publishes body and latest-only hand intent from one fixed-rate loop.
-    Controller input:
-      A+X: Twice within 2s advances toward teleop; X+B saves a recording
-      A+B+X+Y: Start the policy from OFF
-      B+Y: Step back from teleop to base pose, then from base pose to idle
-      X+B: Start/stop-success recording
-      Y+A: The only explicit discard gesture
+    Default VR controls: AXBY starts, grips calibrate/gate each arm and hand,
+    A opens hands and returns home, B returns arms to legs, left stick click toggles locomotion, and
+    X toggles slow speed. XB records/saves; YA discards. Other modes and
+    --legacy-vr-controls retain the SMPL/A+X navigation flow.
     """
     motion_limits = VRMotionLimits(
         speed=vr_max_speed, acceleration=vr_max_acceleration,
@@ -2684,7 +2875,8 @@ def run_pico_manager(
         angular_acceleration=np.deg2rad(vr_max_angular_acceleration_deg),
         jerk=vr_max_jerk, angular_jerk=np.deg2rad(vr_max_angular_jerk_deg),
     )
-    reader = _init_input_source(input_source, buffer_size)
+    controller_tracking = teleop_mode == "vr3pt" and not legacy_vr_controls
+    reader = _init_input_source(input_source, buffer_size, controller_tracking)
     if teleop_mode not in {"pose", "vr3pt", "ik-upper"}:
         raise ValueError("teleop_mode must be 'pose', 'vr3pt', or 'ik-upper'")
     if not np.isfinite(idle_base_transition_duration) or idle_base_transition_duration <= 0:
@@ -2778,17 +2970,22 @@ def run_pico_manager(
         ik_upper_body=teleop_mode == "ik-upper",
         vr_motion_limits=None if disable_vr_motion_limiter else motion_limits,
         vr_motion_trace=motion_trace,
+        controller_tracking=controller_tracking,
     )
     if disable_vr_motion_limiter:
         print("[Manager] VR motion limiter DISABLED: calibrated poses pass through directly")
     else:
         print(f"[Manager] VR jerk limits: {vr_max_jerk:g} m/s^3, {vr_max_angular_jerk_deg:g} deg/s^3; never relaxed")
-        print(f"[Manager] VR control-gap fault threshold: {motion_limits.control_gap_timeout_s:g}s; shorter gaps recover without recalibration")
+        print(f"[Manager] VR conditioner control-gap fault threshold: {motion_limits.control_gap_timeout_s:g}s")
         print(f"[Manager] VR operating speed/acceleration: {vr_max_speed:g} m/s, {vr_max_acceleration:g} m/s^2; "
               f"{vr_max_angular_speed_deg:g} deg/s, {vr_max_angular_acceleration_deg:g} deg/s^2; hard ceilings = 1.5x")
+    if controller_tracking:
+        print("[Manager] Pico watchdog: 100 ms stale input latches arm hold; release both grips, "
+              "center sticks, then press a grip to recalibrate. No automatic return to legs.")
     hand_intent = HandIntentStream()
 
-    # Stable manager states for planner-based teleoperation:
+    # Legacy planner-based teleoperation states (direct controllers use
+    # OFF -> PLANNER -> VR_3PT, with A returning home inside VR_3PT):
     #
     #              A+X                         A+X + calibration
     #     PLANNER ------> IDLE_BASE_POSE --------------------------> TELEOP
@@ -2806,22 +3003,29 @@ def run_pico_manager(
     #   the process; the headset gesture cannot transition back to OFF.
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
-    print(
-        f"Manager controls: twice within 2s A+X=advance toward {teleop_mode.upper()} teleop, "
-        "X+B=record/save, Y+A=only discard, "
-        f"A+B+X+Y=start policy (start-only); initial gait={initial_mode.name}"
-    )
+    if not controller_tracking:
+        print(
+            f"Manager controls: twice within 2s A+X=advance toward {teleop_mode.upper()} teleop, "
+            "X+B=record/save, Y+A=only discard, "
+            f"A+B+X+Y=start policy (start-only); initial gait={initial_mode.name}"
+        )
     current_mode = StreamMode.OFF
     vr3pt_parent_mode = StreamMode.PLANNER
     upper_body_transition: JointPoseTransition | VRPoseTransition | None = None
     transition_destination: StreamMode | None = None
+    transition_opens_hands = False
     recorder_is_recording = False
     recorder_command_timestamp = 0.0
     safe_idle_requested = False
+    controller_resume_allowed = False
     last_teleop_control_sequence = -1
     policy_started = False
     disconnect_hold_active = False
-    face_chords = FaceChordTracker()
+    face_chords = FaceChordTracker(singles=controller_tracking)
+    if controller_tracking:
+        print("[Manager] Controller controls: AXBY=start; grips=calibrate arms/enable hands; "
+              "triggers=open/close; A=open/home; B=arms to legs (walking stays live); left stick click=locomotion; "
+              "X=normal/slow; XB=record/save; YA=discard. No A+X calibration.")
     ax_double_press = DoublePressTracker(window_seconds=2.0)
     manager_period = 1.0 / max(target_fps, 1)
     manager_deadline = time.monotonic()
@@ -2836,6 +3040,11 @@ def run_pico_manager(
         prev_left_axis_click = False
         while True:
             if reader.disconnected:
+                if controller_tracking:
+                    planner_streamer.hold_for_controller_loss()
+                    if planner_streamer.last_vr_pose is not None:
+                        # Stop walking before entering the blocking SDK reconnect.
+                        planner_streamer.run_once(current_mode, force_locomotion_idle=True)
                 print(
                     "[Manager] Teleop frames lost; suspending teleop input. "
                     "SONIC remains running."
@@ -2918,7 +3127,7 @@ def run_pico_manager(
                                     planner_streamer.vr_conditioner.seed(pose, time.monotonic())
                                 break
                         time.sleep(0.1)
-                    if (planner_streamer.disconnect_idle_pose is not None and
+                    if (not controller_tracking and planner_streamer.disconnect_idle_pose is not None and
                             (return_started or time.monotonic() - disconnect_started_at >= 15.0)):
                         transition = planner_streamer.begin_vr_return(
                             to_base=True, duration_s=idle_base_transition_duration,
@@ -2939,7 +3148,9 @@ def run_pico_manager(
                 prev_left_axis_click = False
                 face_chords.reset()
                 ax_double_press.reset()
-                if disconnect_hold_active:
+                if controller_tracking and disconnect_hold_active:
+                    print("[Manager] Reconnected; release grips and center sticks to resume.")
+                elif disconnect_hold_active:
                     print(
                         "[Manager] Teleop reconnected; arms remain held and locomotion IDLE. "
                         "Use A+X twice to recalibrate/resume, or B+Y to return to idle."
@@ -2980,6 +3191,10 @@ def run_pico_manager(
                 ):
                     last_teleop_control_sequence = sequence
                     safe_idle_requested = True
+                    if controller_tracking:
+                        controller_resume_allowed = False
+                        planner_streamer.locomotion.enabled = False
+                        planner_streamer.locomotion.invalidate()
                     if recorder_is_recording:
                         recorder_is_recording = False
                         recorder_command_timestamp = time.time()
@@ -3000,6 +3215,11 @@ def run_pico_manager(
                 bool(a_pressed), bool(b_pressed), bool(x_pressed), bool(y_pressed)
             )
             start_combo = bool(a_pressed) and bool(b_pressed) and bool(x_pressed) and bool(y_pressed)
+            controls_fresh = not controller_tracking or fresh_controller_sample(reader.get_latest(), time.monotonic())
+            if not controls_fresh:
+                face_chords.reset()
+                face_command = None
+                start_combo = False
 
             # During recording, A+X navigates from base back into teleoperation.
             ax_pressed = False
@@ -3051,6 +3271,26 @@ def run_pico_manager(
                         f"[Manager] Safe-idle request unavailable from {current_mode.name}; "
                         "planner-based teleop must be running"
                     )
+            elif controller_tracking:
+                if current_mode == StreamMode.OFF:
+                    if start_combo and not prev_start_combo:
+                        new_mode = StreamMode.PLANNER
+                        policy_started = True
+                        controller_resume_allowed = True
+                elif current_mode == StreamMode.PLANNER and policy_started:
+                    if start_combo and not prev_start_combo:
+                        controller_resume_allowed = True
+                    if controller_resume_allowed:
+                        new_mode = StreamMode.PLANNER_VR_3PT
+                elif current_mode == StreamMode.PLANNER_IDLE_BASE_POSE and controls_fresh:
+                    if start_combo and not prev_start_combo:
+                        controller_resume_allowed = True
+                    inputs = get_controller_inputs(reader)
+                    neutral = max(abs(v) for v in get_controller_axes(reader)) <= JOYSTICK_DEADZONE
+                    if controller_resume_allowed and neutral and max(inputs[3:]) <= 0.4:
+                        new_mode = StreamMode.PLANNER_VR_3PT
+                elif current_mode == StreamMode.PLANNER_VR_3PT and face_command in {"a", "b"}:
+                    requested_transition = StreamMode.PLANNER_VR_3PT
             elif current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.PLANNER
@@ -3116,7 +3356,7 @@ def run_pico_manager(
                 (face_command == "by" and current_mode == StreamMode.PLANNER_VR_3PT)
                 or (face_command == "ax" and current_mode == StreamMode.PLANNER_IDLE_BASE_POSE)
             )
-            if recorder_is_recording and not recording_navigation and (
+            if recorder_is_recording and not controller_tracking and not recording_navigation and (
                 new_mode != current_mode or requested_transition is not None
             ):
                 attempted_mode = requested_transition or new_mode
@@ -3131,10 +3371,16 @@ def run_pico_manager(
             if requested_transition is not None:
                 needs_planner_target = requested_transition == StreamMode.PLANNER
                 if teleop_stream_mode == StreamMode.PLANNER_VR_3PT:
-                    upper_body_transition = planner_streamer.begin_vr_return(
-                        to_base=not needs_planner_target,
-                        duration_s=idle_base_transition_duration,
-                    )
+                    if controller_tracking and face_command == "b":
+                        upper_body_transition = planner_streamer.begin_vr_rest_return(
+                            duration_s=idle_base_transition_duration,
+                        )
+                    else:
+                        upper_body_transition = planner_streamer.begin_vr_return(
+                            to_base=not needs_planner_target,
+                            duration_s=idle_base_transition_duration,
+                            return_head_home=controller_tracking and face_command == "a",
+                        )
                 else:
                     transition_start = planner_streamer.commanded_transition_start()
                     if transition_start is not None:
@@ -3153,7 +3399,10 @@ def run_pico_manager(
                             duration_s=idle_base_transition_duration,
                         )
                 if upper_body_transition is not None:
+                    if controller_tracking:
+                        planner_streamer.vr_arm_clutch = VRArmClutch(controller_frame=True)
                     transition_destination = requested_transition
+                    transition_opens_hands = controller_tracking and face_command == "a"
                     ax_double_press.reset()
                     print(
                         "[Manager] Smooth upper-body transition: "
@@ -3189,12 +3438,14 @@ def run_pico_manager(
                     if not planner_streamer.prepare_ik_upper_body():
                         new_mode = current_mode
 
-            # The public source state remains unchanged until the final target
-            # is sent. VR returns never read live Pico or send joint overrides.
+            # Keep the public source state until the final target is sent.
+            # Controller A/B returns retain live locomotion; arms use generated VR targets.
             transition_completed = False
             if isinstance(upper_body_transition, VRPoseTransition):
                 planner_sent, transition_completed = planner_streamer.send_vr_return_sample(
-                    upper_body_transition, time.monotonic()
+                    upper_body_transition, time.monotonic(),
+                    allow_locomotion=controller_tracking and transition_destination == StreamMode.PLANNER_VR_3PT,
+                    face_command=face_command,
                 )
                 planner_report_count += int(planner_sent)
             elif upper_body_transition is not None:
@@ -3223,22 +3474,23 @@ def run_pico_manager(
                         new_mode,
                         face_command=face_command,
                         vr_pose_override=planner_streamer.held_vr_pose,
-                        force_locomotion_idle=disconnect_hold_active,
+                        force_locomotion_idle=controller_tracking or disconnect_hold_active,
                     )
                 else:
                     planner_sent = planner_streamer.run_once(
                         new_mode,
                         face_command=face_command,
+                        force_locomotion_idle=controller_tracking and new_mode != StreamMode.PLANNER_VR_3PT,
                     )
                 planner_report_count += int(planner_sent)
 
-            if (planner_streamer.vr_conditioner is not None
-                    and planner_streamer.vr_conditioner.fault
+            if (planner_streamer.vr_fault
                     and new_mode in PLANNER_STREAM_MODES
                     and planner_streamer.last_vr_pose is not None):
                 upper_body_transition = None
                 transition_destination = None
                 transition_completed = False
+                safe_idle_requested = False
                 new_mode = StreamMode.PLANNER_IDLE_BASE_POSE
                 disconnect_hold_active = True
 
@@ -3251,9 +3503,7 @@ def run_pico_manager(
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
-                disconnect_hold_active = bool(
-                    planner_streamer.vr_conditioner is not None and planner_streamer.vr_conditioner.fault
-                )
+                disconnect_hold_active = planner_streamer.vr_fault
 
             if transition_completed:
                 completed_destination = transition_destination
@@ -3267,6 +3517,10 @@ def run_pico_manager(
                 disconnect_hold_active = False
                 upper_body_transition = None
                 transition_destination = None
+                if controller_tracking and current_mode == StreamMode.PLANNER_VR_3PT:
+                    planner_streamer.held_vr_pose = None
+                    planner_streamer.first_vr_pose = planner_streamer.last_vr_pose.copy()
+                    planner_streamer.vr_arm_clutch = VRArmClutch(controller_frame=True)
 
             # Mode-independent: send manager_state for data exporter
             recording_action = recording_face_action(
@@ -3282,8 +3536,8 @@ def run_pico_manager(
             toggle_da = recording_action == "discard" or safe_idle_abort_requested
             if toggle_dc_requested and not toggle_dc:
                 print(
-                    "[Manager] Recorder start rejected: use A+X twice within 2s to enter "
-                    f"{teleop_stream_mode.name} first"
+                    "[Manager] Recorder start rejected: enter the active teleop mode first: "
+                    f"{teleop_stream_mode.name}"
                 )
             if toggle_dc:
                 was_recording = recorder_is_recording
@@ -3324,13 +3578,18 @@ def run_pico_manager(
                 )
             )
             manager_report_count += 1
+            home_return = (controller_tracking and transition_destination == StreamMode.PLANNER_VR_3PT
+                           and transition_opens_hands)
             hand_intent.publish(
                 hand_socket,
                 reader,
                 hold=(
-                    upper_body_transition is not None
+                    (upper_body_transition is not None and not home_return)
                     or current_mode == StreamMode.PLANNER_IDLE_BASE_POSE
+                    or (controller_tracking and current_mode != StreamMode.PLANNER_VR_3PT)
                 ),
+                engaged=planner_streamer.vr_arm_clutch.tracking if controller_tracking else None,
+                force_open=home_return,
             )
 
             prev_ax_pressed = ax_pressed
@@ -3510,7 +3769,7 @@ if __name__ == "__main__":
         choices=["pose", "vr3pt", "ik-upper"],
         default="pose",
         help=(
-            "Teleop mode selected by double A+X: full-body pose, learned VR 3-point planner, "
+            "Teleop mode: full-body pose, direct-controller VR 3-point planner, "
             "or deterministic arm IK with planner-owned legs/waist"
         ),
     )
@@ -3520,11 +3779,13 @@ if __name__ == "__main__":
         default="idle",
         help="Initial joystick gait in planner and VR 3-point modes",
     )
+    parser.add_argument("--legacy-vr-controls", action="store_true",
+                        help="Use the older SMPL/A+X controls instead of direct-controller VR clutches")
     parser.add_argument(
         "--idle-base-transition-duration",
         type=float,
-        default=5.0,
-        help="Seconds for each arm transition into or out of idle base pose (default: 5.0)",
+        default=2.0,
+        help="Seconds for each arm transition into or out of idle base pose (default: 2.0)",
     )
     parser.add_argument("--vr-max-speed", type=float, default=0.15, help="3PT translation speed in m/s")
     parser.add_argument("--vr-max-acceleration", type=float, default=0.6, help="3PT translation acceleration in m/s^2")
@@ -3533,10 +3794,17 @@ if __name__ == "__main__":
     parser.add_argument("--vr-max-jerk", type=float, default=6.0, help="Fixed translation jerk ceiling, m/s^3")
     parser.add_argument("--vr-max-angular-jerk-deg", type=float, default=3600.0, help="Fixed angular jerk ceiling, deg/s^3")
     parser.add_argument("--vr-motion-log-dir", help="Directory for full-rate before/after VR command traces")
-    parser.add_argument(
+    limiter_options = parser.add_mutually_exclusive_group()
+    limiter_options.add_argument(
         "--disable-vr-motion-limiter",
         action="store_true",
-        help="Bypass VR pose smoothing, motion caps, and tracking-jump filtering for this run",
+        default=True,
+        help="Bypass VR motion filtering (default); Pico's 100 ms stale-input hold remains active",
+    )
+    limiter_options.add_argument(
+        "--enable-vr-motion-limiter", "--no-disable-vr-motion-limiter",
+        dest="disable_vr_motion_limiter", action="store_false",
+        help="Enable VR pose smoothing, motion caps, and tracking-jump filtering",
     )
     parser.add_argument("--pico-body-port", type=int, default=DEFAULT_PICO_BODY_PORT,
                         help="Local raw PICO body diagnostics publisher port")
@@ -3601,6 +3869,7 @@ if __name__ == "__main__":
             vr_max_angular_jerk_deg=args.vr_max_angular_jerk_deg,
             vr_motion_log_dir=args.vr_motion_log_dir,
             disable_vr_motion_limiter=args.disable_vr_motion_limiter,
+            legacy_vr_controls=args.legacy_vr_controls,
         )
     else:
         # Run legacy single-thread pose streaming
