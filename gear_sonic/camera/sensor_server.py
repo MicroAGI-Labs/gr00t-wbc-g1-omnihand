@@ -121,12 +121,14 @@ class ImageMessageSchema:
     publisher_sequence: int | None = None
     publisher_monotonic_ns: int | None = None
     depths: dict[str, np.ndarray] = field(default_factory=dict)
+    capture_monotonic_ns: dict[str, int] = field(default_factory=dict)
 
     def serialize(self) -> dict[str, Any]:
         serialized_msg: dict[str, Any] = {
             "timestamps": self.timestamps,
             "images": {},
             "depths": {key: np.asarray(value) for key, value in self.depths.items()},
+            "capture_monotonic_ns": self.capture_monotonic_ns,
             "sample_monotonic_ns": self.sample_monotonic_ns,
             "publisher_sequence": self.publisher_sequence,
             "publisher_monotonic_ns": self.publisher_monotonic_ns,
@@ -159,6 +161,7 @@ class ImageMessageSchema:
             timestamps=timestamps,
             images=images,
             depths=depths,
+            capture_monotonic_ns=data.get("capture_monotonic_ns", {}),
             sample_monotonic_ns=data.get("sample_monotonic_ns"),
             publisher_sequence=data.get("publisher_sequence"),
             publisher_monotonic_ns=data.get("publisher_monotonic_ns"),
@@ -169,6 +172,7 @@ class ImageMessageSchema:
             "timestamps": self.timestamps,
             "images": self.images,
             "depths": self.depths,
+            "capture_monotonic_ns": self.capture_monotonic_ns,
             "sample_monotonic_ns": self.sample_monotonic_ns,
             "publisher_sequence": self.publisher_sequence,
             "publisher_monotonic_ns": self.publisher_monotonic_ns,

@@ -78,6 +78,7 @@ def build_planner_message(
     publisher_monotonic_ns: int | None = None,
     vr_base_pose: Sequence[float] | None = None,
     vr_motion_limits: Sequence[float] | None = None,
+    vr_jerk_limits: Sequence[float] | None = None,
 ) -> bytes:
     """
     Assemble a 'planner' topic message:
@@ -186,6 +187,12 @@ def build_planner_message(
             raise ValueError("VR motion limits must contain speed/acceleration and angular speed/acceleration")
         fields.append({"name": "vr_motion_limits", "dtype": "f32", "shape": [4]})
         payload += struct.pack("<4f", *vr_motion_limits)
+
+    if vr_jerk_limits is not None:
+        if len(vr_jerk_limits) != 2:
+            raise ValueError("VR jerk limits must contain translation and angular jerk")
+        fields.append({"name": "vr_jerk_limits", "dtype": "f32", "shape": [2]})
+        payload += struct.pack("<2f", *vr_jerk_limits)
 
     header = _build_header(fields, version=1, count=1)
 

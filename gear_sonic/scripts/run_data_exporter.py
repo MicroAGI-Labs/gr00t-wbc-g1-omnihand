@@ -40,7 +40,16 @@ from scipy.spatial.transform import Rotation as R
 import tyro
 import zmq
 
+# Shared virtual environments may be installed against another worktree.
+# Direct script execution must resolve the recorder's accompanying modules here.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+from gear_sonic.data.clock_sync import ClockClient, DEFAULT_CLOCK_PORT
+from gear_sonic.data.sender_sync import (
+    RecordingInputs, Selection, SenderSynchronizer, selection_inputs, synchronization_features,
+)
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.features_sonic_vla import (
     assemble_dataset_configuration,
@@ -107,6 +116,14 @@ class SonicDataExporterConfig:
     data_collection_frequency: int = 50
     """Data collection frequency (Hz)."""
 
+
+    sender_time_recording: bool = False
+    """Opt in to delayed producer-time alignment; use a dataset with the new schema."""
+
+    synchronization_delay: float = 0.1
+    synchronization_wait_timeout: float = 0.25
+    hand_clock_port: int = DEFAULT_CLOCK_PORT
+    """Read-only clock exchange on a remote hand host (sender-time mode only)."""
 
     # Camera
     camera_host: str = "localhost"
@@ -1048,7 +1065,30 @@ class GrootDataCollector:
         recording_status_port: int = 5581,
         require_hub_upload: bool = False,
         shutdown_upload_timeout: float = 300.0,
+        sender_time_recording: bool = False,
+        synchronization_delay: float = 0.1,
+        synchronization_wait_timeout: float = 0.25,
+        hand_clock_port: int = DEFAULT_CLOCK_PORT,
     ):
+        self._sender_sync = None
+        if sender_time_recording:
+            local_names = {"localhost", "127.0.0.1", "::1"}
+            if any(host not in local_names for host in (camera_host, state_zmq_host, sonic_data_zmq_host)):
+                raise ValueError("sender-time recording currently requires local camera, robot and teleop publishers")
+            camera_names = tuple(key.split(".")[-1] for key, feature in data_exporter.features.items()
+                                 if feature.get("dtype") in ("image", "video"))
+            required_features = synchronization_features(camera_names)
+            if not required_features.keys() <= data_exporter.features.keys():
+                raise ValueError("sender-time recording requires a new dataset with synchronization features")
+            # Validate before starting the remote client or other background resources.
+            self._sender_sync = SenderSynchronizer(
+                camera_names=camera_names, frequency=frequency,
+                delay_s=synchronization_delay, wait_s=synchronization_wait_timeout,
+            )
+            if hand_config is not None and hand_state_host not in local_names:
+                if not 1 <= hand_clock_port <= 65535:
+                    raise ValueError("hand clock port must be within 1..65535")
+                self._sender_sync.hand_clock = ClockClient(f"tcp://{hand_state_host}:{hand_clock_port}")
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
@@ -1096,6 +1136,7 @@ class GrootDataCollector:
             server_ip=camera_host,
             port=camera_port,
             background=True,
+            preserve_history=sender_time_recording,
         )
 
         self.obs_act_buffer = deque(maxlen=100)
@@ -1248,6 +1289,7 @@ class GrootDataCollector:
             "finalizer": finalizer_status,
             "hub": hub_status,
             "stream_rates": self.stream_rates.snapshot(self.RATE_STREAMS),
+            "synchronization": self._sender_sync.status() if getattr(self, "_sender_sync", None) else None,
             "timestamp": time.time(),
         }
         try:
@@ -1283,6 +1325,9 @@ class GrootDataCollector:
         self.latest_proprio_msg = msg
         self.latest_proprio_received_at = time.monotonic()
         self.latest_proprio_received_monotonic_ns = time.monotonic_ns()
+        if getattr(self, "_sender_sync", None) is not None:
+            self._sender_sync.observe("proprio", msg, _integer_scalar(msg.get("sample_monotonic_ns")),
+                                      self.latest_proprio_received_monotonic_ns)
         self.stream_rates.observe(
             "robot_state",
             source_timestamp=_timestamp_seconds(
@@ -1314,6 +1359,9 @@ class GrootDataCollector:
             self.latest_hand_state = state
             self.latest_hand_state_received_at = time.monotonic()
             self.latest_hand_state_received_monotonic_ns = time.monotonic_ns()
+            if getattr(self, "_sender_sync", None) is not None:
+                self._sender_sync.observe("hand", state, _integer_scalar(state.get("monotonic_ns")),
+                                          self.latest_hand_state_received_monotonic_ns)
             self.stream_rates.observe(
                 "hand_state",
                 source_timestamp=_timestamp_seconds(
@@ -1351,8 +1399,88 @@ class GrootDataCollector:
                     received_timestamp=intent_received,
                 )
 
+    def _latest_recording_inputs(self) -> RecordingInputs:
+        """Snapshot the legacy inputs; synchronized rows pass an explicit selection."""
+        def received(ns_name: str, seconds_name: str) -> int:
+            ns = getattr(self, ns_name, None)
+            seconds = getattr(self, seconds_name, None)
+            return int(ns) if ns is not None else int(seconds * 1e9) if seconds is not None else -1
+
+        return RecordingInputs(
+            getattr(self, "latest_proprio_msg", None), getattr(self, "latest_image_msg", None),
+            getattr(self, "latest_hand_state", None), getattr(self, "latest_sonic_msg", None),
+            getattr(self, "latest_planner_msg", None), getattr(self, "latest_manager_msg", None),
+            getattr(self, "current_stream_mode", 0),
+            received("latest_proprio_received_monotonic_ns", "latest_proprio_received_at"),
+            received("latest_image_received_monotonic_ns", "latest_image_received_at"),
+            received("latest_hand_state_received_monotonic_ns", "latest_hand_state_received_at"),
+        )
+
+    def _poll_sender_images(self) -> dict | None:
+        messages = self._image_subscriber.read_pending()
+        combined = getattr(self, "_sender_latest_images", None)
+        for message in messages:
+            received_ns = message["receiver_monotonic_ns"]
+            for name in message["timestamps"]:
+                if name in self._sender_sync.camera_names:
+                    self._sender_sync.observe(
+                        f"camera.{name}", message,
+                        _integer_scalar(message.get("capture_monotonic_ns", {}).get(name)), received_ns,
+                    )
+            if combined is None:
+                combined = {"images": {}, "depths": {}, "timestamps": {}, "camera_received_monotonic_ns": {}}
+            combined = {**combined, **{k: v for k, v in message.items()
+                                     if k not in ("images", "depths", "timestamps")}}
+            for key in ("images", "depths", "timestamps"):
+                combined[key] = {**combined[key], **message.get(key, {})}
+            for name in message["timestamps"]:
+                combined["camera_received_monotonic_ns"][name] = received_ns
+        self._image_subscriber.idx += len(messages)
+        self._sender_latest_images = combined
+        return combined
+
+    def _add_sender_frame(self) -> bool:
+        sync = self._sender_sync
+        now_ns = time.monotonic_ns()
+        if sync.next_target_ns is None:
+            sync.trim(now_ns)
+            return False
+        target = sync.next_target_ns
+        if sync.stop_target_ns is not None and target > sync.stop_target_ns:
+            self._finish_recording(save=True, discard_reason="operator_discarded")
+            return True
+        if now_ns < target + sync.delay_ns:
+            return False
+        selection = sync.select(target, hand=self.hand_config is not None, max_ages={
+            "proprio": self.proprio_state_max_age, "camera": self.camera_max_age,
+            "hand": self.hand_state_max_age, "manager": self.teleop_max_age,
+            "sonic": self.teleop_max_age, "planner": self.teleop_max_age,
+        })
+        if selection.ready:
+            inputs = selection_inputs(selection)
+            try:
+                self._validate_recording_inputs(inputs)
+            except (RuntimeError, ValueError) as exc:
+                selection = Selection(target, selection.samples, (str(exc),))
+            else:
+                # The builder and all feature helpers use only this selection.
+                # Writer exceptions propagate to cleanup; they are not input gaps.
+                result = self._add_data_frame_sonic(time.monotonic(), inputs)
+                sync.advance(target)
+                self._recording_message = (
+                    "Draining synchronized recording" if sync.stop_target_ns is not None
+                    else f"Recording episode {self.current_episode_index}"
+                )
+                return result
+        if now_ns >= target + sync.delay_ns + sync.wait_ns:
+            sync.skip(selection, now_ns)
+            self._recording_message = f"Recording gap: {'; '.join(selection.problems)}"
+        else:
+            self._recording_message = f"Waiting for synchronization: {'; '.join(selection.problems)}"
+        return False
+
     def _external_hand_values(
-        self,
+        self, inputs: RecordingInputs | None = None,
     ) -> tuple[
         np.ndarray,
         np.ndarray,
@@ -1361,27 +1489,28 @@ class GrootDataCollector:
         np.ndarray,
         np.ndarray,
     ]:
-        if self.latest_hand_state is None or self.latest_hand_state_received_at is None:
+        inputs = inputs or self._latest_recording_inputs()
+        if inputs.hand is None or inputs.hand_received_ns <= 0:
             raise RuntimeError("external hand state is unavailable")
-        age = time.monotonic() - self.latest_hand_state_received_at
+        age = inputs.age(inputs.hand, inputs.hand_received_ns, time.monotonic())
         if age > self.hand_state_max_age:
             raise RuntimeError(f"external hand state is stale ({age:.3f}s)")
-        controller_age = self.latest_hand_state.get("state_age_s")
+        controller_age = inputs.hand.get("state_age_s")
         if isinstance(controller_age, (int, float)) and controller_age > self.hand_state_max_age:
             raise RuntimeError(
                 f"external hand controller snapshot is stale ({controller_age:.3f}s)"
             )
-        if self.latest_hand_state.get("mode") == "fault":
+        if inputs.hand.get("mode") == "fault":
             raise RuntimeError("external hand controller is faulted")
-        if self.latest_hand_state.get("input_stale") or self.latest_hand_state.get("intent_sequence") is None:
+        if inputs.hand.get("input_stale") or inputs.hand.get("intent_sequence") is None:
             raise RuntimeError("external hand target is missing or stale")
         for side in ("left", "right"):
-            if self.latest_hand_state.get("sides", {}).get(side, {}).get("intent_closed") is None:
+            if inputs.hand.get("sides", {}).get(side, {}).get("intent_closed") is None:
                 raise RuntimeError(f"external {side} hand has no valid click intent")
         values = []
         for field in ("requested_position_rad", "applied_position_rad", "measured_position_rad"):
             for side in ("left", "right"):
-                side_state = self.latest_hand_state.get("sides", {}).get(side)
+                side_state = inputs.hand.get("sides", {}).get(side)
                 if not side_state or not side_state.get("valid") or not side_state.get("connected"):
                     raise RuntimeError(f"external {side} hand is invalid or disconnected")
                 if side_state.get("input_stale"):
@@ -1392,21 +1521,22 @@ class GrootDataCollector:
                 values.append(array)
         return tuple(values)
 
-    def _validate_recording_inputs(self) -> None:
+    def _validate_recording_inputs(self, inputs: RecordingInputs | None = None) -> None:
         """Reject stale or malformed inputs before they enter an episode."""
+        inputs = inputs or self._latest_recording_inputs()
         if (
-            not _recording_mode_ready(self.current_stream_mode, self.required_stream_mode)
-            and self.current_stream_mode != 3
+            not _recording_mode_ready(inputs.mode, self.required_stream_mode)
+            and inputs.mode != 3
         ):
             required_name = _RECORDING_STREAM_MODE_NAMES[self.required_stream_mode]
             raise RuntimeError(
                 f"required A+X teleop mode {required_name} is not active "
-                f"(stream mode {self.current_stream_mode})"
+                f"(stream mode {inputs.mode})"
             )
         now = time.monotonic()
-        if self.latest_proprio_msg is None or self.latest_proprio_received_at is None:
+        if inputs.proprio is None or inputs.proprio_received_ns <= 0:
             raise RuntimeError("robot state is unavailable")
-        proprio_age = now - self.latest_proprio_received_at
+        proprio_age = inputs.age(inputs.proprio, inputs.proprio_received_ns, now)
         if proprio_age > self.proprio_state_max_age:
             raise RuntimeError(f"robot state is stale ({proprio_age:.3f}s)")
         for key, width in (
@@ -1416,44 +1546,46 @@ class GrootDataCollector:
             ("base_ang_vel", 3),
             ("last_action", 29),
         ):
-            _required_vector(self.latest_proprio_msg, key, width)
-        token = _required_vector(self.latest_proprio_msg, "token_state", 64)
+            _required_vector(inputs.proprio, key, width)
+        token = _required_vector(inputs.proprio, "token_state", 64)
         if not np.any(token):
             raise RuntimeError("SONIC motion token is all zeros")
 
-        if self.latest_image_msg is None or self.latest_image_received_at is None:
+        if inputs.image is None or inputs.image_received_ns <= 0:
             raise RuntimeError("camera frame is unavailable")
-        camera_age = now - self.latest_image_received_at
+        camera_age = inputs.age(inputs.image, inputs.image_received_ns, now)
         if camera_age > self.camera_max_age:
             raise RuntimeError(f"camera frame is stale ({camera_age:.3f}s)")
 
-        self._validate_camera_inputs(now)
+        self._validate_camera_inputs(now, inputs.image, inputs.target_ns)
 
         if self.hand_config is not None:
-            self._external_hand_values()
+            self._external_hand_values(inputs)
 
-        if self.current_stream_mode in (5, 6):
-            if self.latest_planner_msg is None:
+        if inputs.mode in (5, 6):
+            if inputs.planner is None:
                 raise RuntimeError("planner command is unavailable in planner mode")
-            planner_received = self.latest_planner_msg.get("receive_monotonic")
-            if planner_received is None or now - planner_received > self.teleop_max_age:
+            planner_received = inputs.planner.get("receive_monotonic")
+            if planner_received is None or inputs.age(inputs.planner, int(planner_received * 1e9), now) > self.teleop_max_age:
                 raise RuntimeError("planner command is stale in planner mode")
-            if self.latest_planner_msg.get("vr_3pt_position") is None:
+            if inputs.planner.get("vr_3pt_position") is None:
                 raise RuntimeError("VR 3-point position is missing in planner mode")
-            if self.latest_planner_msg.get("vr_3pt_orientation") is None:
+            if inputs.planner.get("vr_3pt_orientation") is None:
                 raise RuntimeError("VR 3-point orientation is missing in planner mode")
-        elif self.current_stream_mode in (1, 4):
-            if self.latest_sonic_msg is None:
+        elif inputs.mode in (1, 4):
+            if inputs.sonic is None:
                 raise RuntimeError("SMPL pose is unavailable in pose mode")
-            pose_received = self.latest_sonic_msg.get("receive_monotonic")
-            if pose_received is None or now - pose_received > self.teleop_max_age:
+            pose_received = inputs.sonic.get("receive_monotonic")
+            if pose_received is None or inputs.age(inputs.sonic, int(pose_received * 1e9), now) > self.teleop_max_age:
                 raise RuntimeError("SMPL pose is stale in pose mode")
-            if self.latest_sonic_msg.get("smpl_pose") is None:
+            if inputs.sonic.get("smpl_pose") is None:
                 raise RuntimeError("SMPL pose is missing in pose mode")
 
     def _episode_validation(self) -> dict[str, object]:
         """Return the quality report used to accept or discard an episode."""
         errors = sorted(self._episode_input_errors)
+        if getattr(self, "_sender_sync", None) is not None:
+            errors.extend(self._sender_sync.errors)
         hand_motion = _episode_hand_motion_range(self.data_exporter.episode_buffer)
         if self.hand_config is not None and self.require_hand_activity:
             if hand_motion < self.minimum_hand_motion_rad:
@@ -1489,6 +1621,7 @@ class GrootDataCollector:
             "errors": errors,
             "hand_command_range_rad": round(hand_motion, 6),
             "rate_check_enforced": False,
+            "synchronization": self._sender_sync.status() if getattr(self, "_sender_sync", None) else None,
             "stream_rates": rates,
         }
 
@@ -1499,6 +1632,8 @@ class GrootDataCollector:
         if buffer_size <= 0:
             self._set_recording_audio_event("discard")
             self._recording_message = "Nothing saved: no frames collected"
+            if getattr(self, "_sender_sync", None) is not None:
+                self._sender_sync.reset()
             self._episode_state.reset_state()
             self._initial_yaw = None
             self._print_and_say("Skipping empty recording", say=False)
@@ -1523,6 +1658,8 @@ class GrootDataCollector:
             validation=validation,
         )
 
+        if getattr(self, "_sender_sync", None) is not None:
+            self._sender_sync.reset()
         self.sonic_timing_monitor.reset()
         self._episode_input_errors.clear()
         self._initial_yaw = None
@@ -1588,7 +1725,14 @@ class GrootDataCollector:
             self._manager_toggle_dc = False
 
         if key == "c":
+            if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
+                return
             if self._episode_state.get_state() == self._episode_state.RECORDING:
+                if getattr(self, "_sender_sync", None) is not None:
+                    self._sender_sync.stop(time.monotonic_ns())
+                    self._episode_state.change_state()
+                    self._recording_message = "Draining synchronized recording"
+                    return
                 self._finish_recording(save=True, discard_reason=discard_reason)
                 return
             if (
@@ -1628,6 +1772,8 @@ class GrootDataCollector:
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
+                if getattr(self, "_sender_sync", None) is not None:
+                    self._sender_sync.start(time.monotonic_ns())
                 self._episode_input_errors.clear()
                 self._set_recording_audio_event("start")
                 self._recording_message = f"Recording episode {self.current_episode_index}"
@@ -1635,7 +1781,7 @@ class GrootDataCollector:
                     f"Recording started. Episode {self.current_episode_index}", say=False
                 )
         elif key == "x":
-            if self._episode_state.get_state() == self._episode_state.RECORDING:
+            if self._episode_state.get_state() in (self._episode_state.RECORDING, self._episode_state.NEED_TO_SAVE):
                 self._finish_recording(save=False, discard_reason=discard_reason)
 
     def _poll_sonic_zmq_messages(self):
@@ -1685,9 +1831,14 @@ class GrootDataCollector:
                 )
             self.current_stream_mode = new_stream_mode
         self.latest_manager_msg = {
+            "stream_mode": self.current_stream_mode,
             "publisher_monotonic_ns": _integer_scalar(data.get("publisher_monotonic_ns")),
             "received_monotonic_ns": received_monotonic_ns,
         }
+
+        if getattr(self, "_sender_sync", None) is not None:
+            self._sender_sync.observe("manager", self.latest_manager_msg,
+                                      self.latest_manager_msg["publisher_monotonic_ns"], received_monotonic_ns)
 
         if self._extract_bool(data, "toggle_data_collection"):
             self._manager_toggle_dc = True
@@ -1749,6 +1900,10 @@ class GrootDataCollector:
                 * 1e9
             ),
         }
+        if getattr(self, "_sender_sync", None) is not None:
+            self._sender_sync.observe("planner", self.latest_planner_msg,
+                                      self.latest_planner_msg["publisher_monotonic_ns"], received_monotonic_ns)
+
 
     def _handle_pose_message(self, raw: bytes) -> None:
         G1_L_WRIST_ROLL_IDX = 23
@@ -1854,6 +2009,9 @@ class GrootDataCollector:
                     * 1e9
                 ),
             }
+            if getattr(self, "_sender_sync", None) is not None:
+                self._sender_sync.observe("sonic", self.latest_sonic_msg,
+                                          self.latest_sonic_msg["sample_monotonic_ns"], received_monotonic_ns)
         except Exception as e:
             if not hasattr(self, "_sonic_error_count"):
                 self._sonic_error_count = 0
@@ -1892,9 +2050,9 @@ class GrootDataCollector:
             if parts:
                 print(f"[Latency] {', '.join(parts)}")
 
-    def _validate_camera_inputs(self, now: float) -> None:
+    def _validate_camera_inputs(self, now: float, message: dict | None = None, target_ns: int | None = None) -> None:
         """Validate only the streams selected for this dataset."""
-        message = self.latest_image_msg or {}
+        message = (self.latest_image_msg if message is None else message) or {}
         received = message.get("camera_received_monotonic_ns", {})
         for feature_name, feature in self.data_exporter.features.items():
             is_depth = feature_name == DEPTH_VIDEO_FEATURE
@@ -1915,14 +2073,15 @@ class GrootDataCollector:
                 if _timestamp_seconds(message.get("timestamps", {}).get(source_name)) is None:
                     raise RuntimeError(f"camera {name} capture timestamp is unavailable")
             received_at = received.get(source_name)
-            if received_at is not None and now - received_at / 1e9 > self.camera_max_age:
+            if target_ns is None and received_at is not None and now - received_at / 1e9 > self.camera_max_age:
                 raise RuntimeError(f"camera {name} is stale")
 
-    def _add_images_to_frame_data(self, frame_data: dict) -> None:
-        if self.latest_image_msg is None:
+    def _add_images_to_frame_data(self, frame_data: dict, inputs: RecordingInputs | None = None) -> None:
+        inputs = inputs or self._latest_recording_inputs()
+        if inputs.image is None:
             return
-        images = self.latest_image_msg["images"]
-        depths = self.latest_image_msg.get("depths", {})
+        images = inputs.image["images"]
+        depths = inputs.image.get("depths", {})
         for feature_name, feature_info in self.data_exporter.features.items():
             if feature_name == DEPTH_VIDEO_FEATURE:
                 source_name = "ego_view_depth"
@@ -1935,7 +2094,7 @@ class GrootDataCollector:
                 timestamp_key = f"capture.{source_name}_source_timestamp_ns"
                 if timestamp_key in self.data_exporter.features:
                     frame_data[timestamp_key] = np.asarray(
-                        [int(self.latest_image_msg["timestamps"][source_name] * 1e9)], dtype=np.int64
+                        [int(inputs.image["timestamps"][source_name] * 1e9)], dtype=np.int64
                     )
                 continue
             if feature_info.get("dtype") in ["image", "video"]:
@@ -1948,7 +2107,7 @@ class GrootDataCollector:
                 frame_data[feature_name] = images[image_key]
                 timestamp_key = f"capture.{image_key}_source_timestamp_ns"
                 if timestamp_key in self.data_exporter.features:
-                    timestamp = self.latest_image_msg["timestamps"][image_key]
+                    timestamp = inputs.image["timestamps"][image_key]
                     frame_data[timestamp_key] = np.asarray([int(timestamp * 1e9)], dtype=np.int64)
 
     def _finalize_frame(self, t_start: float) -> bool:
@@ -1956,11 +2115,13 @@ class GrootDataCollector:
         if t_end - t_start > (1 / self.frequency):
             print(f"DataExporter Missed: {t_end - t_start} sec")
 
-        if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
+        if getattr(self, "_sender_sync", None) is None and self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
             self._finish_recording(save=True, discard_reason="operator_discarded")
         return True
 
     def _add_data_frame(self):
+        if getattr(self, "_sender_sync", None) is not None:
+            return self._add_sender_frame()
         t_start = time.monotonic()
 
         if self._episode_state.get_state() != self._episode_state.RECORDING:
@@ -1983,10 +2144,11 @@ class GrootDataCollector:
             self._recording_message = f"Recording episode {self.current_episode_index}"
         return self._add_data_frame_sonic(t_start)
 
-    def _add_data_frame_sonic(self, t_start: float) -> bool:
+    def _add_data_frame_sonic(self, t_start: float, inputs: RecordingInputs | None = None) -> bool:
         """Build one data frame in Sonic CPP + SMPL mode."""
-        assert self.latest_proprio_msg is not None
-        proprio = self.latest_proprio_msg
+        inputs = inputs or self._latest_recording_inputs()
+        assert inputs.proprio is not None
+        proprio = inputs.proprio
 
         if self.hand_config is not None:
             (
@@ -1996,7 +2158,7 @@ class GrootDataCollector:
                 applied_right,
                 measured_left,
                 measured_right,
-            ) = self._external_hand_values()
+            ) = self._external_hand_values(inputs)
             whole_q = assemble_dataset_configuration(
                 self.robot_model,
                 proprio["body_q"],
@@ -2070,10 +2232,10 @@ class GrootDataCollector:
 
         self._add_cpp_state_features(frame_data, proprio)
 
-        sonic_latency_ms = self._add_sonic_pose_features(frame_data)
+        sonic_latency_ms = self._add_sonic_pose_features(frame_data, inputs)
 
         if self.hand_config is not None:
-            side_states = self.latest_hand_state["sides"]
+            side_states = inputs.hand["sides"]
             frame_data["teleop.left_hand_joints"] = requested_left.astype(np.float32)
             frame_data["teleop.right_hand_joints"] = requested_right.astype(np.float32)
             frame_data["control.hand_applied_position"] = np.concatenate(
@@ -2092,16 +2254,17 @@ class GrootDataCollector:
             ).astype(np.float32)
             frame_data["teleop.hand_closed"] = np.zeros(2, dtype=bool)
 
-        self._add_capture_features(frame_data, proprio)
-        self._add_images_to_frame_data(frame_data)
+        self._add_capture_features(frame_data, proprio, inputs)
+        self._add_images_to_frame_data(frame_data, inputs)
 
         self._log_latency_periodic(sonic_latency_ms)
 
         self.data_exporter.add_frame(frame_data)
         return self._finalize_frame(t_start)
 
-    def _add_capture_features(self, frame_data: dict, proprio: dict) -> None:
+    def _add_capture_features(self, frame_data: dict, proprio: dict, inputs: RecordingInputs | None = None) -> None:
         """Preserve source identity/timing without exposing it to GR00T."""
+        inputs = inputs or self._latest_recording_inputs()
         robot_source_s = _timestamp_seconds(proprio.get("ros_timestamp"))
         frame_data["capture.robot_state_sequence"] = np.asarray(
             [_integer_scalar(proprio.get("index"))], dtype=np.int64
@@ -2116,10 +2279,10 @@ class GrootDataCollector:
             [_integer_scalar(proprio.get("publisher_monotonic_ns"))], dtype=np.int64
         )
         frame_data["capture.robot_state_received_monotonic_ns"] = np.asarray(
-            [self.latest_proprio_received_monotonic_ns or -1], dtype=np.int64
+            [inputs.proprio_received_ns or -1], dtype=np.int64
         )
 
-        image = self.latest_image_msg or {}
+        image = inputs.image or {}
         frame_data["capture.camera_sequence"] = np.asarray(
             [_integer_scalar(image.get("publisher_sequence"))], dtype=np.int64
         )
@@ -2133,10 +2296,10 @@ class GrootDataCollector:
             [_integer_scalar(image.get("publisher_monotonic_ns"))], dtype=np.int64
         )
         frame_data["capture.camera_received_monotonic_ns"] = np.asarray(
-            [self.latest_image_received_monotonic_ns or -1], dtype=np.int64
+            [inputs.image_received_ns or -1], dtype=np.int64
         )
 
-        hand = self.latest_hand_state or {}
+        hand = inputs.hand or {}
         frame_data["capture.hand_state_sequence"] = np.asarray(
             [_integer_scalar(hand.get("sequence"))], dtype=np.int64
         )
@@ -2150,7 +2313,7 @@ class GrootDataCollector:
             [_integer_scalar(hand.get("published_monotonic_ns"))], dtype=np.int64
         )
         frame_data["capture.hand_state_received_monotonic_ns"] = np.asarray(
-            [self.latest_hand_state_received_monotonic_ns or -1], dtype=np.int64
+            [inputs.hand_received_ns or -1], dtype=np.int64
         )
         frame_data["capture.hand_intent_sequence"] = np.asarray(
             [_integer_scalar(hand.get("intent_sequence"))], dtype=np.int64
@@ -2162,7 +2325,7 @@ class GrootDataCollector:
             [_integer_scalar(hand.get("intent_received_monotonic_ns"))], dtype=np.int64
         )
 
-        pose = self.latest_sonic_msg or {}
+        pose = inputs.sonic or {}
         frame_data["capture.pico_pose_sequence"] = np.asarray(
             [_integer_scalar(pose.get("frame_index"))], dtype=np.int64
         )
@@ -2175,17 +2338,26 @@ class GrootDataCollector:
                 [_integer_scalar(pose.get(f"{message_field}_monotonic_ns"))], dtype=np.int64
             )
 
-        planner = self.latest_planner_msg or {}
+        planner = inputs.planner or {}
         for capture_field, message_field in (("publish", "publisher"), ("received", "received")):
             frame_data[f"capture.planner_{capture_field}_monotonic_ns"] = np.asarray(
                 [_integer_scalar(planner.get(f"{message_field}_monotonic_ns"))], dtype=np.int64
             )
 
-        manager = self.latest_manager_msg or {}
+        manager = inputs.manager or {}
         for capture_field, message_field in (("publish", "publisher"), ("received", "received")):
             frame_data[f"capture.manager_{capture_field}_monotonic_ns"] = np.asarray(
                 [_integer_scalar(manager.get(f"{message_field}_monotonic_ns"))], dtype=np.int64
             )
+        if inputs.target_ns is not None:
+            frame_data["capture.sync_target_monotonic_ns"] = np.asarray([inputs.target_ns], dtype=np.int64)
+            for key in self.data_exporter.features:
+                if not key.startswith("capture.sync."):
+                    continue
+                stream, field = key[len("capture.sync."):].rsplit(".", 1)
+                sample = inputs.samples.get(stream, {})
+                frame_data[key] = np.asarray([sample.get(f"_sync_{field}", -1)], dtype=np.int64)
+
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
         base_quat = _required_vector(proprio, "base_quat", 4)
@@ -2229,21 +2401,23 @@ class GrootDataCollector:
         frame_data["action.motion_token"] = _required_vector(proprio, "token_state", 64)
         frame_data["action.motion_token_valid"] = np.ones(1, dtype=np.uint8)
 
-    def _add_sonic_pose_features(self, frame_data: dict) -> float | None:
+    def _add_sonic_pose_features(self, frame_data: dict, inputs: RecordingInputs | None = None) -> float | None:
         """Add teleop features based on current stream mode."""
+        inputs = inputs or self._latest_recording_inputs()
         sonic_latency_ms = None
 
-        frame_data["teleop.stream_mode"] = np.array([self.current_stream_mode], dtype=np.int32)
+        frame_data["teleop.stream_mode"] = np.array([inputs.mode], dtype=np.int32)
 
-        smpl_msg = self.latest_sonic_msg
+        smpl_msg = inputs.sonic
         use_smpl = False
-        if self.current_stream_mode in (1, 4) and smpl_msg is not None:
+        if inputs.mode in (1, 4) and smpl_msg is not None:
             receive_ts = smpl_msg.get("receive_timestamp")
             if receive_ts is not None:
-                age_sec = time.time() - receive_ts
+                age_sec = ((inputs.target_ns - smpl_msg["_sync_time_ns"]) / 1e9
+                           if inputs.target_ns is not None else time.time() - receive_ts)
                 sonic_latency_ms = age_sec * 1000
                 self.sonic_timing_monitor.log_time_delta(age_sec)
-                if sonic_latency_ms <= 100.0:
+                if inputs.target_ns is not None or sonic_latency_ms <= 100.0:
                     use_smpl = True
                 elif (self.sonic_timing_monitor.failure_count + 1) % 10 == 0:
                     self._print_and_say(
@@ -2253,16 +2427,17 @@ class GrootDataCollector:
             else:
                 use_smpl = True
 
-        planner_msg = self.latest_planner_msg
+        planner_msg = inputs.planner
         use_planner = False
-        if self.current_stream_mode in (5, 6) and planner_msg is not None:
+        if inputs.mode in (5, 6) and planner_msg is not None:
             receive_ts = planner_msg.get("receive_timestamp")
             if receive_ts is not None:
-                age_sec = time.time() - receive_ts
+                age_sec = ((inputs.target_ns - planner_msg["_sync_time_ns"]) / 1e9
+                           if inputs.target_ns is not None else time.time() - receive_ts)
                 planner_latency_ms = age_sec * 1000
                 if sonic_latency_ms is None:
                     sonic_latency_ms = planner_latency_ms
-                if planner_latency_ms <= 200.0:
+                if inputs.target_ns is not None or planner_latency_ms <= 200.0:
                     use_planner = True
             else:
                 use_planner = True
@@ -2315,7 +2490,7 @@ class GrootDataCollector:
         frame_data["teleop.smpl_valid"] = np.asarray([int(use_smpl)], dtype=np.uint8)
 
         hand_msg = (
-            smpl_msg if self.current_stream_mode in (1, 4) and smpl_msg is not None
+            smpl_msg if inputs.mode in (1, 4) and smpl_msg is not None
             else planner_msg if planner_msg is not None
             else smpl_msg
         )
@@ -2472,6 +2647,8 @@ class GrootDataCollector:
                 except Exception:
                     pass
 
+        if getattr(self, "_sender_sync", None) is not None:
+            self._sender_sync.close()
         self._print_and_say("Shutting down data exporter...", say=False)
 
     def run(self):
@@ -2491,7 +2668,8 @@ class GrootDataCollector:
 
                     with self.telemetry.timer("poll_image"):
                         previous_image_index = self._image_subscriber.idx
-                        img_msg = self._image_subscriber.read()
+                        img_msg = (self._poll_sender_images() if self._sender_sync is not None
+                                   else self._image_subscriber.read())
                         if img_msg is not None:
                             self.latest_image_msg = img_msg
                         if self._image_subscriber.idx != previous_image_index and img_msg is not None:
@@ -2578,7 +2756,31 @@ def resolve_hand_profile(requested: str, hand_config: dict | None) -> HandProfil
     return profile
 
 
+def _validate_recording_dataset_mode(root: Path, expected_features: dict, sender_mode: bool) -> None:
+    """Reject incompatible resume before opening any episode video writers."""
+    info_path = root / "meta/info.json"
+    if not info_path.exists():
+        return
+    info = json.loads(info_path.read_text())
+    existing = {key for key in info.get("features", {}) if key.startswith("capture.sync")}
+    expected = {key for key in expected_features if key.startswith("capture.sync")}
+    if existing != expected or bool(existing) != sender_mode:
+        raise ValueError(
+            "Dataset synchronization schema differs from this recording mode. "
+            "Choose a new --dataset-name or use the mode/cameras that created this dataset."
+        )
+
+
 def main(config: SonicDataExporterConfig):
+    if config.sender_time_recording:
+        if any(host not in {"localhost", "127.0.0.1", "::1"} for host in
+               (config.camera_host, config.state_zmq_host, config.sonic_zmq_host)):
+            raise ValueError("sender-time recording requires local camera, robot and teleop publishers")
+        # Validate before waiting on publishers or opening writers.
+        SenderSynchronizer(camera_names=(), frequency=config.data_collection_frequency,
+                           delay_s=config.synchronization_delay, wait_s=config.synchronization_wait_timeout)
+        if not 1 <= config.hand_clock_port <= 65535:
+            raise ValueError("hand clock port must be within 1..65535")
     g1_rm = get_g1_robot_model()
 
     robot_config = poll_robot_config_zmq(
@@ -2610,8 +2812,16 @@ def main(config: SonicDataExporterConfig):
         for key, value in get_zed_stereo_modality_config().items():
             modality_config.setdefault(key, {}).update(value)
 
+    if config.sender_time_recording:
+        camera_names = tuple(key.split(".")[-1] for key, feature in dataset_features.items()
+                             if feature.get("dtype") in ("image", "video"))
+        dataset_features.update(synchronization_features(camera_names))
+
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
+    _validate_recording_dataset_mode(
+        Path(config.root_output_dir) / config.dataset_name, dataset_features, config.sender_time_recording,
+    )
     data_exporter = Gr00tDataExporter.create(
         save_root=f"{config.root_output_dir}/{config.dataset_name}",
         fps=config.data_collection_frequency,
@@ -2625,6 +2835,14 @@ def main(config: SonicDataExporterConfig):
                 {"format": "uint8_rgb", "min_m": 0.0, "max_m": DEPTH_VIDEO_MAX_METERS}
                 if config.record_zed_stereo else None
             ),
+            "recording_synchronization": {
+                "mode": "sender" if config.sender_time_recording else "latest",
+                "delay_s": config.synchronization_delay,
+                "wait_timeout_s": config.synchronization_wait_timeout,
+                "target_clock": "recorder CLOCK_MONOTONIC",
+                "remote_hand_mapping": "four-timestamp exchange; 5 ms uncertainty limit; 100 ppm drift budget",
+                "time_fields": "measurement/capture for robot, cameras, pose, hands; publication for planner/manager",
+            },
             "hand_profile": hand_profile.name,
             "hand_config": hand_config,
             "capture": _capture_reproducibility_metadata(
@@ -2661,6 +2879,10 @@ def main(config: SonicDataExporterConfig):
         recording_status_port=config.recording_status_port,
         require_hub_upload=config.require_hub_upload,
         shutdown_upload_timeout=config.shutdown_upload_timeout,
+        sender_time_recording=config.sender_time_recording,
+        synchronization_delay=config.synchronization_delay,
+        synchronization_wait_timeout=config.synchronization_wait_timeout,
+        hand_clock_port=config.hand_clock_port,
     )
     data_collector.run()
 

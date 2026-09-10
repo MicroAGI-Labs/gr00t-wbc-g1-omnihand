@@ -18,6 +18,8 @@ import uuid
 import numpy as np
 import zmq
 
+from gear_sonic.data.clock_sync import clock_id
+
 from .backends.base import HandBackend
 from .backends.dex1 import DEFAULT_WORKER, Dex1Backend, Dex1SafetyError
 from .backends.mujoco import MuJoCoHandTransport, MuJoCoSimHandBackend
@@ -64,6 +66,7 @@ class FixedRateHandStatePublisher:
         if frequency <= 0:
             raise ValueError("hand-state publish frequency must be positive")
         self.endpoint = endpoint
+        self._clock_id = clock_id()
         self.frequency = float(frequency)
         self.period = 1.0 / self.frequency
         context = mp.get_context("spawn")
@@ -130,6 +133,7 @@ class FixedRateHandStatePublisher:
                 else None
             )
             state["publish_sequence"] = self._publish_sequence
+            state["clock_id"] = self._clock_id
             state["published_monotonic_ns"] = int(published_at * 1e9)
             state["state_age_s"] = None if control_at is None else max(0.0, published_at - control_at)
             state["publisher_target_frequency_hz"] = self.frequency

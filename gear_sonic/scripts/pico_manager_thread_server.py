@@ -25,6 +25,7 @@
 from collections import defaultdict, deque
 from copy import deepcopy
 from enum import Enum, IntEnum
+import atexit
 import os
 import socket
 import subprocess
@@ -55,6 +56,8 @@ from gear_sonic.trl.utils.torch_transform import (
 )
 from gear_sonic.utils.teleop import input_readers
 from gear_sonic.utils.teleop.vr_motion_conditioner import VRMotionConditioner, VRMotionLimits
+from gear_sonic.utils.teleop.vr_motion_trace import VRMotionTrace
+from gear_sonic.utils.teleop.pico_body_diagnostics import DEFAULT_PICO_BODY_PORT, PicoBodyPublisher
 from gear_sonic.utils.teleop.gesture_trackers import (
     DoublePressTracker,
     recording_face_action,
@@ -98,6 +101,32 @@ try:
     import xrobotoolkit_sdk as xrt
 except ImportError:
     xrt = None
+
+_pico_body_diagnostics = None
+_next_pico_unavailable_diagnostic = 0.0
+
+
+def _record_pico_body_diagnostics(*, available, poses=None, packet_stamp=None, body_stamp=None):
+    """Count every raw SDK frame; the diagnostics publisher emits at 10 Hz."""
+    global _next_pico_unavailable_diagnostic
+    if _pico_body_diagnostics is None:
+        return
+    if not available:
+        now = time.monotonic()
+        if now < _next_pico_unavailable_diagnostic:
+            return
+        _next_pico_unavailable_diagnostic = now + 0.1
+    try:
+        if packet_stamp is None:
+            packet_stamp = xrt.get_time_stamp_ns()
+        body_stamp_fn = getattr(xrt, "get_body_timestamp_ns", None)
+        if body_stamp is None:
+            body_stamp = body_stamp_fn() if body_stamp_fn is not None else None
+        if available and poses is None:
+            poses = xrt.get_body_joints_pose()
+        _pico_body_diagnostics.record(poses, packet_stamp, body_stamp, available=available)
+    except Exception as exc:
+        _pico_body_diagnostics.record(None, None, None, available=False, error=str(exc))
 
 try:
     from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
@@ -953,6 +982,8 @@ class PicoReader:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._fps_ema = 0.0
         self._last_stamp_ns = None
+        self._body_clock_verified = False
+        self._body_clock_fallback_reported = False
         self._latest = None
         self._lock = threading.Lock()
         self._last_new_data_time = time.monotonic()
@@ -1001,6 +1032,39 @@ class PicoReader:
         with self._lock:
             return 0 if self._latest is None else int(self._latest["timestamp_ns"])
 
+    def _read_sample(self):
+        """Bracket SDK reads so the pose and timestamps describe one snapshot.
+
+        Some SDK/service pairs expose a body clock but always return zero.
+        Use packet timing until a positive body clock has actually been seen.
+        Once verified, a missing body clock must still trigger stale braking.
+        """
+        body_clock = getattr(xrt, "get_body_timestamp_ns", None)
+        for _ in range(3):
+            packet_stamp = int(xrt.get_time_stamp_ns())
+            body_stamp = int(body_clock()) if body_clock is not None else None
+            if (self._latest is not None and packet_stamp == self._latest["timestamp_ns"]
+                    and body_stamp == self._latest.get("body_timestamp_ns")):
+                return self._latest
+            poses = np.array(xrt.get_body_joints_pose())
+            body_after = int(body_clock()) if body_clock is not None else None
+            if body_stamp == body_after and packet_stamp == int(xrt.get_time_stamp_ns()):
+                if body_stamp is not None and body_stamp > 0:
+                    self._body_clock_verified = True
+                elif not self._body_clock_verified and not self._body_clock_fallback_reported:
+                    print("[PicoReader] Body timestamp unavailable; using packet timing for this SDK. "
+                          "Independent body freshness cannot be verified.")
+                    self._body_clock_fallback_reported = True
+                return {
+                    "body_poses_np": poses,
+                    "timestamp_ns": packet_stamp,
+                    "body_timestamp_ns": body_stamp,
+                    "source_timestamp_ns": (body_stamp or 0) if self._body_clock_verified else packet_stamp,
+                    "timestamp_realtime": time.time(),
+                    "timestamp_monotonic": time.monotonic(),
+                }
+        return None  # Try again next reader iteration; never publish a torn read.
+
     def _run(self):
         last_report = time.time()
         while not self._stop.is_set():
@@ -1011,18 +1075,26 @@ class PicoReader:
                 body_available = False
 
             if not body_available:
+                _record_pico_body_diagnostics(available=False)
                 self._flag_disconnect_if_stale("No body data")
                 time.sleep(0.001)
                 continue
             try:
-                stamp_ns = xrt.get_time_stamp_ns()
+                sample = self._read_sample()
+                if sample is None:
+                    self._flag_disconnect_if_stale("No consistent body snapshot")
+                    time.sleep(0.001)
+                    continue
+                stamp_ns = sample["timestamp_ns"]
             except Exception as exc:
                 print(f"[PicoReader] timestamp error: {exc}")
                 self._flag_disconnect_if_stale("Timestamp read failed")
                 time.sleep(0.01)
                 continue
             prev_stamp_ns = self._last_stamp_ns
-            if prev_stamp_ns is not None and stamp_ns == prev_stamp_ns:
+            previous_body_stamp = None if self._latest is None else self._latest.get("body_timestamp_ns")
+            if (prev_stamp_ns is not None and stamp_ns == prev_stamp_ns
+                    and sample["body_timestamp_ns"] == previous_body_stamp):
                 self._flag_disconnect_if_stale("Body timestamps stopped")
                 time.sleep(0.000001)
                 continue
@@ -1032,19 +1104,12 @@ class PicoReader:
                 inst = 1.0 / device_dt
                 self._fps_ema = inst if self._fps_ema == 0.0 else (0.9 * self._fps_ema + 0.1 * inst)
             self._last_stamp_ns = stamp_ns
-            t_realtime = time.time()
-            t_monotonic = time.monotonic()
             try:
-                body_poses = xrt.get_body_joints_pose()
-
-                sample = {
-                    "body_poses_np": np.array(body_poses),
-                    "timestamp_realtime": t_realtime,
-                    "timestamp_monotonic": t_monotonic,
-                    "timestamp_ns": stamp_ns,
-                    "dt": device_dt,
-                    "fps": self._fps_ema,
-                }
+                _record_pico_body_diagnostics(
+                    available=True, poses=sample["body_poses_np"], packet_stamp=stamp_ns,
+                    body_stamp=sample["body_timestamp_ns"],
+                )
+                sample.update(dt=device_dt, fps=self._fps_ema)
                 with self._lock:
                     self._latest = sample
                 self._last_new_data_time = time.monotonic()
@@ -1855,7 +1920,9 @@ def _connect_xrt_body_stream() -> None:
             deadline = time.monotonic() + XRT_CONNECT_ATTEMPT_SECONDS
             first_stamp_ns = None
             while time.monotonic() < deadline:
-                if xrt.is_body_data_available():
+                body_available = xrt.is_body_data_available()
+                _record_pico_body_diagnostics(available=body_available)
+                if body_available:
                     stamp_ns = int(xrt.get_time_stamp_ns())
                     if first_stamp_ns is None:
                         first_stamp_ns = stamp_ns
@@ -2091,9 +2158,11 @@ class PlannerStreamer:
         zmq_feedback_port: int = 5557,
         initial_mode: LocomotionMode = LocomotionMode.IDLE,
         ik_upper_body: bool = False,
-        vr_motion_limits: VRMotionLimits = VRMotionLimits(),
+        vr_motion_limits: VRMotionLimits | None = VRMotionLimits(),
+        vr_motion_trace: VRMotionTrace | None = None,
     ):
         self.socket = socket
+        self.vr_motion_trace = vr_motion_trace
         self.reader = reader
         self.three_point = three_point
         self.feedback_reader = FeedbackReader(
@@ -2107,6 +2176,7 @@ class PlannerStreamer:
         # Persistent facing buffer (unit vector on XY plane)
         self.yaw_accumulator = YawAccumulator()
         self.last_xrt_timestamp = None
+        self.last_vr_source_timestamp_ns = None
         # body_q_target feedback contains the planner reference before arm
         # overrides. Retain the last successfully sent override to reconstruct
         # the reference being followed when a mode transition starts.
@@ -2115,7 +2185,9 @@ class PlannerStreamer:
         self.held_vr_pose: np.ndarray | None = None
         self.first_vr_pose: np.ndarray | None = None
         self.disconnect_idle_pose: np.ndarray | None = None
-        self.vr_conditioner = VRMotionConditioner(vr_motion_limits)
+        self.vr_conditioner = (
+            VRMotionConditioner(vr_motion_limits) if vr_motion_limits is not None else None
+        )
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
@@ -2178,6 +2250,7 @@ class PlannerStreamer:
         self.three_point.calibrate_to_vr_target(sample["body_poses_np"], target)
         self.first_vr_pose = target.copy()
         self.held_vr_pose = None
+        self.last_vr_source_timestamp_ns = None
         if self.vr_conditioner is not None:
             self.vr_conditioner.seed(target, time.monotonic())
         print("[PlannerLoop] Pico recalibrated to held VR target; first command preserved")
@@ -2318,13 +2391,31 @@ class PlannerStreamer:
                 or self.first_vr_pose is not None
                 or stream_mode == StreamMode.PLANNER_IDLE_BASE_POSE
             )
+            source_fresh = True
+            sample = None
+            source_timestamp_ns = None
             # Generated targets must remain sendable while the native Pico
             # client is disconnected (including timestamp API failures).
             if not generated_vr:
-                xrt_timestamp = self.reader.get_timestamp_ns()
-                if xrt_timestamp == self.last_xrt_timestamp and not transition_or_base_pose:
+                sample = self.reader.get_latest()
+                # Keep the pose and freshness decision tied to this snapshot.
+                # The fallback supports readers without timestamped samples.
+                xrt_timestamp = (sample["timestamp_ns"] if sample is not None and "timestamp_ns" in sample
+                                 else self.reader.get_timestamp_ns())
+                if stream_mode == StreamMode.PLANNER_VR_3PT and sample is not None:
+                    body_stamp = sample.get("body_timestamp_ns")
+                    source_timestamp_ns = sample.get(
+                        "source_timestamp_ns",
+                        body_stamp if body_stamp is not None else sample.get("timestamp_ns"),
+                    )
+                freshness_stamp = xrt_timestamp if source_timestamp_ns is None else source_timestamp_ns
+                previous_stamp = (getattr(self, "last_vr_source_timestamp_ns", None)
+                                  if stream_mode == StreamMode.PLANNER_VR_3PT else self.last_xrt_timestamp)
+                source_fresh = freshness_stamp > 0 and freshness_stamp != previous_stamp
+                continuous_vr = (stream_mode == StreamMode.PLANNER_VR_3PT
+                                 and self.vr_conditioner is not None)
+                if not source_fresh and not transition_or_base_pose and not continuous_vr:
                     return False
-                self.last_xrt_timestamp = xrt_timestamp
 
             # Face chords are disambiguated by the manager and confirmed on
             # release. A+B selects the next mode; X+Y selects the previous.
@@ -2415,7 +2506,6 @@ class PlannerStreamer:
                 if self.first_vr_pose is not None:
                     vr_3pt_pose = self.first_vr_pose.copy()
                 else:
-                    sample = self.reader.get_latest()
                     if sample is None:
                         return False
                     vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
@@ -2444,7 +2534,6 @@ class PlannerStreamer:
             if stream_mode == StreamMode.PLANNER_IK_UPPER and not generated_vr:
                 if self.ik_upper_body is None:
                     raise RuntimeError("upper-body IK was not initialized")
-                sample = self.reader.get_latest()
                 if sample is None:
                     return False
                 vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
@@ -2454,16 +2543,23 @@ class PlannerStreamer:
 
             base_pose = None
             next_conditioner = None
+            input_vr_pose = None
+            command_time = time.monotonic()
             if sent_vr_pose is not None:
+                input_vr_pose = np.asarray(sent_vr_pose).copy()
                 if self.vr_conditioner is not None:
                     # Commit filter state only after the corresponding packet is sent.
                     next_conditioner = deepcopy(self.vr_conditioner)
                     sent_vr_pose = next_conditioner.update(
-                        sent_vr_pose, time.monotonic(), live=not generated_vr
+                        sent_vr_pose, command_time, live=not generated_vr,
+                        source_fresh=source_fresh,
+                        source_timestamp_ns=source_timestamp_ns,
                     )
                     if next_conditioner.fault:
                         mode_to_send = LocomotionMode.IDLE
                         movement, speed = [0.0, 0.0, 0.0], -1.0
+                else:
+                    sent_vr_pose = validate_vr_pose(sent_vr_pose)
                 vr_3pt_position = sent_vr_pose[:, :3].flatten().tolist()
                 vr_3pt_orientation = sent_vr_pose[:, 3:].flatten().tolist()
                 if self.disconnect_idle_pose is not None:
@@ -2491,8 +2587,16 @@ class PlannerStreamer:
                      next_conditioner.limits.angular_speed, next_conditioner.limits.angular_acceleration]
                     if next_conditioner is not None else None
                 ),
+                vr_jerk_limits=(
+                    [next_conditioner.limits.jerk, next_conditioner.limits.angular_jerk]
+                    if next_conditioner is not None else None
+                ),
             )
             self.socket.send(msg)
+            if not generated_vr:
+                self.last_xrt_timestamp = xrt_timestamp
+                if stream_mode == StreamMode.PLANNER_VR_3PT:
+                    self.last_vr_source_timestamp_ns = freshness_stamp
             if next_conditioner is not None:
                 if next_conditioner.fault and not self.vr_conditioner.fault:
                     print(f"[PlannerLoop] {next_conditioner.fault}; braking to hold. A+X twice to re-anchor.")
@@ -2500,6 +2604,14 @@ class PlannerStreamer:
                 if next_conditioner.fault:
                     self.held_vr_pose = sent_vr_pose.copy()
             self.last_vr_pose = None if sent_vr_pose is None else sent_vr_pose.copy()
+            if input_vr_pose is not None and getattr(self, "vr_motion_trace", None) is not None:
+                self.vr_motion_trace.record(
+                    input_vr_pose, sent_vr_pose, next_conditioner, now=command_time,
+                    stream_mode=stream_mode.value, generated=generated_vr,
+                    packet_timestamp=self.last_xrt_timestamp,
+                    source_fresh=source_fresh,
+                    source_timestamp_ns=source_timestamp_ns,
+                )
             if not generated_vr:
                 self.first_vr_pose = None
             # A failed send must not replace the command used by the handoff.
@@ -2552,6 +2664,10 @@ def run_pico_manager(
     vr_max_acceleration: float = 0.6,
     vr_max_angular_speed_deg: float = 90.0,
     vr_max_angular_acceleration_deg: float = 360.0,
+    vr_max_jerk: float = 6.0,
+    vr_max_angular_jerk_deg: float = 3600.0,
+    vr_motion_log_dir: str | None = None,
+    disable_vr_motion_limiter: bool = False,
 ):
     """
     Manager: publishes body and latest-only hand intent from one fixed-rate loop.
@@ -2566,6 +2682,7 @@ def run_pico_manager(
         speed=vr_max_speed, acceleration=vr_max_acceleration,
         angular_speed=np.deg2rad(vr_max_angular_speed_deg),
         angular_acceleration=np.deg2rad(vr_max_angular_acceleration_deg),
+        jerk=vr_max_jerk, angular_jerk=np.deg2rad(vr_max_angular_jerk_deg),
     )
     reader = _init_input_source(input_source, buffer_size)
     if teleop_mode not in {"pose", "vr3pt", "ik-upper"}:
@@ -2643,6 +2760,13 @@ def run_pico_manager(
         record_format=record_format,
         log_prefix="PoseLoop",
     )
+    motion_trace = VRMotionTrace(
+        vr_motion_log_dir, None if disable_vr_motion_limiter else motion_limits,
+        feedback_endpoint=f"tcp://{zmq_feedback_host}:{zmq_feedback_port}",
+    ) if vr_motion_log_dir else None
+    if motion_trace is not None:
+        atexit.register(motion_trace.close)
+        print(f"[Manager] Full-rate VR before/after trace: {motion_trace.path.resolve()}")
     planner_streamer = PlannerStreamer(
         socket=socket,
         reader=reader,
@@ -2652,8 +2776,16 @@ def run_pico_manager(
         zmq_feedback_port=zmq_feedback_port,
         initial_mode=initial_mode,
         ik_upper_body=teleop_mode == "ik-upper",
-        vr_motion_limits=motion_limits,
+        vr_motion_limits=None if disable_vr_motion_limiter else motion_limits,
+        vr_motion_trace=motion_trace,
     )
+    if disable_vr_motion_limiter:
+        print("[Manager] VR motion limiter DISABLED: calibrated poses pass through directly")
+    else:
+        print(f"[Manager] VR jerk limits: {vr_max_jerk:g} m/s^3, {vr_max_angular_jerk_deg:g} deg/s^3; never relaxed")
+        print(f"[Manager] VR control-gap fault threshold: {motion_limits.control_gap_timeout_s:g}s; shorter gaps recover without recalibration")
+        print(f"[Manager] VR operating speed/acceleration: {vr_max_speed:g} m/s, {vr_max_acceleration:g} m/s^2; "
+              f"{vr_max_angular_speed_deg:g} deg/s, {vr_max_angular_acceleration_deg:g} deg/s^2; hard ceilings = 1.5x")
     hand_intent = HandIntentStream()
 
     # Stable manager states for planner-based teleoperation:
@@ -3398,6 +3530,16 @@ if __name__ == "__main__":
     parser.add_argument("--vr-max-acceleration", type=float, default=0.6, help="3PT translation acceleration in m/s^2")
     parser.add_argument("--vr-max-angular-speed-deg", type=float, default=90.0)
     parser.add_argument("--vr-max-angular-acceleration-deg", type=float, default=360.0)
+    parser.add_argument("--vr-max-jerk", type=float, default=6.0, help="Fixed translation jerk ceiling, m/s^3")
+    parser.add_argument("--vr-max-angular-jerk-deg", type=float, default=3600.0, help="Fixed angular jerk ceiling, deg/s^3")
+    parser.add_argument("--vr-motion-log-dir", help="Directory for full-rate before/after VR command traces")
+    parser.add_argument(
+        "--disable-vr-motion-limiter",
+        action="store_true",
+        help="Bypass VR pose smoothing, motion caps, and tracking-jump filtering for this run",
+    )
+    parser.add_argument("--pico-body-port", type=int, default=DEFAULT_PICO_BODY_PORT,
+                        help="Local raw PICO body diagnostics publisher port")
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -3424,6 +3566,10 @@ if __name__ == "__main__":
     with_g1_robot = not args.no_g1
 
     if args.manager:
+        if args.input_source == "xrt":
+            _pico_body_diagnostics = PicoBodyPublisher(args.pico_body_port)
+            _pico_body_diagnostics.start()
+            atexit.register(_pico_body_diagnostics.close)
         run_pico_manager(
             port=args.port,
             hand_intent_port=args.hand_intent_port,
@@ -3451,6 +3597,10 @@ if __name__ == "__main__":
             vr_max_acceleration=args.vr_max_acceleration,
             vr_max_angular_speed_deg=args.vr_max_angular_speed_deg,
             vr_max_angular_acceleration_deg=args.vr_max_angular_acceleration_deg,
+            vr_max_jerk=args.vr_max_jerk,
+            vr_max_angular_jerk_deg=args.vr_max_angular_jerk_deg,
+            vr_motion_log_dir=args.vr_motion_log_dir,
+            disable_vr_motion_limiter=args.disable_vr_motion_limiter,
         )
     else:
         # Run legacy single-thread pose streaming
