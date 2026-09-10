@@ -185,12 +185,12 @@ class Gr00tDataExporter(LeRobotDataset):
     3. Save the episode using save_episode()
        - Flushes the episode buffer to disk
        - Closes the video writers
-       - Creates new video writer and ep buffer for the next episode
+       - Creates an empty buffer; video writers open on the next episode's first frame
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.video_writers = self.create_video_writer()
+        self.video_writers = {}
 
     @property
     def repo_id(self):
@@ -276,20 +276,28 @@ class Gr00tDataExporter(LeRobotDataset):
         obj.delta_timestamps = None
         obj.delta_indices = None
         obj.episode_data_index = None
-        obj.video_writers = obj.create_video_writer()
+        obj.video_writers = {}
         return obj
 
     def create_video_writer(self) -> dict[str, VideoWriter]:
         video_writers = {}
-        for key in self.meta.video_keys:
-            video_writers[key] = VideoWriter(
-                self.root
-                / self.meta.get_video_file_path(self.episode_buffer["episode_index"], key),
-                self.meta.shapes[key][1],
-                self.meta.shapes[key][0],
-                self.fps,
-                self.vcodec,
-            )
+        try:
+            for key in self.meta.video_keys:
+                video_writers[key] = VideoWriter(
+                    self.root
+                    / self.meta.get_video_file_path(self.episode_buffer["episode_index"], key),
+                    self.meta.shapes[key][1],
+                    self.meta.shapes[key][0],
+                    self.fps,
+                    self.vcodec,
+                )
+        except Exception:
+            for writer in video_writers.values():
+                try:
+                    writer.cancel()
+                except Exception as exc:
+                    print(f"Could not close partially initialized video writer: {exc}")
+            raise
         return video_writers
 
     def add_frame(self, frame: dict) -> None:
@@ -305,6 +313,9 @@ class Gr00tDataExporter(LeRobotDataset):
 
         if self.episode_buffer is None:
             self.episode_buffer = self.create_episode_buffer()
+
+        if self.video_keys and not self.video_writers:
+            self.video_writers = self.create_video_writer()
 
         frame_index = self.episode_buffer["size"]
         timestamp = frame.pop("timestamp") if "timestamp" in frame else frame_index / self.fps
@@ -350,22 +361,17 @@ class Gr00tDataExporter(LeRobotDataset):
         """Skip the current episode and start a new one."""
         self.stop_video_writers()
         self.episode_buffer = self.create_episode_buffer()
-        self.video_writers = self.create_video_writer()
+        self.video_writers = {}
 
     def detach_episode(self) -> tuple[dict[str, Any], dict[str, VideoWriter]]:
-        """Rotate to a new active episode and return the completed episode.
-
-        The returned buffer and writers are independent of the new active
-        episode, so a background worker can finish them while collection
-        continues. Episode indices are reserved here rather than waiting for
-        metadata finalization, which keeps consecutive recordings distinct.
-        """
+        """Transfer the completed episode without opening the next video files."""
         episode_buffer = self.episode_buffer
         video_writers = self.video_writers
         next_episode_index = int(episode_buffer["episode_index"]) + 1
-
-        self.episode_buffer = self.create_episode_buffer(episode_index=next_episode_index)
-        self.video_writers = self.create_video_writer()
+        self.episode_buffer = self.create_episode_buffer(
+            episode_index=next_episode_index
+        )
+        self.video_writers = {}
         return episode_buffer, video_writers
 
     def save_episode(
@@ -373,13 +379,17 @@ class Gr00tDataExporter(LeRobotDataset):
         episode_data: dict | None = None,
         *,
         video_writers: dict[str, VideoWriter] | None = None,
-        success: bool = True,
+        discarded: bool = False,
+        success: bool | None = None,
         validation: dict[str, Any] | None = None,
     ) -> None:
         active_episode = episode_data is None
+        if success is not None:
+            discarded = not success
+        success = not discarded
         source_buffer = self.episode_buffer if active_episode else episode_data
-        # Finalization transforms and pops fields. Keep the detached source
-        # intact so the finalizer can persist it for recovery on any failure.
+        # Finalization pops and stacks fields. Retain a detached source buffer
+        # unchanged so a failed background job can persist it for recovery.
         episode_buffer = copy.deepcopy(source_buffer)
         writers = self.video_writers if video_writers is None else video_writers
 
@@ -393,7 +403,7 @@ class Gr00tDataExporter(LeRobotDataset):
 
         episode_length = episode_buffer.pop("size")
         tasks = episode_buffer.pop("task")
-        episode_tasks = list(set(tasks))
+        episode_tasks = list(dict.fromkeys(tasks))
         episode_index = int(episode_buffer["episode_index"])
 
         episode_buffer["index"] = np.arange(
@@ -402,78 +412,99 @@ class Gr00tDataExporter(LeRobotDataset):
         episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
 
         for key, ft in self.features.items():
-            if key in ["index", "episode_index", "task_index"] or ft["dtype"] in [
-                "image",
-                "video",
-            ]:
+            if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
                 continue
             episode_buffer[key] = np.stack(episode_buffer[key])
 
-        # All content validation happens before any authoritative metadata is
-        # committed. A failed episode can leave replaceable files, but it cannot
-        # make info.json claim that an invalid episode exists.
+        # Reject timestamp problems before creating data, videos, or metadata.
         check_timestamps_sync(
-            episode_buffer["timestamp"],
+            np.asarray(episode_buffer["timestamp"], dtype=np.float64),
             episode_buffer["episode_index"],
             {"to": np.asarray([episode_length], dtype=np.int64)},
             self.fps,
             self.tolerance_s,
         )
 
-        for task in episode_tasks:
-            task_index = self.meta.get_task_index(task)
-            if task_index is None:
-                self.meta.add_task(task)
-
-        episode_buffer["task_index"] = np.array(
-            [self.meta.get_task_index(task) for task in tasks]
-        )
-
-        non_video_features = {
-            key: value
-            for key, value in self.features.items()
-            if value["dtype"] not in ["video"]
-        }
-        non_vid_ep_buffer = {
-            key: value
-            for key, value in episode_buffer.items()
-            if key in non_video_features
-        }
-        ep_stats = compute_episode_stats(non_vid_ep_buffer, non_video_features)
-
-        self._wait_image_writer()
-        self._save_episode_table(episode_buffer, episode_index)
-
-        if self.meta.video_keys:
-            video_paths = self.encode_episode_videos(
-                episode_index,
-                video_writers=writers,
+        metadata_state = {
+            attribute: copy.deepcopy(getattr(self.meta, attribute))
+            for attribute in (
+                "info",
+                "episodes",
+                "episodes_stats",
+                "stats",
+                "tasks",
+                "task_to_task_index",
             )
-            for key in self.meta.video_keys:
-                episode_buffer[key] = video_paths[key]
-
-        for key in self.meta.video_keys:
-            video_path = self.root / self.meta.get_video_file_path(episode_index, key)
-            if not video_path.is_file():
-                raise FileNotFoundError(
-                    f"Video path: {video_path} does not exist for episode {episode_index}"
-                )
-        parquet_path = self.root / self.meta.get_data_file_path(episode_index)
-        if not parquet_path.is_file():
-            raise FileNotFoundError(
-                f"Parquet path: {parquet_path} does not exist for episode {episode_index}"
-            )
-
-        previous_discarded = list(
-            self.meta.info.get("discarded_episode_indices", [])
-        )
-        if not success and episode_index not in previous_discarded:
-            self.meta.info["discarded_episode_indices"] = [
-                *previous_discarded,
-                episode_index,
-            ]
+            if hasattr(self.meta, attribute)
+        }
         try:
-            # This is the authoritative commit and intentionally occurs last.
+            for task in episode_tasks:
+                task_index = self.meta.get_task_index(task)
+                if task_index is None:
+                    self.meta.add_task(task)
+
+            episode_buffer["task_index"] = np.array(
+                [self.meta.get_task_index(task) for task in tasks]
+            )
+
+            non_video_features = {
+                key: value
+                for key, value in self.features.items()
+                if value["dtype"] not in ["video"]
+            }
+            non_vid_ep_buffer = {
+                key: value
+                for key, value in episode_buffer.items()
+                if key in non_video_features
+            }
+            ep_stats = compute_episode_stats(
+                non_vid_ep_buffer,
+                non_video_features,
+            )
+
+            self._wait_image_writer()
+            self._save_episode_table(episode_buffer, episode_index)
+
+            if self.meta.video_keys:
+                video_paths = self.encode_episode_videos(
+                    episode_index,
+                    video_writers=writers,
+                )
+                for key in self.meta.video_keys:
+                    episode_buffer[key] = video_paths[key]
+
+            for key in self.meta.video_keys:
+                video_path = self.root / self.meta.get_video_file_path(
+                    episode_index,
+                    key,
+                )
+                if not video_path.is_file():
+                    raise FileNotFoundError(
+                        f"Video path: {video_path} does not exist for episode {episode_index}"
+                    )
+            parquet_path = self.root / self.meta.get_data_file_path(episode_index)
+            if not parquet_path.is_file():
+                raise FileNotFoundError(
+                    f"Parquet path: {parquet_path} does not exist for episode {episode_index}"
+                )
+
+            if discarded:
+                previous_discarded = self.meta.info.get(
+                    "discarded_episode_indices", []
+                )
+                if episode_index not in previous_discarded:
+                    self.meta.info["discarded_episode_indices"] = [
+                        *previous_discarded,
+                        episode_index,
+                    ]
+
+            quality = dict(self.meta.info.get("episode_quality", {}))
+            quality[str(episode_index)] = {
+                "discarded": bool(discarded),
+                "validation": validation
+                or {"passed": not discarded, "errors": []},
+            }
+            self.meta.info["episode_quality"] = quality
             self.meta.save_episode(
                 episode_index,
                 episode_length,
@@ -481,7 +512,8 @@ class Gr00tDataExporter(LeRobotDataset):
                 ep_stats,
             )
         except Exception:
-            self.meta.info["discarded_episode_indices"] = previous_discarded
+            for attribute, value in metadata_state.items():
+                setattr(self.meta, attribute, value)
             raise
 
         quality_path = self.root / "meta" / "episode_quality.jsonl"
@@ -502,13 +534,9 @@ class Gr00tDataExporter(LeRobotDataset):
             # committed episode into a false finalizer failure over this audit log.
             print(f"[Exporter] Could not append episode quality record: {exc}")
 
-        img_dir = self.root / "images"
-        if img_dir.is_dir():
-            shutil.rmtree(img_dir)
-
         if active_episode:
             self.episode_buffer = self.create_episode_buffer()
-            self.video_writers = self.create_video_writer()
+            self.video_writers = {}
 
     def encode_episode_videos(
         self,
@@ -533,9 +561,10 @@ class Gr00tDataExporter(LeRobotDataset):
         self.save_episode(
             episode_data,
             video_writers=video_writers,
-            success=False,
+            discarded=True,
             validation=validation,
         )
+
 
 
 # ---------------------------------------------------------------------------

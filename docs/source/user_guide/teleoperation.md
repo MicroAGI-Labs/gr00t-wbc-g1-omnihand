@@ -52,7 +52,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager
 2. **Stand in calibration pose** — Upright, feet together, arms in down. Recalibrate often!!!
 3. **Make robot stand loose but standing** - Put the G1 somehow slack on gantry (the policy will start and start balancing on its own). 
 4. **Press A+B+X+Y** on controllers — Initializes the policy and calibrates (enters Planner mode)
-5. **Press A+X** — Switches to Pose mode (whole-body teleoperation active)
+5. **Press and release A+X twice within two seconds** — Switches to Pose mode (whole-body teleoperation active)
 6. **Teleoperate** — Your movements are now mirrored by the robot
 7. **Stop from the UI or terminate the control process** when done.
 
@@ -164,13 +164,13 @@ When switching between modes, **always match the robot's current pose first**.
 **Dangerous scenario:**
 1. Robot is in Planner mode standing upright
 2. You're crouching or reaching in a different pose
-3. You press **A+X** to switch to Pose mode
+3. You complete two **A+X** gestures within two seconds to switch to Pose mode
 4. **Robot violently tries to match your crouched pose** ⚠️
 
 **Safe procedure:**
-1. Before pressing **A+X**, look at the robot (or visualization)
+1. Before switching modes with **A+X**, look at the robot (or visualization)
 2. Move your body to approximately match the robot's current pose
-3. Then press **A+X** — transition will be smooth
+3. When not recording, press and release **A+X** twice within two seconds to switch modes. During recording, one A+X gesture saves the take and keeps the current mode.
 
 **Pause feature (Menu button):**
 

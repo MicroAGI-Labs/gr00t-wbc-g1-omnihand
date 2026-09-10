@@ -122,7 +122,7 @@ def test_atlas_o10_actuators_move_active_and_nonlinearly_coupled_joints():
         active_index = float(data.qpos[model.joint("L_index_pip_joint").qposadr[0]])
         passive_index = float(data.qpos[model.joint("L_index_dip_joint").qposadr[0]])
         assert np.max(np.abs(left)) > 0.3
-        assert np.max(np.abs(right)) < 0.06
+        np.testing.assert_allclose(right, right_target, atol=0.02)
         assert active_index > 0.3
         assert passive_index > active_index
     finally:

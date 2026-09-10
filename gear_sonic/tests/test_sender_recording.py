@@ -6,7 +6,7 @@ import time
 import numpy as np
 import pytest
 
-from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+from gear_sonic.camera.composed_camera import CameraFrameBuffer, ComposedCameraClientSensor
 from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.data.clock_sync import (
     ClockClient, ClockEstimate, ClockServer, ClockUnavailable, clock_id, estimate_exchange,
@@ -161,6 +161,7 @@ def receiver():
     client._background_lock = threading.Lock()
     client._receiver_error = None
     client._history_overflow = 0
+    client._background_buffer = CameraFrameBuffer()
     return client
 
 

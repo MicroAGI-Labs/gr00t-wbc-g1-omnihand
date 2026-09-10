@@ -39,6 +39,7 @@ This environment is separate from `.venv_teleop` and `.venv_sim` — the data ex
 
 ---
 
+(camera-server-setup-on-the-camera-host)=
 ## Camera Server Setup (On the Camera Host)
 
 The camera server must run where the camera USB cable is connected. For the onboard ZED setup, that is Thor. It can publish locally to the exporter over `localhost` while using the same ZMQ interface as a remote setup.

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import html
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import deque
 import json
 import queue
 import re
@@ -687,6 +688,8 @@ class CameraFrameHub:
         self._jpeg: bytes | None = None
         self._sequence = 0
         self._camera_count = 0
+        self._camera_samples: dict[str, deque[tuple[float, float]]] = {}
+        self._camera_last_source: dict[str, float] = {}
         self._last_frame_time = 0.0
         self._running = True
         self._client = SensorClient()
@@ -709,8 +712,18 @@ class CameraFrameHub:
             return {
                 "streaming": age is not None and age < 2.0,
                 "camera_count": self._camera_count,
+                "camera_rates_hz": self._camera_rates(),
                 "last_frame_age_s": round(age, 3) if age is not None else None,
             }
+
+    def _camera_rates(self) -> dict[str, float]:
+        rates = {}
+        for name, samples in self._camera_samples.items():
+            if len(samples) > 1:
+                elapsed = samples[-1][0] - samples[0][0]
+                if elapsed > 0:
+                    rates[name] = round((len(samples) - 1) / elapsed, 2)
+        return rates
 
     def wait_for_jpeg(self, sequence: int, timeout: float = 2.0) -> tuple[int, bytes | None]:
         with self._condition:
@@ -729,6 +742,15 @@ class CameraFrameHub:
                 continue
 
             now = time.monotonic()
+            with self._condition:
+                for name, timestamp in message.get("timestamps", {}).items():
+                    if timestamp == self._camera_last_source.get(name):
+                        continue
+                    self._camera_last_source[name] = timestamp
+                    samples = self._camera_samples.setdefault(name, deque())
+                    samples.append((now, float(timestamp)))
+                    while samples and now - samples[0][0] > 2.0:
+                        samples.popleft()
             if now < next_frame_time:
                 continue
 

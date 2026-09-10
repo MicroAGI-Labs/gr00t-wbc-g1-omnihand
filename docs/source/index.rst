@@ -129,6 +129,10 @@ Documentation
    :caption: Reference Documentation
 
    references/index
+   references/pico_controller_controls
+   references/dex1_teleop
+   references/sender_time_recording
+   references/atlas_controls_comparison
    user_guide/configuration
    references/conventions
    references/training_code

@@ -827,13 +827,15 @@ def _timestamp_seconds(value, *, nanoseconds: bool = False) -> float | None:
 
 
 def _integer_scalar(value, default: int = -1) -> int:
-    if isinstance(value, np.ndarray):
-        if value.size == 0:
+    """Read an optional int64 source identity without rounding or overflowing."""
+    try:
+        array = np.asarray(value)
+        if array.size != 1 or array.dtype.kind not in "iu":
             return default
-        value = value.flat[0]
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        result = int(array.item())
+        return result if 0 <= result <= np.iinfo(np.int64).max else default
+    except (TypeError, ValueError, OverflowError):
         return default
-    return int(value)
 
 
 def _required_vector(data: dict, key: str, width: int) -> np.ndarray:
@@ -1651,13 +1653,20 @@ class GrootDataCollector:
             success = False
 
         episode_buffer, video_writers = self.data_exporter.detach_episode()
-        self.episode_finalizer.enqueue(
-            episode_index=episode_index,
-            episode_buffer=episode_buffer,
-            video_writers=video_writers,
-            success=success,
-            validation=validation,
-        )
+        try:
+            self.episode_finalizer.enqueue(
+                episode_index=episode_index,
+                episode_buffer=episode_buffer,
+                video_writers=video_writers,
+                success=success,
+                validation=validation,
+            )
+        except Exception:
+            # The finalizer did not take ownership. Preserve the completed take
+            # and its writers so the operator can retry saving it.
+            self.data_exporter.episode_buffer = episode_buffer
+            self.data_exporter.video_writers = video_writers
+            raise
 
         if getattr(self, "_sender_sync", None) is not None:
             self._sender_sync.reset()
@@ -2108,7 +2117,9 @@ class GrootDataCollector:
                 frame_data[feature_name] = images[image_key]
                 timestamp_key = f"capture.{image_key}_source_timestamp_ns"
                 if timestamp_key in self.data_exporter.features:
-                    timestamp = inputs.image["timestamps"][image_key]
+                    timestamp = _timestamp_seconds(inputs.image.get("timestamps", {}).get(image_key))
+                    if timestamp is None or timestamp >= np.iinfo(np.int64).max / 1e9:
+                        raise ValueError(f"Required image '{image_key}' has no valid source timestamp")
                     frame_data[timestamp_key] = np.asarray([int(timestamp * 1e9)], dtype=np.int64)
 
     def _finalize_frame(self, t_start: float) -> bool:

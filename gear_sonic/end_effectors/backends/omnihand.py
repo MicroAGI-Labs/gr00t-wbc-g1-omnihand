@@ -20,6 +20,7 @@ SDK_COMMIT = "026740d9fdd8ba32b0605fa702a992b322076f1b"
 EXPECTED_DRIVER = "gs_usb"
 SOCKETCAN_REQUEST_INTERVAL_MS = 0
 SOCKETCAN_FRAME_RECV_TIMEOUT_MS = 50
+LINK_INSPECTION_TIMEOUT_S = 1.0
 EXPECTED_SERIAL = {
     HandSide.RIGHT: "2082395E534B50052",
     HandSide.LEFT: "205B3973534B50042",
@@ -85,14 +86,16 @@ def _canfd_link_mismatches(document: Any) -> list[str]:
 
     nominal = info.get("bittiming")
     data = info.get("data_bittiming")
+    flags = link.get("flags")
+    ctrlmode = info.get("ctrlmode")
     missing: list[str] = []
     if link.get("link_type") != "can":
         missing.append("CAN link type")
-    if link.get("operstate") != "UP" or "UP" not in link.get("flags", ()):
+    if link.get("operstate") != "UP" or not isinstance(flags, list) or "UP" not in flags:
         missing.append("UP interface")
     if link.get("mtu") != 72:
         missing.append("CAN-FD MTU 72")
-    if "FD" not in info.get("ctrlmode", ()):
+    if not isinstance(ctrlmode, list) or "FD" not in ctrlmode:
         missing.append("FD mode")
     if info.get("state") != "ERROR-ACTIVE":
         missing.append("ERROR-ACTIVE CAN state")
@@ -121,9 +124,10 @@ def _validate_canfd_link(interface: str) -> None:
             check=True,
             capture_output=True,
             text=True,
+            timeout=LINK_INSPECTION_TIMEOUT_S,
         ).stdout
         details = json.loads(raw)
-    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         raise OmniHandHardwareError(f"cannot inspect CAN-FD settings for {interface}") from exc
     missing = _canfd_link_mismatches(details)
     if missing:
@@ -197,8 +201,8 @@ class OmniHandBackend:
         """Configure and verify the SDK's SocketCAN request cadence."""
         if not 0 <= request_interval_ms <= 100:
             raise OmniHandHardwareError("SocketCAN request interval must be between 0 and 100 ms")
-        if frame_recv_timeout_ms <= 0:
-            raise OmniHandHardwareError("SocketCAN frame receive timeout must be positive")
+        if not 10 <= frame_recv_timeout_ms <= 1000:
+            raise OmniHandHardwareError("SocketCAN frame receive timeout must be between 10 and 1000 ms")
         try:
             self._hand.set_request_interval(request_interval_ms)
             actual_interval = int(self._hand.get_request_interval())

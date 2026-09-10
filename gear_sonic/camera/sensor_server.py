@@ -3,6 +3,7 @@
 import base64
 from dataclasses import dataclass, field
 from enum import Enum
+from collections.abc import Mapping
 import time
 from typing import Any
 
@@ -157,11 +158,20 @@ class ImageMessageSchema:
             else:
                 images[key] = value
         depths = {key: np.asarray(value) for key, value in data.get("depths", {}).items()}
+        capture_values = data.get("capture_monotonic_ns", {})
+        if not isinstance(capture_values, Mapping):
+            capture_values = {}
         return ImageMessageSchema(
             timestamps=timestamps,
             images=images,
             depths=depths,
-            capture_monotonic_ns=data.get("capture_monotonic_ns", {}),
+            capture_monotonic_ns={
+                str(key): int(value)
+                for key, value in capture_values.items()
+                if isinstance(value, (int, np.integer))
+                and not isinstance(value, (bool, np.bool_))
+                and int(value) > 0
+            },
             sample_monotonic_ns=data.get("sample_monotonic_ns"),
             publisher_sequence=data.get("publisher_sequence"),
             publisher_monotonic_ns=data.get("publisher_monotonic_ns"),
@@ -217,6 +227,37 @@ class SensorServer:
         if capture_times and not has_sample_monotonic:
             capture_age_ns = int(max(0.0, published_wall_s - max(capture_times)) * 1e9)
             payload["sample_monotonic_ns"] = published_monotonic_ns - capture_age_ns
+        supplied_capture_times = payload.get("capture_monotonic_ns", {})
+        capture_monotonic_ns = (
+            dict(supplied_capture_times)
+            if isinstance(supplied_capture_times, Mapping)
+            else {}
+        )
+        timestamps = payload.get("timestamps", {})
+        if not isinstance(timestamps, Mapping):
+            timestamps = {}
+        for camera_name, captured_wall_s in timestamps.items():
+            supplied = capture_monotonic_ns.get(camera_name)
+            if (
+                isinstance(supplied, (int, np.integer))
+                and not isinstance(supplied, (bool, np.bool_))
+                and int(supplied) > 0
+            ):
+                capture_monotonic_ns[camera_name] = int(supplied)
+                continue
+            if (
+                isinstance(captured_wall_s, (int, float, np.number))
+                and not isinstance(captured_wall_s, (bool, np.bool_))
+                and np.isfinite(captured_wall_s)
+                and float(captured_wall_s) > 0
+            ):
+                capture_age_ns = int(
+                    max(0.0, published_wall_s - float(captured_wall_s)) * 1e9
+                )
+                capture_monotonic_ns[camera_name] = (
+                    published_monotonic_ns - capture_age_ns
+                )
+        payload["capture_monotonic_ns"] = capture_monotonic_ns
         payload["publisher_sequence"] = self.message_sent + 1
         payload["publisher_monotonic_ns"] = published_monotonic_ns
         try:
