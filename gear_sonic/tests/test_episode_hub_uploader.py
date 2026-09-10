@@ -3,10 +3,12 @@
 from pathlib import Path
 import threading
 import time
+from unittest.mock import Mock
 
 import pytest
 
-from gear_sonic.scripts.run_data_exporter import EpisodeFinalizer, EpisodeHubUploader
+from gear_sonic.data.episode_finalizer import EpisodeFinalizer
+from gear_sonic.data.hub_uploader import EpisodeHubUploader
 
 
 class _FakeMeta:
@@ -84,6 +86,74 @@ def test_recording_allowed_while_upload_is_in_flight(uploader):
 
     assert hub.status()["uploading"] is True
     assert hub.can_record() is True
+
+
+def test_failed_upload_retries_without_blocking_recording(uploader):
+    hub, exporter = uploader
+    _write_episode(exporter.root, 0)
+    attempted = threading.Event()
+    release_retry = threading.Event()
+    calls = []
+
+    def upload(snapshot, config):
+        calls.append(snapshot)
+        attempted.set()
+        if len(calls) == 1:
+            raise OSError("network unavailable")
+        assert release_retry.wait(timeout=5.0)
+
+    hub._upload_runner = upload
+    try:
+        hub.enqueue(0)
+        assert attempted.wait(timeout=1.0)
+        _wait_for(lambda: hub.status()["retrying"])
+        assert hub.can_record()
+        assert hub.status()["last_uploaded_episode"] is None
+        assert "network unavailable" in hub.status()["error"]
+        release_retry.set()
+        assert hub.wait_until_idle(timeout=5.0)
+        assert len(calls) == 2
+        assert hub.status()["last_uploaded_episode"] == 0
+        assert hub.status()["error"] is None
+    finally:
+        release_retry.set()
+
+
+def test_shutdown_stops_upload_child_and_preserves_local_episode(uploader, monkeypatch):
+    import gear_sonic.data.hub_uploader as module
+
+    hub, exporter = uploader
+    _write_episode(exporter.root, 0)
+    started, released = threading.Event(), threading.Event()
+    process = Mock(returncode=None)
+
+    def communicate():
+        started.set()
+        assert released.wait(timeout=5.0)
+        process.returncode = -15
+        return "", "terminated"
+
+    process.communicate.side_effect = communicate
+    process.terminate.side_effect = released.set
+    process.poll.return_value = None
+    spawn = Mock(return_value=process)
+    monkeypatch.setattr(module.subprocess, "Popen", spawn)
+    hub._upload_runner = hub._run_upload_subprocess
+    try:
+        hub.enqueue(0)
+        assert started.wait(timeout=2.0)
+        hub.close(timeout=0)
+        command = spawn.call_args.args[0]
+        helper = Path(command[1])
+        assert helper == Path(module.__file__).resolve().parents[1] / "scripts/upload_dataset_snapshot.py"
+        assert helper.is_file()
+        assert "--private" in command
+        process.terminate.assert_called_once()
+        assert not hub._thread.is_alive()
+        assert hub.status()["last_uploaded_episode"] is None
+        assert (exporter.root / "data/chunk-000/episode_000000.parquet").is_file()
+    finally:
+        released.set()
 
 
 def test_upload_uses_immutable_metadata_snapshot(uploader):

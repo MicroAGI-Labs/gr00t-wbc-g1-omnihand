@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import av
 import numpy as np
@@ -93,17 +94,18 @@ def test_next_writer_failure_cannot_lose_detached_video(tmp_path, monkeypatch):
 
     monkeypatch.setattr(exporter, "create_video_writer", fail_next_writer)
     completed, writers = exporter.detach_episode()
-    finalizer = EpisodeFinalizer(exporter)
+    finalizer = EpisodeFinalizer(exporter, SimpleNamespace(status=lambda: {"ready": False}))
     try:
         finalizer.enqueue(
             episode_index=0,
             episode_buffer=completed,
             video_writers=writers,
-            discarded=False,
+            success=True,
             validation={"passed": True, "errors": []},
         )
         assert finalizer.wait_until_idle(timeout=5.0)
-        assert finalizer.drain_results()[0].succeeded
+        assert finalizer.status()["error"] is None
+        assert finalizer.status()["last_finalized_episode"] == 0
         with pytest.raises(OSError, match="cannot open next"):
             exporter.add_frame(frame)
         assert exporter.episode_buffer["size"] == 0

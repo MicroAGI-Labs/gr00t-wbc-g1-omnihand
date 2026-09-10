@@ -66,7 +66,7 @@ def test_recording_start_is_blocked_outside_required_mode():
     collector._check_recording_commands()
 
     assert collector._episode_state.get_state() == collector._episode_state.IDLE
-    assert collector._recording_message == "Enter VR3PT with A+X before recording"
+    assert collector._recording_message == "Enter VR3PT teleop before recording"
 
 
 @pytest.mark.parametrize("passed", [True, False])
