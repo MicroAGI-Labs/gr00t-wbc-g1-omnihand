@@ -95,6 +95,40 @@ class Gr00tDatasetMetadata(LeRobotDatasetMetadata):
     """
 
     MODALITY_CONFIG_REL_PATH = Path("meta/modality.json")
+    EMPTY_INDEX_FILES = ("tasks.jsonl", "episodes.jsonl", "episodes_stats.jsonl")
+
+    @classmethod
+    def restore_empty_indexes(cls, root: str | Path) -> None:
+        """Complete v2.1 metadata only when no recording has been written."""
+        root = Path(root)
+        missing = [root / "meta" / name for name in cls.EMPTY_INDEX_FILES
+                   if not (root / "meta" / name).exists()]
+        if not missing:
+            return
+        with (root / "meta/info.json").open() as stream:
+            info = json.load(stream)
+        if info.get("codebase_version") != "v2.1":
+            return
+        counts_empty = all(info.get(key) == 0 for key in (
+            "total_episodes", "total_frames", "total_tasks", "total_videos",
+        ))
+        indexes_empty = all(not path.exists() or path.stat().st_size == 0
+                            for path in (root / "meta" / name for name in cls.EMPTY_INDEX_FILES))
+        recording_files = any(path.is_file() for directory in ("data", "videos", "images")
+                              for path in (root / directory).rglob("*"))
+        if not counts_empty or not indexes_empty or recording_files:
+            raise ValueError(
+                f"Incomplete dataset metadata at {root}: missing "
+                f"{', '.join(path.name for path in missing)}. "
+                "Recording data may exist; no files were changed."
+            )
+        for path in missing:
+            # Never truncate an index, including one created concurrently.
+            try:
+                with path.open("x"):
+                    pass
+            except FileExistsError:
+                pass
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -122,6 +156,7 @@ class Gr00tDatasetMetadata(LeRobotDatasetMetadata):
         with open(obj.root / cls.MODALITY_CONFIG_REL_PATH, "w") as f:
             json.dump(modality_config, f, indent=4)
         obj.modality_config = modality_config
+        cls.restore_empty_indexes(obj.root)
         return obj
 
     @staticmethod
@@ -201,6 +236,7 @@ class Gr00tDataExporter(LeRobotDataset):
             shutil.rmtree(save_root)
 
         if (Path(save_root)).exists():
+            Gr00tDatasetMetadata.restore_empty_indexes(save_root)
             try:
                 obj.meta = Gr00tDatasetMetadata(
                     repo_id=repo_id,

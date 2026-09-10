@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -5,6 +6,56 @@ import pytest
 
 from gear_sonic.data import exporter as exporter_module
 from gear_sonic.data.exporter import Gr00tDataExporter
+
+
+def _create_empty_exporter(root):
+    return Gr00tDataExporter.create(
+        save_root=root, fps=50, task="demo", robot_type="test",
+        features={"state": {"dtype": "float32", "shape": (1,), "names": ["joint"]}},
+        modality_config={key: {} for key in ("state", "action", "video", "annotation")},
+    )
+
+
+@pytest.mark.parametrize("legacy_missing_indexes", [False, True])
+def test_resume_before_first_episode_stays_local(tmp_path, monkeypatch, legacy_missing_indexes):
+    from lerobot.common.datasets import lerobot_dataset
+
+    def forbid_hub(*args, **kwargs):
+        pytest.fail("A local empty dataset must not fall back to the Hub")
+
+    monkeypatch.setattr(lerobot_dataset, "get_safe_version", forbid_hub)
+    root = tmp_path / "dataset"
+    initial = _create_empty_exporter(root)
+    for name in initial.meta.EMPTY_INDEX_FILES:
+        path = root / "meta" / name
+        assert path.read_bytes() == b""
+        if legacy_missing_indexes:
+            path.unlink()
+    before = (root / "meta/info.json").read_bytes()
+    resumed = _create_empty_exporter(root)
+    assert resumed.meta.total_episodes == 0
+    assert resumed.episode_buffer["episode_index"] == 0
+    assert (root / "meta/info.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("existing", ["counts", "video", "table", "task"])
+def test_missing_indexes_never_hide_existing_recording(tmp_path, existing):
+    root = tmp_path / "dataset"
+    initial = _create_empty_exporter(root)
+    (root / "meta/episodes_stats.jsonl").unlink()
+    if existing == "counts":
+        path = root / "meta/info.json"
+        info = json.loads(path.read_text())
+        info["total_episodes"] = 1
+        path.write_text(json.dumps(info))
+    else:
+        path = root / {"video": "videos/frame.mp4", "table": "data/frame.parquet", "task": "meta/tasks.jsonl"}[existing]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"retained recording")
+    before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    with pytest.raises(ValueError, match="Recording data may exist"):
+        _create_empty_exporter(root)
+    assert {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
 
 
 class _FakeMeta:

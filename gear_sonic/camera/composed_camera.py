@@ -518,6 +518,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
         all_timestamps = {}
         all_images = {}
         all_depths = {}
+        capture_monotonic_ns = {}
         sample_monotonic_values = []
         for _mount, camera_data in message.items():
             all_timestamps.update(camera_data.get("timestamps", {}))
@@ -526,10 +527,14 @@ class ComposedCameraSensor(Sensor, SensorServer):
             sample_monotonic_ns = camera_data.get("sample_monotonic_ns")
             if isinstance(sample_monotonic_ns, int) and sample_monotonic_ns > 0:
                 sample_monotonic_values.append(sample_monotonic_ns)
+                for name in camera_data.get("timestamps", {}):
+                    capture_monotonic_ns[name] = sample_monotonic_ns
+            capture_monotonic_ns.update(camera_data.get("capture_monotonic_ns", {}))
         img_schema = ImageMessageSchema(
             timestamps=all_timestamps,
             images=all_images,
             depths=all_depths,
+            capture_monotonic_ns=capture_monotonic_ns,
             # Match the existing wall-timestamp fallback, which uses the most
             # recent capture when several cameras share one published packet.
             sample_monotonic_ns=(
@@ -582,7 +587,8 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
     """ZMQ client that deserializes merged camera frames from the server."""
 
     def __init__(
-        self, server_ip: str = "localhost", port: int = 5555, *, background: bool = False
+        self, server_ip: str = "localhost", port: int = 5555, *, background: bool = False,
+        preserve_history: bool = False,
     ):
         self._latest_message = None
         self._avg_time_per_frame: deque = deque(maxlen=20)
@@ -594,6 +600,8 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         self._last_staleness_warning_time = 0.0
         self._staleness_warning_interval = 2.0
         self._background = background
+        self._preserve_history = preserve_history
+        self._history_overflow = 0
         self._background_lock = threading.Lock()
         self._background_frames: dict[str, deque] = {}
         self._background_timestamps: dict[str, float] = {}
@@ -650,6 +658,26 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
 
     def _buffer_camera_frames(self, message: dict) -> None:
         """Keep bounded queues of distinct captures, independently per camera."""
+        if getattr(self, "_preserve_history", False):
+            # Do not sample before the recorder selects against its target time.
+            # Cached channels keep their original capture ID and arrival time.
+            for name in set(message["images"]) | set(message.get("depths", {})):
+                source_ns = message.get("capture_monotonic_ns", {}).get(name)
+                identity = (source_ns, message.get("timestamps", {}).get(name))
+                if self._background_timestamps.get(name) == identity:
+                    continue
+                self._background_timestamps[name] = identity
+                frames = self._background_frames.setdefault(name, deque(maxlen=32))
+                if len(frames) == frames.maxlen:
+                    self._history_overflow += 1
+                frames.append({
+                    **message,
+                    "images": {name: message["images"][name]} if name in message["images"] else {},
+                    "depths": {name: message["depths"][name]} if name in message.get("depths", {}) else {},
+                    "timestamps": {name: message.get("timestamps", {}).get(name)},
+                    "capture_monotonic_ns": {name: source_ns},
+                })
+            return
         for name, image in message["images"].items():
             timestamp = message["timestamps"][name]
             if self._background_timestamps.get(name) == timestamp:
@@ -664,6 +692,19 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             self._background_timestamps[name] = timestamp
             frames = self._background_frames.setdefault(name, deque(maxlen=5))
             frames.append({**message, "images": {}, "depths": {name: depth}, "timestamps": {name: timestamp}})
+
+    def read_pending(self) -> list[dict]:
+        """Transfer distinct per-camera captures without dropping past candidates."""
+        if not self._background or not self._preserve_history:
+            raise RuntimeError("read_pending requires background preserve_history mode")
+        if self._receiver_error is not None:
+            raise RuntimeError(f"camera receiver failed: {self._receiver_error}")
+        with self._background_lock:
+            messages = [frame for frames in self._background_frames.values() for frame in frames]
+            for frames in self._background_frames.values():
+                frames.clear()
+        messages.sort(key=lambda frame: frame["receiver_monotonic_ns"])
+        return messages
 
     def _sample_camera_frames(self) -> dict | None:
         updated = False

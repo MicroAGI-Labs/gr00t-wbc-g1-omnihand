@@ -129,6 +129,13 @@ class DataCollectionLaunchConfig:
     hand_backend: Literal["dex3", "omnihand", "dex1", "none"] = "dex3"
     """Hand owner. OmniHand uses the external controller in sim and hardware."""
 
+    sender_time_recording: bool = False
+    """Opt in to producer-time recording; requires a dataset with synchronization metadata."""
+
+    synchronization_delay: float = 0.1
+    synchronization_wait_timeout: float = 0.25
+    hand_clock_port: int = 5574
+
     hand_server_host: str | None = None
     """Launch DEX 1 hands on this host over SSH; omit to launch locally."""
 
@@ -195,6 +202,24 @@ class DataCollectionLaunchConfig:
     idle_base_transition_duration: float = 5.0
     """Seconds for smooth arm motion into and out of the teleop alignment pose."""
 
+    disable_vr_motion_limiter: bool = False
+    """Bypass VR motion limits for this launch, including worker restarts."""
+
+    vr_max_speed: float = 0.35
+    """Operating Cartesian translation speed limit in m/s (hard ceiling = 1.5x)."""
+
+    vr_max_acceleration: float = 0.9
+    """Operating Cartesian translation acceleration in m/s^2 (hard ceiling = 1.5x)."""
+
+    vr_max_jerk: float = 9.0
+    """Fixed Cartesian translation jerk ceiling in m/s^3."""
+
+    vr_max_angular_jerk_deg: float = 3600.0
+    """Fixed Cartesian angular jerk ceiling in degrees/s^3."""
+
+    vr_motion_log_dir: str | None = None
+    """Optional directory for full-rate before/after VR motion traces."""
+
     # Data exporter options
     task_prompt: str = DEFAULT_TASK_PROMPT
     """Language task prompt for the data exporter."""
@@ -253,6 +278,16 @@ SIM_PANE = 4
 def _check_prerequisites(config: DataCollectionLaunchConfig):
     """Verify that required tools and venvs exist."""
     errors = []
+    if config.sender_time_recording:
+        if config.camera_host not in {"localhost", "127.0.0.1", "::1"}:
+            errors.append("sender-time recording currently requires the camera publisher on this host")
+        if not all(math.isfinite(v) and v > 0 for v in
+                   (config.synchronization_delay, config.synchronization_wait_timeout)):
+            errors.append("synchronization delay and wait timeout must be positive finite seconds")
+        if not 1 <= config.hand_clock_port <= 65535 or config.hand_clock_port in (
+            config.hand_intent_port, config.hand_state_port, config.hand_control_port,
+        ):
+            errors.append("hand clock port must be within 1..65535 and distinct from other hand ports")
 
     if not shutil.which("tmux"):
         errors.append("tmux is not installed. Install with: sudo apt install tmux")
@@ -355,6 +390,10 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
         errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
     if config.idle_base_transition_duration <= 0.0:
         errors.append("--idle-base-transition-duration must be positive")
+    for name in ("vr_max_speed", "vr_max_acceleration", "vr_max_jerk", "vr_max_angular_jerk_deg"):
+        value = getattr(config, name)
+        if not math.isfinite(value) or value <= 0:
+            errors.append(f"--{name.replace('_', '-')} must be positive and finite")
 
     if errors:
         print("ERROR: Prerequisites not met:\n")
@@ -472,6 +511,8 @@ def _remote_hand_command(config: DataCollectionLaunchConfig) -> str:
         f"--control-port {config.hand_control_port} "
         f"--dex1-transition-duration {config.dex1_transition_duration} --enable-command"
     )
+    if config.sender_time_recording:
+        command += f" --clock-port {config.hand_clock_port}"
     return shlex.join([
         *_remote_hand_ssh_args(config), "--", str(config.hand_server_host), command,
     ])
@@ -616,6 +657,13 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Deploy input:    {config.deploy_input_type}")
     print(f"  Teleop input:    {config.pico_input_source}")
     print(f"  Body control:    {config.body_control_mode}")
+    print(f"  VR limiter:      {'DISABLED' if config.disable_vr_motion_limiter else 'enabled'}")
+    if not config.disable_vr_motion_limiter:
+        print(f"  VR speed limit:  {config.vr_max_speed:g} m/s (hard ceiling {1.5 * config.vr_max_speed:g} m/s)")
+        print(f"  VR acceleration: {config.vr_max_acceleration:g} m/s^2 (hard ceiling {1.5 * config.vr_max_acceleration:g} m/s^2)")
+        print(f"  VR jerk limits:  {config.vr_max_jerk:g} m/s^3, {config.vr_max_angular_jerk_deg:g} deg/s^3")
+    if config.vr_motion_log_dir:
+        print(f"  VR motion logs:  {config.vr_motion_log_dir}")
     print(f"  Hand backend:    {config.hand_backend}")
     print(f"  Hand server:     {config.hand_server_host or 'local (managed by launcher)'}")
     if config.deploy_checkpoint:
@@ -706,10 +754,18 @@ def main(config: DataCollectionLaunchConfig):
         f"--teleop-control-port {config.teleop_control_port} "
         f"--teleop-mode {pico_teleop_mode} "
         f"--idle-base-transition-duration {config.idle_base_transition_duration} "
+        f"--vr-max-speed {config.vr_max_speed} "
+        f"--vr-max-acceleration {config.vr_max_acceleration} "
+        f"--vr-max-jerk {config.vr_max_jerk} "
+        f"--vr-max-angular-jerk-deg {config.vr_max_angular_jerk_deg} "
         "--initial-locomotion-mode slow_walk"
     )
     if config.pico_manager:
         pico_process_cmd += " --manager"
+    if config.disable_vr_motion_limiter:
+        pico_process_cmd += " --disable-vr-motion-limiter"
+    if config.vr_motion_log_dir:
+        pico_process_cmd += f" --vr-motion-log-dir {shlex.quote(config.vr_motion_log_dir)}"
     if config.pico_vis_vr3pt:
         pico_process_cmd += " --vis_vr3pt"
     if config.pico_vis_smpl:
@@ -805,6 +861,12 @@ def main(config: DataCollectionLaunchConfig):
         f"--hand-state-port {config.hand_state_port} "
         f"--hand-state-host {shlex.quote(config.hand_server_host or 'localhost')}"
     )
+    if config.sender_time_recording:
+        exporter_cmd += (
+            f" --sender-time-recording --synchronization-delay {config.synchronization_delay}"
+            f" --synchronization-wait-timeout {config.synchronization_wait_timeout}"
+            f" --hand-clock-port {config.hand_clock_port}"
+        )
     if config.dataset_name:
         exporter_cmd += f" --dataset-name '{config.dataset_name}'"
     if config.record_wrist_cameras:

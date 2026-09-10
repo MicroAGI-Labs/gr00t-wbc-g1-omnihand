@@ -156,15 +156,23 @@ TEST(PlannerDisconnect, KeepsVrTargetsAndEncoderAcrossTimeoutAndReconnect) {
     // Custom limits are cached on the robot and constrain a large autonomous
     // return even when there are no more publisher messages.
     header.fields.push_back({"vr_motion_limits", "f64", {4}});
-    for (bool translation_dominates : {true, false}) {
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        const bool translation_dominates = scenario % 2 == 0;
+        if (scenario == 2) header.fields.push_back({"vr_jerk_limits", "f64", {2}});
         std::array<double, 4> limits{0.2, 0.5, 0.2, 0.4};
+        std::array<double, 2> jerk_limits{0.02, 0.02};
         position[0] = base[0] + (translation_dominates ? 1.2 : 0.0);
         orientation[0] = std::sqrt(0.5);
         orientation[3] = std::sqrt(0.5);
         base[3] = std::cos(M_PI / 12);
         base[6] = std::sin(M_PI / 12);
-        ZMQManagerTestPeer::receive(manager, header,
-            {view(mode), view(direction), view(direction), view(position), view(orientation), view(base), view(limits)});
+        if (scenario < 2) {
+            ZMQManagerTestPeer::receive(manager, header,
+                {view(mode), view(direction), view(direction), view(position), view(orientation), view(base), view(limits)});
+        } else {
+            ZMQManagerTestPeer::receive(manager, header,
+                {view(mode), view(direction), view(direction), view(position), view(orientation), view(base), view(limits), view(jerk_limits)});
+        }
         tick();
         ZMQManagerTestPeer::expire(manager);
         tick();
@@ -172,6 +180,8 @@ TEST(PlannerDisconnect, KeepsVrTargetsAndEncoderAcrossTimeoutAndReconnect) {
         auto previous_orientation = manager.GetVR3PointOrientation().second;
         Eigen::Vector3d previous_v = Eigen::Vector3d::Zero();
         Eigen::Vector3d previous_w = Eigen::Vector3d::Zero();
+        Eigen::Vector3d previous_a = Eigen::Vector3d::Zero();
+        Eigen::Vector3d previous_alpha = Eigen::Vector3d::Zero();
         for (int i = 1; i <= 2000; ++i) {
             ZMQManagerTestPeer::heldFor(manager, 15.0 + i * 0.01);
             auto p = manager.GetVR3PointPosition().second;
@@ -187,6 +197,13 @@ TEST(PlannerDisconnect, KeepsVrTargetsAndEncoderAcrossTimeoutAndReconnect) {
             EXPECT_LE((v - previous_v).norm() / 0.01, limits[1] + 1e-5);
             ASSERT_LE(w.norm(), limits[2] + 1e-6);
             EXPECT_LE((w - previous_w).norm() / 0.01, limits[3] + 1e-5);
+            const Eigen::Vector3d a = (v - previous_v) / 0.01;
+            const Eigen::Vector3d alpha = (w - previous_w) / 0.01;
+            if (scenario >= 2) {
+                EXPECT_LE((a - previous_a).norm() / 0.01, jerk_limits[0] + 1e-5);
+                EXPECT_LE((alpha - previous_alpha).norm() / 0.01, jerk_limits[1] + 1e-5);
+            }
+            previous_a = a; previous_alpha = alpha;
             previous_position = p; previous_orientation = q;
             previous_v = v; previous_w = w;
         }

@@ -11,6 +11,8 @@ import signal
 import subprocess
 import sys
 
+from gear_sonic.data.clock_sync import ClockServer
+
 from .backends.dex1 import DEFAULT_WORKER, USB_PORTS
 from .protocol import DEFAULT_HAND_CONTROL_PORT, DEFAULT_HAND_INTENT_PORT, DEFAULT_HAND_STATE_PORT
 from .supervisor import HandWorkerSupervisor
@@ -29,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--intent-port", type=int, default=DEFAULT_HAND_INTENT_PORT)
     parser.add_argument("--state-port", type=int, default=DEFAULT_HAND_STATE_PORT)
     parser.add_argument("--control-port", type=int, default=DEFAULT_HAND_CONTROL_PORT)
+    parser.add_argument("--clock-port", type=int, default=0,
+                        help="Read-only recording clock service port; 0 disables it")
     parser.add_argument("--dex1-worker", type=Path, default=DEFAULT_WORKER)
     parser.add_argument("--dex1-transition-duration", type=float, default=1.5)
     parser.add_argument("--enable-command", action="store_true")
@@ -38,6 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def worker_command(args: argparse.Namespace) -> list[str]:
     ports = (args.intent_port, args.state_port, args.control_port)
+    if args.clock_port:
+        ports = (*ports, args.clock_port)
     if any(not 1 <= port <= 65535 for port in ports) or len(set(ports)) != len(ports):
         raise ValueError("intent, state, and control ports must be distinct and within 1..65535")
     if not 1.35 <= args.dex1_transition_duration <= 30:
@@ -87,9 +93,14 @@ def main(argv: list[str] | None = None) -> int:
         raise KeyboardInterrupt
 
     previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGHUP, signal.SIGTERM)}
+    clock_server = ClockServer(f"tcp://{args.state_bind_host}:{args.clock_port}") if args.clock_port else None
     try:
+        if clock_server is not None:
+            clock_server.start()
         return HandWorkerSupervisor(command, control_endpoint=control_endpoint).run()
     finally:
+        if clock_server is not None:
+            clock_server.close()
         for sig, handler in previous.items():
             signal.signal(sig, handler)
 
