@@ -24,6 +24,8 @@ jobs:
       GIT_LFS_SKIP_SMUDGE: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Download robot meshes used by FK and dataset tests
+        run: git lfs pull --include="gear_sonic/data/robot_model/model_data/g1/meshes/*" --exclude=""
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
