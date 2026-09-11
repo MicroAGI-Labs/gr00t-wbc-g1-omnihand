@@ -9,9 +9,12 @@ from scipy.spatial.transform import Rotation
 from gear_sonic.scripts import pico_manager_thread_server as manager
 from gear_sonic.scripts.run_data_exporter import unpack_pose_message
 from gear_sonic.utils.teleop.pose_transition import (
+    B_ARM_POSE_RAD,
     IDLE_BASE_UPPER_BODY_MASK,
     IDLE_BASE_UPPER_BODY_RAD,
     JointPoseTransition,
+    X_ARM_POSE_RAD,
+    Y_ARM_POSE_RAD,
 )
 
 
@@ -58,7 +61,8 @@ def test_planner_handoff_ignores_measured_tracking_error(streamer):
     )
     np.testing.assert_array_equal(transition.sample(0).position, reference)
     # A 0.15-rad measured/reference offset must not become a command step.
-    assert np.max(np.abs(transition.sample(0.02).position - reference)) < 1e-5
+    # Allow under 0.1 mrad at 20 ms, including the larger wrist-roll travel.
+    assert np.max(np.abs(transition.sample(0.02).position - reference)) < 1e-4
     np.testing.assert_allclose(transition.sample(2).position, IDLE_BASE_UPPER_BODY_RAD)
 
 
@@ -223,6 +227,64 @@ def test_initial_vr_return_uses_planner_command_and_real_base_fk(streamer):
     idle_return = streamer.begin_vr_return(to_base=False, duration_s=2)
     np.testing.assert_allclose(streamer.disconnect_idle_pose[:2], idle_return.goal[:2])
     assert not np.allclose(streamer.disconnect_idle_pose[:2], expected_start[:2])
+
+
+def test_home_return_uses_neutral_wrists_in_vr_targets(streamer):
+    streamer.three_point = manager.ThreePointPose()
+    streamer.last_vr_pose = vr_pose()
+    neutral_joints = IDLE_BASE_UPPER_BODY_RAD.copy()
+    neutral_joints[11:] = 0
+    neutral = streamer.vr_pose_from_upper_body(neutral_joints)
+    transition = streamer.begin_vr_return(to_base=True, duration_s=2, return_head_home=True)
+    np.testing.assert_allclose(transition.goal[:, :3], neutral[:, :3], atol=1e-7)
+    np.testing.assert_allclose(
+        Rotation.from_quat(transition.goal[:, 3:], scalar_first=True).as_matrix(),
+        Rotation.from_quat(neutral[:, 3:], scalar_first=True).as_matrix(), atol=1e-7,
+    )
+    assert streamer.send_vr_return_sample(transition, transition.progress.started_at + 2)[0]
+    sent = decode_vr(streamer.packets[-1])
+    np.testing.assert_allclose(sent[:, :3], transition.goal[:, :3], atol=1e-7)
+    # Quaternion signs may differ after shortest-path interpolation.
+    np.testing.assert_allclose(
+        Rotation.from_quat(sent[:, 3:], scalar_first=True).as_matrix(),
+        Rotation.from_quat(transition.goal[:, 3:], scalar_first=True).as_matrix(), atol=1e-7,
+    )
+
+
+@pytest.mark.parametrize("button, arm_pose", [("b", B_ARM_POSE_RAD), ("x", X_ARM_POSE_RAD), ("y", Y_ARM_POSE_RAD)])
+def test_saved_arm_return_uses_measured_fk_in_current_torso_frame_and_only_vr_packets(streamer, button, arm_pose):
+    streamer.three_point = manager.ThreePointPose()
+    model = streamer.three_point.robot_model
+    body = np.zeros(29)
+    body[12:15] = [0.4, 0.1, -0.05]  # Recalling arms must preserve a different waist pose.
+    body[15:29] = arm_pose.reshape(-1)
+    configuration = model.get_configuration_from_actuated_joints(body_actuated_joint_values=body)
+    frames = manager.get_g1_key_frame_poses(model, q=configuration)
+    expected = np.asarray([
+        np.concatenate((frames[name]["position"], frames[name]["orientation_wxyz"]))
+        for name in ("left_wrist", "right_wrist", "torso")
+    ])
+    streamer.last_vr_pose = expected.copy()
+    streamer.last_vr_pose[:2, :3] += [0.1, 0.02, 0.05]
+    start = streamer.last_vr_pose.copy()
+    resting = streamer.disconnect_idle_pose.copy()
+    transition = streamer.begin_vr_saved_arm_return(button=button, duration_s=2)
+    np.testing.assert_allclose(transition.start, start)
+    np.testing.assert_allclose(transition.goal[:, :3], expected[:, :3], atol=1e-7)
+    np.testing.assert_allclose(
+        Rotation.from_quat(transition.goal[:, 3:], scalar_first=True).as_matrix(),
+        Rotation.from_quat(expected[:, 3:], scalar_first=True).as_matrix(), atol=1e-7,
+    )
+    for elapsed in np.linspace(0, 2, 101):
+        sent, complete = streamer.send_vr_return_sample(transition, transition.progress.started_at + elapsed)
+        assert sent and complete == (elapsed == 2)
+        pose = decode_vr(streamer.packets[-1])  # Rejects any joint override in the wire packet.
+        np.testing.assert_allclose(pose[2], start[2], atol=1e-7)
+    np.testing.assert_allclose(decode_vr(streamer.packets[0]), start, atol=1e-7)
+    np.testing.assert_allclose(decode_vr(streamer.packets[-1])[:, :3], expected[:, :3], atol=1e-7)
+    np.testing.assert_array_equal(streamer.disconnect_idle_pose, resting)
+    streamer.last_vr_pose = None
+    assert streamer.begin_vr_saved_arm_return(button=button, duration_s=2) is None
 
 
 def test_every_reentry_reanchors_pico_and_preserves_first_packet(streamer, monkeypatch):

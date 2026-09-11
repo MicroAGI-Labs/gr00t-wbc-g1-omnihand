@@ -18,31 +18,41 @@ Full-body POSE and upper-body IK keep their existing controls.
   aperture control. After each grip engagement, release then press the trigger
   to resume hand input; until then its held target is preserved.
 - **A:** open both hands and smoothly return the arms and waist to the existing
-  ready/base pose. Locomotion remains available at the selected speed, and an
+  ready/base pose with neutral wrists (0° wrist roll, pitch and yaw).
+  Locomotion remains available at the selected speed, and an
   active recording continues. Release and repress the side buttons after the
   return to resume arm control.
-- **B:** smoothly return the arms to the saved arms-on-legs planner resting
-  pose. Hold the grippers and preserve the waist target. Locomotion and an active
+- **B:** smoothly recall the measured arm pose captured on 2026-09-11
+  (sample 53586), using VR_3PT wrist position/orientation targets. Hold the grippers
+  and preserve the waist target. Locomotion and an active
   recording remain available. Release and repress the side buttons afterward.
 - **Left stick click:** toggle locomotion. Center both sticks afterward to arm it.
 - **Left stick up/down:** forward/backward while locomotion is enabled.
 - **Right stick left/right:** turn while locomotion is enabled.
 - **Simultaneous forward/backward and turn input:** stop until only one action
   is requested. Left stick horizontal and right stick vertical are unused.
-- **X:** toggle normal/slow speed while locomotion is enabled. Center the sticks
-  after switching. Slow mode uses a 0.1–0.6 m/s walking command and
-  halves the turn rate; normal mode uses SONIC's normal walking speed. The
-  existing data-collection launcher initially selects slow speed.
+- **X:** smoothly recall the arm pose captured from measured robot feedback on
+  2026-09-11. Uses VR_3PT wrist position/orientation targets, just like A's home
+  return. Preserve the current waist target and hold both grippers. Locomotion
+  and recording remain available; release/repress the side buttons afterward.
+  X replaces the speed toggle; walking speed follows the configured initial gait
+  (the data-collection launcher starts in slow mode).
+- **Y:** smoothly recall the measured arm pose captured on 2026-09-11 at 16:49:57
+  Europe/Berlin. Uses the same VR_3PT return as X, preserving the current waist
+  target and holding both grippers. Locomotion and recording remain available;
+  release/repress the side buttons afterward.
 - **X+B:** start recording, or save the active recording.
-- **Y+A:** discard the active recording using the existing exporter semantics.
+- **Y+B:** stop and save the active recording as a failed episode.
+- **Y+A:** discard the active recording and delete its temporary files.
 - **UI safe-idle:** stop locomotion, hold hands, and return to idle. AXBY is
   required to re-enter teleop afterward; locomotion starts disabled.
 - **UI stop / keyboard O:** retain the existing SONIC stop controls.
 
 Solo face buttons and recording chords execute only when all face buttons are
-released. AXBY cannot also invoke A, B, X, or a recording chord; XB cannot invoke
-B's resting return. A+X and B+Y have
-no action in this profile.
+released. AXBY cannot also invoke A, B, X, Y, or a recording chord; XB cannot invoke
+B's resting return or X's saved pose. YA cannot invoke A's home or Y's saved pose,
+and YB cannot invoke either saved pose. Any third face button cancels the
+recording/pose action, including staggered releases. A+X has no action in this profile.
 
 The headset defines the forward direction captured on each arm engagement;
 turning it while holding a grip does not change that arm's reference. Head
@@ -56,12 +66,13 @@ that arm's last emitted target immediately. A fresh press captures a new
 reference without moving the held target.
 
 An independent watchdog latches a hold when the latest valid Pico sample is
-**100 ms old**, checked on each manager tick (normally 50 Hz). It holds the last
-commanded arm targets, stops locomotion, gates hand input, and cancels any A/B
+**200 ms old**, checked on each manager tick (normally 50 Hz). It holds the last
+commanded arm targets, stops locomotion, gates hand input, and cancels any A/B/X/Y
 return. Fresh data alone cannot resume motion: release **both** side buttons and center both
 sticks, then hold a side button to recalibrate and enable that arm. A+X is not
-needed. A prolonged disconnect keeps the held target; returning to the legs
-requires B. The 100 ms check requires the manager loop to be running; publisher
+needed. A prolonged disconnect keeps the exact last emitted target across SDK
+reconnection, without replacing it with robot visualization feedback. Pose presets
+require an explicit B/X/Y command. The 200 ms check requires the manager loop to be running; publisher
 failure still uses SONIC's existing receiver timeout. Holding Cartesian targets
 does not mechanically lock the joints; SONIC continues balancing the robot.
 

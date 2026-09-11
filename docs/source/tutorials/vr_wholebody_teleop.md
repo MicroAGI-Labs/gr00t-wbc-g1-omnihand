@@ -323,13 +323,13 @@ Holding a VR target does not lock arm joints against whole-body balancing.
 | **Keyboard** (C++ terminal) | Press **`O`** for immediate stop |
 | **Process control** | Terminate the SONIC control process |
 
-In the default controller profile, valid Pico input that becomes **100 ms old**
+In the default controller profile, valid Pico input that becomes **200 ms old**
 latches the last commanded arm targets, stops locomotion, gates hand input, and
 cancels any home/rest return. Fresh packets alone cannot resume movement: release
 both grips and center the sticks, then engage each arm to recalibrate it.
 SONIC's separate publisher watchdog holds the same arm targets if the Python
-manager stops sending. Long disconnects keep holding; **B** explicitly requests
-the arms-on-legs return.
+manager stops sending. Long disconnects keep holding; **B/X/Y** explicitly
+recall their saved arm poses.
 
 The optional legacy SMPL profile retains its disconnect sequence: after a
 one-second publisher timeout, hold the wrists; after 15 seconds, return to the

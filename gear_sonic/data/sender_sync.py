@@ -53,7 +53,8 @@ class SenderSynchronizer:
 
     def __init__(self, *, camera_names: tuple[str, ...], frequency: int = 50,
                  delay_s: float = 0.1, wait_s: float = 0.25,
-                 hand_clock: ClockClient | None = None, capacity: int = 32):
+                 hand_clock: ClockClient | None = None, capacity: int = 32,
+                 allow_stale_hand: bool = False):
         if not all(math.isfinite(v) and v > 0 for v in (frequency, delay_s, wait_s)):
             raise ValueError("frequency, synchronization delay and wait must be positive")
         if capacity < 2:
@@ -64,6 +65,7 @@ class SenderSynchronizer:
         self.wait_ns = round(wait_s * 1e9)
         self.capacity = capacity
         self.hand_clock = hand_clock
+        self.allow_stale_hand = allow_stale_hand
         self.histories: dict[str, deque[dict]] = {}
         self.input_errors: dict[str, str] = {}
         self.dropped = 0
@@ -106,8 +108,11 @@ class SenderSynchronizer:
                 return  # Held snapshots/cached cameras do not advance watermarks.
             if timestamp <= self._committed_ns:
                 self.late += 1
-                self._episode_error(f"{stream}: sample arrived after its target was committed")
-                return
+                if stream != "hand" or not self.allow_stale_hand:
+                    self._episode_error(f"{stream}: sample arrived after its target was committed")
+                    return
+                # Keep late hand feedback for subsequent rows with its actual
+                # timestamp. Already-written rows are never rewritten.
             if history and timestamp <= history[-1]["_sync_time_ns"]:
                 raise ClockUnavailable("clock mapping moved backwards")
             if len(history) == self.capacity:
@@ -137,7 +142,10 @@ class SenderSynchronizer:
         self.next_target_ns = self.stop_target_ns = self.start_ns = None
         self._committed_ns = 0
 
-    def select(self, target_ns: int, *, hand: bool, max_ages: dict[str, float]) -> Selection:
+    def select(self, target_ns: int, *, hand: bool, max_ages: dict[str, float],
+               allow_stale_hand: bool | None = None) -> Selection:
+        if allow_stale_hand is None:
+            allow_stale_hand = self.allow_stale_hand
         required = ["proprio", "manager", *(f"camera.{n}" for n in self.camera_names)]
         if hand:
             required.append("hand")
@@ -146,10 +154,12 @@ class SenderSynchronizer:
 
         def select_stream(stream: str) -> None:
             history = self.histories.get(stream, ())
+            retain_hand = stream == "hand" and allow_stale_hand
             if stream in self.input_errors:
                 problems.append(f"{stream}: {self.input_errors[stream]}")
                 return
-            if not history or history[-1]["_sync_time_ns"] - history[-1]["_sync_uncertainty_ns"] <= target_ns:
+            if not history or (not retain_hand and
+                    history[-1]["_sync_time_ns"] - history[-1]["_sync_uncertainty_ns"] <= target_ns):
                 problems.append(f"{stream}: waiting for producer to advance")
                 return
             sample = next((s for s in reversed(history)
@@ -159,7 +169,7 @@ class SenderSynchronizer:
                 return
             age = (target_ns - sample["_sync_time_ns"] + sample["_sync_uncertainty_ns"]) / 1e9
             limit = max_ages["camera" if stream.startswith("camera.") else stream]
-            if age > limit:
+            if age > limit and not retain_hand:
                 problems.append(f"{stream}: past sample is stale ({age:.3f}s)")
                 return
             samples[stream] = sample

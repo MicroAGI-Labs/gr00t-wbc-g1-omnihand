@@ -305,7 +305,7 @@ simulator, hand, and camera-log panes. Screen positions depend on terminal size.
 |---|---|
 | 0 | C++ deployment |
 | 1 | PICO manager and its worker restart loop |
-| 2 | Data exporter, including background finalization/upload |
+| 2 | Data exporter: continuous video compression and background local saving |
 | 3 | Browser or native camera viewer |
 | 4 on daily hardware setup | Local hand supervisor or SSH to the Orin hand server |
 | 5 on daily hardware setup | Read-only camera service journal |
@@ -320,7 +320,8 @@ Requires `tmux` to be installed (`sudo apt install tmux`).
 **For simulation** (the launcher starts `run_sim_loop.py` in an extra pane in the same window):
 
 ```bash
-python gear_sonic/scripts/launch_data_collection.py --sim
+python gear_sonic/scripts/launch_data_collection.py --sim \
+    --no-record-zed-stereo --no-record-wrist-cameras
 ```
 
 **For a real robot with the camera server on the same Thor:**
@@ -330,19 +331,14 @@ python gear_sonic/scripts/launch_data_collection.py \
     --task-prompt "pick up the cup"
 ```
 
-**With wrist cameras** (records ego view + left/right wrist camera streams):
+**Five videos are recorded by default:** both ZED eyes, the depth visualization
+shown in the browser UI, and both wrist cameras. The depth video uses the same
+colors and per-frame scaling as the UI and is saved as a three-channel uint8 MP4.
 
-```bash
-python gear_sonic/scripts/launch_data_collection.py \
-    --task-prompt "pick up the cup" \
-    --record-wrist-cameras
-```
-
-Add `--record-zed-stereo` when the ego camera is a ZED to record its left eye
-and depth visualization alongside the existing right-eye ego video. Although
-the camera transport supports float32 metric depth, the recorder stores
-`observation.images.ego_view_depth` as a three-channel uint8 video, not lossless
-metric depth.
+For a setup without ZED stereo or wrist cameras, explicitly use
+`--no-record-zed-stereo` or `--no-record-wrist-cameras`, respectively. These
+defaults and options also apply to `run_data_exporter.py`. Start a new dataset
+when changing the recorded cameras; existing episodes retain their original schema.
 
 **With physical OmniHands and the browser controls:**
 
@@ -419,25 +415,38 @@ that arm to a hold and holds that hand. After engagement, release then press
 the **index trigger** to resume binary hand control: pressed closes, released
 opens.
 
-**A** opens both hands and smoothly returns arms and waist to the existing
-ready/base pose. It keeps locomotion available and continues an active
+**A** opens both hands and smoothly returns arms and waist to the
+ready/base pose, with neutral wrists (0° wrist roll, pitch and yaw).
+It keeps locomotion available and continues an active
 recording. The return follows the configured smooth
 transition duration; release/repress the side buttons afterward.
 
-Calibrated VR targets pass through directly. Pico data stale for 100 ms latches
+Calibrated VR targets pass through directly. Pico data stale for 200 ms latches
 the last arm targets, stops locomotion, and cancels any arm return. After fresh
 data returns, release both side buttons and center both sticks, then press a
 side button to recalibrate that arm. Long disconnects keep holding.
 
-**B** smoothly returns the arms to the saved arms-on-legs planner resting pose
-while holding the grippers and preserving the waist target. Locomotion and
+**B** smoothly recalls the measured arm pose captured on 2026-09-11 (sample 53586)
+through VR_3PT wrist targets, holding the grippers and preserving
+the waist target. Locomotion and
 recording remain available. Release/repress the side buttons to resume tracking.
+
+**X** smoothly recalls the arm pose captured from measured robot feedback on
+2026-09-11, using VR_3PT wrist position/orientation targets as for A's base return.
+It preserves the current waist target, holds the grippers, and keeps locomotion
+and recording available. Release/repress the side buttons to resume tracking.
+
+**Y** recalls the measured arm pose captured on 2026-09-11 at 16:49:57 Europe/Berlin.
+It uses the same smooth VR_3PT return as X, preserving the current waist target
+and holding both grippers. Locomotion and recording remain available;
+release/repress the side buttons afterward.
 
 **Left stick click** toggles locomotion. **Left stick up/down** commands
 forward/backward, and **right stick left/right** commands turning. Only one
 of these four actions is accepted at a time; simultaneous walking and turning
-inputs stop motion until unambiguous. **X** toggles normal/slow speed. Center
-the sticks after a mode/speed change. **X+B** records/saves; **Y+A** discards.
+inputs stop motion until unambiguous. Walking speed follows the configured
+initial gait; the collection launcher starts in slow mode. **X+B** records/saves;
+**Y+B** stops and saves the take as a failure; **Y+A** discards it.
 See [all Pico controller controls](../references/pico_controller_controls.md)
 for input-loss recovery, trigger re-arming, and hand-server compatibility.
 
@@ -549,15 +558,16 @@ All options are provided via CLI flags — no interactive prompts.  Key flags:
 | Flag | Default | Description |
 |---|---|---|
 | `--task-prompt` | Tote/conveyor task from `hub_config.py` | Language task description for this session |
-| `--dataset-name` | *(auto: timestamp)* | Dataset name.  Omit to create a new one, or pass an existing name to append episodes |
+| `--dataset-name` | Saved machine configuration, otherwise timestamp | Dataset name; an existing compatible dataset is resumed |
 | `--data-collection-frequency` | `50` | Recording frequency (Hz) |
-| `--root-output-dir` | `outputs` | Parent directory for saved datasets |
+| `--root-output-dir` | Saved machine configuration, otherwise `outputs` | Parent directory for saved datasets |
 
 ```{tip}
-Datasets are saved under `<root-output-dir>/<dataset-name>/`.  If `--dataset-name`
-is not specified, a new name is generated from the local date and time
-(`YYYY-MM-DD-HH-MM-SS-microseconds`). Each launch creates a separate dataset;
-pass an explicit name only when you want to append to an existing dataset.
+Datasets are saved under `<root-output-dir>/<dataset-name>/`. Both the launcher
+and standalone exporter read `root_output_dir` and `dataset_name` from
+`~/.config/sonic/recording.json`; CLI options override that configuration.
+Without a saved name, a new timestamped dataset is created.
+This Thor uses `/home/unitree/recordings/g1_teleop` for subsequent launches.
 ```
 
 ### Recording Controls
@@ -569,21 +579,23 @@ There are two ways to control recording: **PICO VR controllers** (recommended du
 | Input | Action |
 |---|---|
 | **X + B** | **Toggle on release** — starts a new episode only while the selected teleop mode is active, or stops and saves the current one |
-| **Y + A** | **Discard on release** — saves the active episode flagged for removal during post-processing |
+| **Y + B** | **Save failure on release** — preserves the active episode with a failure label |
+| **Y + A** | **Discard on release** — deletes the active take's temporary files |
 
 Recording is locked to the launch-selected teleop mode (POSE, VR3PT, or IK
 upper). In the default VR controller profile, **A** returns home within VR3PT
 and the episode continues, including the return. **Y+A** never triggers A's
-home action, and **X+B** never triggers X's speed change. UI safe-idle aborts
+home action or Y's saved arm pose, and **X+B** never triggers X's saved arm pose. UI safe-idle aborts
 an active take. Legacy VR base navigation can keep a take open; other legacy
-mode changes require saving or discarding first.
+mode changes require saving the take as successful or failed first.
 
 **Keyboard over ZMQ:**
 
 | Key | Action |
 |---|---|
 | `c` | **Toggle** recording (same as X + B; start requires the selected teleop mode) |
-| `x` | **Discard** episode (same as Y + A — flagged for removal) |
+| `f` | **Stop & Save Failure** (same as Y + B — data is preserved) |
+| `x` | **Discard** (same as Y + A — active take is deleted) |
 
 ```{note}
 Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.
@@ -631,7 +643,7 @@ Key options:
 | Flag | Default | Description |
 |---|---|---|
 | `--task-prompt` | Tote/conveyor task from `hub_config.py` | Language task description for annotation |
-| `--dataset-name` | *(auto: timestamp)* | Dataset name; omit to auto-generate, or reuse an existing name to append |
+| `--dataset-name` | Saved configuration, otherwise timestamp | Dataset name; reuses an existing compatible dataset |
 | `--data-collection-frequency` | `50` | Recording frequency in Hz |
 | `--camera-host` | `localhost` | Camera server hostname |
 | `--camera-port` | `5555` | Camera server port |
@@ -639,7 +651,7 @@ Key options:
 | `--sonic-zmq-port` | `5556` | SMPL pose publisher port |
 | `--state-zmq-host` | `localhost` | Robot state publisher host |
 | `--state-zmq-port` | `5557` | Robot state publisher port |
-| `--root-output-dir` | `outputs` | Root directory for saved datasets |
+| `--root-output-dir` | Saved configuration, otherwise `outputs` | Root directory for saved datasets |
 | `--text-to-speech / --no-text-to-speech` | `True` | Voice feedback via espeak |
 
 ---
@@ -680,15 +692,15 @@ Each frame contains:
 | `observation.projected_gravity` | `(3,)` | Gravity vector in body frame |
 | `observation.omnihand_{left,right}_raw` | `(10,)` | Native measured OmniHand positions (rad) |
 | `observation.images.ego_view` | `(480, 640, 3)` | Ego camera image (saved as MP4 video) |
-| `observation.images.ego_view_left` | `(480, 640, 3)` | ZED rectified left-eye image (with `--record-zed-stereo`) |
-| `observation.images.ego_view_depth` | `(480, 640, 3)` | ZED depth visualization video, not metric-depth storage (with `--record-zed-stereo`) |
-| `observation.images.left_wrist` | `(480, 640, 3)` | Left wrist camera (only with `--record-wrist-cameras`) |
-| `observation.images.right_wrist` | `(480, 640, 3)` | Right wrist camera (only with `--record-wrist-cameras`) |
+| `observation.images.ego_view_left` | `(480, 640, 3)` | ZED rectified left-eye video (enabled by default) |
+| `observation.images.ego_view_depth` | `(480, 640, 3)` | Same depth visualization video as the browser UI (enabled by default) |
+| `observation.images.left_wrist` | `(480, 640, 3)` | Left wrist video (enabled by default) |
+| `observation.images.right_wrist` | `(480, 640, 3)` | Right wrist video (enabled by default) |
 | `action.motion_token` | `(64,)` | SONIC universal motion token |
 | `teleop.{left,right}_hand_joints` | `(10,)` | Requested native OmniHand actions (rad) |
 | `action.omnihand_{left,right}_raw` | `(10,)` | Named copies of the requested native actions |
 | `control.hand_applied_position` | `(20,)` with OmniHand | Applied hand position command, distinct from requested and measured positions |
-| `episode.success` | `(1,)` | Successful save (`1`) or discarded/invalid (`0`) |
+| `episode.success` | `(1,)` | Successful episode (`1`) or failed episode (`0`); both are saved |
 | `capture.*` | `(1,)` | Source sequences and source/receive timestamps |
 | `task_index` | `(1,)` | Index of the language task in `tasks.jsonl` |
 
@@ -696,20 +708,104 @@ The auxiliary velocity, raw-action, timing, and validity columns are retained
 for provenance but are not added to the default `UNITREE_G1_SONIC` modality.
 GR00T continues to train on the compact registered state/action contract.
 
-### Automatic episode quality gates
+### Continuous recording and background saving
 
-While recording, stale camera, robot, active teleop, hand, malformed token,
-NaN, or wrong-shaped required samples are not admitted. A dropout after an
-episode has begun marks that episode invalid. On save, external-hand collection verifies that at
-least one requested hand joint changed by `--minimum-hand-motion-rad` (default
-`0.02`). Invalid episodes are preserved with `episode.success = 0`, listed in
-`discarded_episode_indices`, and explained in `meta/episode_quality.jsonl`.
+Camera images are compressed continuously into temporary H.264 files on the
+local dataset disk. The recorder keeps bounded image queues and robot/teleop
+measurements in RAM. Each camera queue holds at most 50 frames; the combined
+queue budget is 256 MiB per take. Five 640×480 RGB cameras use at most about
+220 MiB in these queues, plus encoder working memory and measurements. Memory
+no longer grows by roughly 52 GiB over a four-minute take.
+
+Stop & Save transfers the measurements and encoders to a background worker,
+which closes the videos and commits the data table and metadata. The next take
+can start while the preceding save finishes. Start is temporarily blocked if
+two finalization jobs are pending or a finalizer error needs attention. Teleop
+continues. Recovery files retain measurements and compressed-video paths if
+saving fails.
+
+**Stop & Save Failure** (Y+B or `f`) preserves the current take's videos and data
+with `episode.success = 0`. It advances the saved episode count normally.
+An operator-accepted take that fails validation is also preserved as unsuccessful.
+**Discard** (Y+A or `x`) cancels the active encoders and deletes their temporary
+files without adding an episode. The next take can reuse that episode number.
+
+Saving either outcome, duration-limit stops, and shutdown never initiate an upload.
+Recording does not require selecting or creating a Hugging Face repository.
+When finished collecting, select a destination and click **Upload saved
+recordings**. This uploads all saved episodes in the current dataset. Uploads
+wait for recording and local saving to finish; starting a take waits while a
+requested upload is in progress. Upload failures retry and leave local files intact.
+
+The standalone script can upload a snapshot of completed episodes while
+recording continues:
+
+```bash
+/home/unitree/recordings/upload_to_hf.sh MicroAGI-Labs/g1-teleop --dry-run
+/home/unitree/recordings/upload_to_hf.sh MicroAGI-Labs/g1-teleop
+```
+
+Replace the repository name as needed. Dry-run contacts no remote service;
+uploads default to private and include saved unsuccessful takes. Active takes
+are excluded. If saving changes metadata during snapshot creation, retry after
+that save finishes. Run the command again to upload later episodes.
+
+### Episode quality flags and limits
+
+Recordings automatically stop after **240 seconds (four minutes)** by
+default. The limit uses elapsed recording time, including teleop pauses and
+input gaps. Robot teleop continues; the recorder discards the active take and
+removes its temporary files without adding an episode. Takes stopped with
+Stop & Save that fail validation are still saved as unsuccessful. The discard reason is
+`episode_duration_limit`. Set `--max-episode-duration-s` on the launcher or
+standalone exporter to change the limit, or set it to `0` to disable it.
+
+In the default latest-sample recording mode, stale camera, robot, or active
+teleop samples are saved with frame-level quality flags and original source
+timestamps. Staleness does not fail an operator-accepted episode. In
+`meta/episode_quality.jsonl`, `validation.frame_diagnostics` lists each warning's
+count, maximum age, and zero-based inclusive `frame_ranges`. These indices
+refer to saved table rows and video frames, for later cropping. The report also
+contains `freshness_thresholds_s` and `flagged_frame_count` (including hand
+warnings, counting each affected frame once).
+
+Malformed tokens, NaN, and missing or wrong-shaped required measurements still
+cannot form a row. Omissions are recorded in `validation.input_gaps` with the
+next saved frame index and elapsed recording times. A gap after a saved row
+still marks the episode unsuccessful, and Stop & Save preserves it for review.
+Optional sender-time mode retains its stricter synchronization admission checks.
+
+Available external-hand measurements and position commands are recorded even
+when the controller snapshot or target is stale, or a held hand has no click
+intent after reconnecting. These conditions are diagnostics and do not veto
+an operator-accepted episode: it remains `episode.success = 1` and can be used
+for training. The original `capture.hand_*` sequences and source/publication/
+receipt timestamps are retained; a repeated snapshot is never relabeled as a
+new measurement. Reported hand validity stays in `observation.*_hand_valid`.
+When a disconnect or fault report omits positions, the recorder carries forward
+the last complete hand snapshot from the same controller session and clock.
+Requested, applied, and measured positions keep their last reported values;
+the measurement timestamp and sequence stay unchanged, and both hand-valid
+flags are false during the disconnect. Robot and camera frames continue to be
+recorded, and the operator's accepted outcome remains successful. The held
+interval is logged as `external hand snapshot retained during disconnect`.
+After reconnecting, newly reported measurements replace the held values.
+`meta/episode_quality.jsonl` and `meta/info.json` retain `hand_diagnostics` with
+warning counts, inclusive frame-index ranges, and maximum ages. For rows
+identified as having no valid click intent, the auxiliary boolean
+`teleop.hand_closed` is a placeholder, not an open command; use the recorded
+requested/applied position actions for training. Missing measurements are not
+filled with invented positions.
+
+Hand motion is optional by default. `--require-hand-activity` explicitly opts
+in to requiring a requested hand joint change of at least
+`--minimum-hand-motion-rad` (default `0.02`). Invalid episodes are preserved with `episode.success = 0`, listed in
+`failed_episode_indices`, and explained in `meta/episode_quality.jsonl`.
 The voice announces "Recording failed validation" and the UI shows the reason.
-These episodes are still saved and uploaded to the configured Hugging Face
-dataset as unsuccessful. An operator discard still announces "Recording discarded".
+These episodes are saved locally as unsuccessful and included if you later
+request an upload. An operator failure reports that it is saving the failed take.
 
-Use `--no-require-hand-activity` only for a task that genuinely contains no
-hand motion. Stream rates are diagnostic and do not determine episode acceptance.
+Stream rates are diagnostic and do not determine episode acceptance.
 
 ---
 
@@ -722,11 +818,12 @@ All commands below run in the **data collection virtual environment**:
 source .venv_data_collection/bin/activate
 ```
 
-### Remove Discarded Episodes
+### Historical Discard Markers
 
-Episodes discarded during collection (`x` key or Y + A) are saved to disk
-but flagged in `meta/info.json`. By default, the processing script removes these
-flagged episodes so they are excluded from fine-tuning:
+New failures (`f`, Y+B, validation failures, or technical stops) are saved
+and listed in `failed_episode_indices`. They are not marked for automatic
+removal. Older datasets can contain historical `discarded_episode_indices`
+in `meta/info.json`; the processor's removal option only applies to those:
 
 ```bash
 # Clean a default VR3PT dataset; keep its intentional zero SMPL fields.

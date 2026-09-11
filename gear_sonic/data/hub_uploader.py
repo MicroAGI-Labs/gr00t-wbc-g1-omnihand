@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import queue
@@ -15,6 +16,7 @@ import threading
 import time
 
 from gear_sonic.data.exporter import Gr00tDataExporter
+from gear_sonic.utils.data_collection.hub_config import DATASET_CONFIG_PREFIX, decode_dataset_config
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,11 @@ class EpisodeHubUploader:
         self._condition = threading.Condition()
         self._stop = threading.Event()
         self._config: dict[str, object] | None = None
+        self._config_path = Path(data_exporter.root) / ".hub-config.json"
+        if self._config_path.is_file():
+            self._config = decode_dataset_config(DATASET_CONFIG_PREFIX + self._config_path.read_text())
+            data_exporter.meta.repo_id = self._config["repo_id"]
+            data_exporter.task = self._config["prompt"]
         self._pending = 0
         self._uploading = False
         self._retrying = False
@@ -55,6 +62,9 @@ class EpisodeHubUploader:
                 if config != self._config:
                     raise RuntimeError("cannot change dataset while an upload is pending")
                 return
+            temporary = self._config_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(config) + "\n")
+            os.replace(temporary, self._config_path)
             self._config = config
             self._error = None
             self._retrying = False

@@ -234,7 +234,7 @@ def test_recording_includes_wrist_images_and_source_times_only_when_enabled(wris
         assert frame["capture.left_wrist_source_timestamp_ns"].tolist() == [2_000_000_000]
 
 
-def test_optional_recording_rejects_missing_stale_and_wrong_size_wrists():
+def test_optional_recording_flags_stale_wrists_and_rejects_missing_or_wrong_size():
     obj = collector(True)
     with pytest.raises(RuntimeError, match="left_wrist is unavailable"):
         obj._validate_camera_inputs(1.01)
@@ -242,8 +242,7 @@ def test_optional_recording_rejects_missing_stale_and_wrong_size_wrists():
         obj.latest_image_msg["images"].update(sample(name, 1)["images"])
         obj.latest_image_msg["timestamps"][name] = 1.0
     obj.latest_image_msg["camera_received_monotonic_ns"]["left_wrist"] = 100_000_000
-    with pytest.raises(RuntimeError, match="left_wrist is stale"):
-        obj._validate_camera_inputs(1.01)
+    assert obj._validate_camera_inputs(1.01)["camera left_wrist is stale"] == pytest.approx(.91)
     obj.latest_image_msg["camera_received_monotonic_ns"]["left_wrist"] = 1_000_000_000
     obj.latest_image_msg["images"]["right_wrist"] = np.zeros((720, 1280, 3))
     with pytest.raises(RuntimeError, match="right_wrist shape"):

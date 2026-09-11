@@ -44,13 +44,15 @@ def recording_face_action(
 
     A+X is a mode gesture only while idle. During an active recording it is
     consumed as save, with the same outcome as X+B. Y+A is the sole explicit
-    discard gesture.
+    discard gesture. Y+B saves an unsuccessful take without changing teleop mode.
     """
     if recorder_is_recording:
         if face_command in {"ax", "xb"}:
             return "save"
         if face_command == "ya":
             return "discard"
+        if face_command == "by":
+            return "failure"
         return None
 
     if face_command == "xb" and recording_mode_ready:

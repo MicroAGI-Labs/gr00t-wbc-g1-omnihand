@@ -86,6 +86,44 @@ IDLE_BASE_UPPER_BODY_MASK = np.asarray(
     dtype=bool,
 )
 
+# Measured body_q_measured snapshot on 2026-09-11 at 16:49:57 Europe/Berlin.
+# Rows: left/right. Columns: shoulder pitch/roll/yaw, elbow, wrist roll/pitch/yaw.
+# Y recalls these arms relative to the current torso, using the normal VR return.
+Y_ARM_POSE_RAD = np.asarray(
+    [
+        [0.35431361198425293, 0.7837563753128052, -0.3823087811470032,
+         0.0902651846408844, 0.8319089412689209, 0.0195582564920187, 0.6267629861831665],
+        [0.3189002275466919, -0.7903236746788025, 0.34102311730384827,
+         0.11873970180749893, -0.554318368434906, -0.05346162989735603, -0.42375022172927856],
+    ],
+    dtype=np.float64,
+)
+
+# Measured body_q_measured snapshot on 2026-09-11, sample 55826.
+# Rows: left/right. Columns: shoulder pitch/roll/yaw, elbow, wrist roll/pitch/yaw.
+# Arm joints only; recalling this pose preserves the current torso target.
+X_ARM_POSE_RAD = np.asarray(
+    [
+        [0.16441158950328827, 1.0650501251220703, -0.33403632044792175,
+         0.4476108253002167, 0.47851812839508057, -0.25245967507362366, 1.1506893634796143],
+        [-0.023093601688742638, -0.861713707447052, 0.5341609120368958,
+         0.15899471938610077, -0.7014606595039368, -0.15892280638217926, -0.9975789189338684],
+    ],
+    dtype=np.float64,
+)
+
+# Measured body_q_measured snapshot on 2026-09-11, sample 53586.
+# Same left/right arm ordering and torso-relative recall as X above.
+B_ARM_POSE_RAD = np.asarray(
+    [
+        [0.29662156105041504, 0.4542141258716583, -0.04379035905003548,
+         -0.6848025918006898, 0.06421148031949997, -0.35131755471229553, 0.3443547189235687],
+        [0.1369677037000656, -0.44495031237602234, 0.06273742020130157,
+         -0.666550636291504, 0.10391521453857422, -0.3579927682876587, -0.42420563101768494],
+    ],
+    dtype=np.float64,
+)
+
 
 @dataclass(frozen=True)
 class JointTransitionSample:

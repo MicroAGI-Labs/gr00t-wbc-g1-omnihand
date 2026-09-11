@@ -256,9 +256,9 @@ class G1Deploy {
     bool report_temperature_ = false;
     std::string pending_tts_;  // One-shot TTS message, consumed by GatherInputInterfaceData()
 
-    // Per-motor high temperature hysteresis (enter at >= 90, exit at < 85)
+    // Per-motor high temperature hysteresis (enter at >= 110, exit at < 85)
     std::array<bool, G1_NUM_MOTOR> motor_high_temp_ = {};
-    static constexpr int16_t HIGH_TEMP_ENTER = 90;
+    static constexpr int16_t HIGH_TEMP_ENTER = 110;
     static constexpr int16_t HIGH_TEMP_EXIT = 85;
     bool high_temp_warning_ = false;
     std::string high_temp_message_;
@@ -2880,7 +2880,7 @@ class G1Deploy {
         // Extract estimated torque in hardware order
         motor_torque[i] = static_cast<double>(unitree_joint_state[i].tau_est());
 
-        // High temperature hysteresis check (enter >= 90, exit < 85)
+        // High temperature hysteresis check (enter >= 110, exit < 85)
         int16_t max_temp = std::max(unitree_joint_state[i].temperature()[0],
                                     unitree_joint_state[i].temperature()[1]);
         if (motor_high_temp_[i]) {

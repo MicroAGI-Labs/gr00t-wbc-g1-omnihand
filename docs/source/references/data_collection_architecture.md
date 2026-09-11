@@ -35,7 +35,7 @@ logger. Grip release holds the last emitted arm target; a fresh press captures
 a new reference. Explicit home/rest commands still interpolate over their
 configured duration.
 
-The direct-controller watchdog remains independent of pose filtering: 100 ms
+The direct-controller watchdog remains independent of pose filtering: 200 ms
 without a valid controller sample latches arm holds, stops locomotion, gates
 hand intent, and cancels an active return. Fresh data requires release and
 recalibration before tracking resumes. SONIC also handles loss of the publisher.

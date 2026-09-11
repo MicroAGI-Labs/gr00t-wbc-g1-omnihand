@@ -81,6 +81,7 @@ os.environ["PYTHONPATH"] = _SOURCE_ROOT + os.pathsep + os.environ.get("PYTHONPAT
 import tyro  # noqa: E402
 
 from gear_sonic.utils.data_collection.hub_config import DEFAULT_TASK_PROMPT  # noqa: E402
+from gear_sonic.utils.data_collection.local_recordings import resolve_recording_destination  # noqa: E402
 
 
 def _get_local_ip() -> str:
@@ -207,16 +208,22 @@ class DataCollectionLaunchConfig:
     """Language task prompt for the data exporter."""
 
     dataset_name: str | None = None
-    """Omit to create a new timestamped dataset; set explicitly to resume one."""
+    """Use the saved local destination by default; override to select another dataset."""
+
+    root_output_dir: str | None = None
+    """Override the saved local recording directory."""
 
     data_exporter_frequency: int = 50
     """Data collection frequency (Hz) for the data exporter."""
 
-    record_wrist_cameras: bool = False
+    max_episode_duration_s: float = 240.0
+    """Discard a recording at this elapsed duration; 0 disables the limit."""
+
+    record_wrist_cameras: bool = True
     """Record wrist camera streams (left_wrist, right_wrist) in the dataset."""
 
-    record_zed_stereo: bool = False
-    """Record ZED left-eye RGB and float32 depth in the dataset."""
+    record_zed_stereo: bool = True
+    """Record both ZED eyes and the same depth visualization video as the browser UI."""
 
     text_to_speech: bool = True
     """Enable voice feedback via espeak (data exporter)."""
@@ -372,6 +379,8 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
         errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
     if config.idle_base_transition_duration <= 0.0:
         errors.append("--idle-base-transition-duration must be positive")
+    if not math.isfinite(config.max_episode_duration_s) or config.max_episode_duration_s < 0:
+        errors.append("--max-episode-duration-s must be finite and nonnegative")
 
     if errors:
         print("ERROR: Prerequisites not met:\n")
@@ -611,6 +620,9 @@ def _hand_worker_command(config: DataCollectionLaunchConfig) -> tuple[str, str]:
 
 def main(config: DataCollectionLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
+    config.root_output_dir, config.dataset_name = resolve_recording_destination(
+        config.dataset_name, config.root_output_dir,
+    )
 
     _check_prerequisites(config)
     if config.check_only:
@@ -632,6 +644,7 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Mode:            {'Simulation' if config.sim else 'Real Robot'}")
     print(f"  Task prompt:     {config.task_prompt}")
     print(f"  Dataset name:    {config.dataset_name or '(auto)'}")
+    print(f"  Local folder:    {Path(config.root_output_dir) / config.dataset_name}")
     print(f"  Deploy input:    {config.deploy_input_type}")
     print(f"  Teleop input:    {config.pico_input_source}")
     print(f"  Body control:    {config.body_control_mode}")
@@ -641,9 +654,11 @@ def main(config: DataCollectionLaunchConfig):
         print(f"  Checkpoint:      {config.deploy_checkpoint}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
     print(f"  DC frequency:    {config.data_exporter_frequency} Hz")
+    print(f"  Episode limit:   {config.max_episode_duration_s:g}s (0 = disabled)")
     viewer_mode = "Browser" if config.remote_ui else ("Native" if config.camera_viewer else "No")
     print(f"  Camera viewer:   {viewer_mode}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
+    print(f"  ZED eyes/depth:  {'Yes' if config.record_zed_stereo else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
     print(f"  Teleop vis:      vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
@@ -818,6 +833,7 @@ def main(config: DataCollectionLaunchConfig):
         f"python gear_sonic/scripts/run_data_exporter.py "
         f"--task-prompt '{config.task_prompt}' "
         f"--data-collection-frequency {config.data_exporter_frequency} "
+        f"--max-episode-duration-s {config.max_episode_duration_s} "
         f"--required-stream-mode {required_stream_mode} "
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port} "
@@ -831,13 +847,10 @@ def main(config: DataCollectionLaunchConfig):
             f" --hand-clock-port {config.hand_clock_port}"
         )
     if config.dataset_name:
-        exporter_cmd += f" --dataset-name '{config.dataset_name}'"
-    if config.record_wrist_cameras:
-        exporter_cmd += " --record-wrist-cameras"
-    if config.record_zed_stereo:
-        exporter_cmd += " --record-zed-stereo"
-    if config.remote_ui:
-        exporter_cmd += " --require-hub-upload"
+        exporter_cmd += f" --dataset-name {shlex.quote(config.dataset_name)}"
+    exporter_cmd += f" --root-output-dir {shlex.quote(config.root_output_dir)}"
+    exporter_cmd += " --record-wrist-cameras" if config.record_wrist_cameras else " --no-record-wrist-cameras"
+    exporter_cmd += " --record-zed-stereo" if config.record_zed_stereo else " --no-record-zed-stereo"
     if not config.text_to_speech:
         exporter_cmd += " --no-text-to-speech"
 

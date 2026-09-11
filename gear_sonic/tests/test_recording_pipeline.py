@@ -47,20 +47,23 @@ def test_selected_source_metadata_and_failure_label_round_trip_and_resume(tmp_pa
     source = {**{name: captured[name] for name in fields}, "episode.success": np.ones(1, dtype=np.uint8)}
     exporter.add_frame(source)
     exporter.add_frame(source)
-    exporter.save_episode(success=False, validation={"passed": False, "errors": ["operator_discarded"]})
+    exporter.save_episode(success=False, validation={"passed": False, "errors": ["operator_marked_failure"]})
     table = pq.read_table(exporter.root / exporter.meta.get_data_file_path(0))
     assert table[fields[0]].to_pylist() == [2**53 + 17] * 2
     assert table[fields[0]].type.bit_width == 64
     assert table[fields[1]].to_pylist() == [1000 * MS] * 2
     assert table["episode.success"].to_pylist() == [0, 0]
-    assert exporter.meta.info["discarded_episode_indices"] == [0]
-    assert exporter.meta.info["episode_quality"]["0"]["discarded"] is True
+    assert exporter.meta.info["discarded_episode_indices"] == []
+    assert exporter.meta.info["failed_episode_indices"] == [0]
+    assert exporter.meta.info["episode_quality"]["0"]["discarded"] is False
+    assert exporter.meta.info["episode_quality"]["0"]["success"] is False
     np.testing.assert_array_equal(source["episode.success"], [1])
     resumed = Gr00tDataExporter.create(**options)
     resumed.add_frame(source)
     resumed.save_episode()
     assert resumed.meta.total_frames == 3
     assert resumed.meta.total_episodes == 2
+    assert resumed.meta.info["failed_episode_indices"] == [0]
 
 
 def test_rejected_finalizer_handoff_preserves_completed_episode_and_writers():
@@ -70,7 +73,7 @@ def test_rejected_finalizer_handoff_preserves_completed_episode_and_writers():
     completed = {"episode_index": 0, "size": 2, "frame_index": [0, 1]}
     writers = {"camera": object()}
     exporter = SimpleNamespace(episode_buffer=completed, video_writers=writers)
-    def detach():
+    def detach(*, advance_index=True):
         exporter.episode_buffer = {"episode_index": 1, "size": 0}
         exporter.video_writers = {}
         return completed, writers

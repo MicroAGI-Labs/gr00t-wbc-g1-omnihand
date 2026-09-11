@@ -1,4 +1,4 @@
-"""Finalize locally owned episode buffers and enqueue their committed snapshots."""
+"""Finalize locally owned episode buffers without initiating uploads."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ class _EpisodeFinalizationJob:
     video_writers: dict
     success: bool
     validation: dict
+    delete: bool = False
 
 
 class EpisodeFinalizer:
@@ -29,15 +30,16 @@ class EpisodeFinalizer:
     def __init__(
         self,
         data_exporter: Gr00tDataExporter,
-        hub_uploader: EpisodeHubUploader,
+        hub_uploader: EpisodeHubUploader | None = None,
         max_pending: int = 2,
     ):
         self.data_exporter = data_exporter
-        self.hub_uploader = hub_uploader
         self.max_pending = max_pending
         self._queue: queue.Queue[_EpisodeFinalizationJob | None] = queue.Queue()
         self._condition = threading.Condition()
         self._pending = 0
+        self._pending_saves = 0
+        self._pending_discards = 0
         self._finalizing = False
         self._last_finalized_episode: int | None = None
         self._error: str | None = None
@@ -56,9 +58,14 @@ class EpisodeFinalizer:
         video_writers: dict,
         success: bool,
         validation: dict,
+        delete: bool = False,
     ) -> None:
         with self._condition:
             self._pending += 1
+            if delete:
+                self._pending_discards += 1
+            else:
+                self._pending_saves += 1
             self._condition.notify_all()
         self._queue.put(
             _EpisodeFinalizationJob(
@@ -67,6 +74,7 @@ class EpisodeFinalizer:
                 video_writers=video_writers,
                 success=success,
                 validation=validation,
+                delete=delete,
             )
         )
 
@@ -78,6 +86,8 @@ class EpisodeFinalizer:
         with self._condition:
             return {
                 "pending": self._pending,
+                "pending_saves": self._pending_saves,
+                "pending_discards": self._pending_discards,
                 "finalizing": self._finalizing,
                 "last_finalized_episode": self._last_finalized_episode,
                 "error": self._error,
@@ -110,6 +120,8 @@ class EpisodeFinalizer:
             "episode_buffer": job.episode_buffer,
             "success": job.success,
             "validation": job.validation,
+            "video_paths": {key: str(writer.output_path) for key, writer in job.video_writers.items()
+                            if hasattr(writer, "output_path")},
         }
         with open(temporary_path, "wb") as recovery_file:
             pickle.dump(payload, recovery_file, protocol=pickle.HIGHEST_PROTOCOL)
@@ -135,46 +147,41 @@ class EpisodeFinalizer:
                 self._finalizing = True
                 self._condition.notify_all()
             try:
-                if job.success:
+                if job.delete:
+                    self.data_exporter.discard_episode(video_writers=job.video_writers)
+                else:
                     self.data_exporter.save_episode(
                         job.episode_buffer,
                         video_writers=job.video_writers,
+                        success=job.success,
                         validation=job.validation,
                     )
-                else:
-                    self.data_exporter.save_episode_as_discarded(
-                        job.episode_buffer,
-                        video_writers=job.video_writers,
-                        validation=job.validation,
-                    )
-                with self._condition:
-                    self._last_finalized_episode = job.episode_index
+                if not job.delete:
+                    with self._condition:
+                        self._last_finalized_episode = job.episode_index
             except Exception as exc:
-                self._stop_job_writers(job)
-                try:
-                    recovery_path = self._persist_failed_job(job)
-                    recovery_detail = f"; recovery saved to {recovery_path}"
-                except Exception as recovery_exc:
-                    recovery_detail = f"; recovery also failed: {recovery_exc}"
+                if job.delete:
+                    recovery_detail = "; discarded take cleanup failed; check .recording"
+                else:
+                    self._stop_job_writers(job)
+                    try:
+                        recovery_path = self._persist_failed_job(job)
+                        recovery_detail = f"; recovery saved to {recovery_path}"
+                    except Exception as recovery_exc:
+                        recovery_detail = f"; recovery also failed: {recovery_exc}"
                 error = f"{exc}{recovery_detail}"
                 print(f"[Finalizer] Episode {job.episode_index} failed: {error}")
                 with self._condition:
                     self._error = error[-500:]
-            else:
-                if self.hub_uploader.status()["ready"]:
-                    try:
-                        self.hub_uploader.enqueue(job.episode_index)
-                    except Exception as exc:
-                        # The local episode is already committed. Keep that
-                        # success authoritative and report upload staging as a
-                        # separate, non-blocking fault. A later cumulative
-                        # snapshot also includes this episode.
-                        self.hub_uploader.report_enqueue_failure(
-                            job.episode_index,
-                            exc,
-                        )
             finally:
+                # Release completed buffers and encoders before waiting again.
+                deleted = job.delete
+                del job
                 with self._condition:
                     self._pending -= 1
+                    if deleted:
+                        self._pending_discards -= 1
+                    else:
+                        self._pending_saves -= 1
                     self._finalizing = False
                     self._condition.notify_all()

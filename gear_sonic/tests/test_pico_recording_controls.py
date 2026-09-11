@@ -83,7 +83,7 @@ def enter_mode(mode):
 
 
 @pytest.mark.parametrize("mode", [1, 2, 5])
-@pytest.mark.parametrize("gesture", ["ax", "xb", "ya"])
+@pytest.mark.parametrize("gesture", ["ax", "xb", "ya", "by"])
 def test_recording_gestures_emit_once_on_release_without_mode_switch(run_manager, mode, gesture):
     steps = enter_mode(mode)
     states, commands = run_manager(steps + [
@@ -93,9 +93,10 @@ def test_recording_gestures_emit_once_on_release_without_mode_switch(run_manager
     tail = states[len(steps):]
     assert [s["stream_mode"].item() for s in tail] == [mode] * 5
     assert [bool(s["toggle_data_collection"].item()) for s in tail] == [
-        False, False, False, gesture != "ya", False,
+        False, False, False, gesture in {"ax", "xb"}, False,
     ]
     assert [bool(s["toggle_data_abort"].item()) for s in tail] == [False, False, False, gesture == "ya", False]
+    assert [bool(s["toggle_data_failure"].item()) for s in tail] == [False, False, False, gesture == "by", False]
     assert len(commands) == (1 if mode == 2 else 2)
 
 

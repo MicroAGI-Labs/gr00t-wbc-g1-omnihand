@@ -27,7 +27,7 @@ establish physical tracking accuracy or the quality of a recorded demonstration.
 8. [How the collector constructs a row](#how-the-collector-constructs-a-row)
 9. [Optional sender-time recording](#optional-sender-time-recording)
 10. [Dataset schema and action meaning](#dataset-schema-and-action-meaning)
-11. [Saving, discarding, and uploading](#saving-discarding-and-uploading)
+11. [Saving outcomes and uploading](#saving-outcomes-and-uploading)
 12. [Installation and alternative launches](#installation-and-alternative-launches)
 13. [Troubleshooting by symptom](#troubleshooting-by-symptom)
 14. [Design decisions and tradeoffs](#design-decisions-and-tradeoffs)
@@ -106,8 +106,9 @@ Then open the same loopback URL on the laptop. Keep the SSH tunnel running.
 The server binds to loopback by default; `--remote-ui` means a browser served
 through the tunnel, not a public HTTP listener.
 
-The daily wrapper enables the browser dataset workflow. Select or create an
-empty Hugging Face dataset in the UI and set the task prompt before recording.
+The daily wrapper enables the browser dataset workflow. Recording saves locally
+without a Hugging Face connection. Set the task prompt before recording and
+select an upload destination when ready to upload saved episodes.
 The default organization is `MicroAGI-Labs`, with private datasets selected by
 default. The Thor account must already have Hub credentials with the required
 access. Credentials are used on Thor, not entered into this README or sent as
@@ -263,7 +264,10 @@ tmux leaves the complete dashboard running.
 7. Press and release **X+B**, or use the browser recording control, to begin the
    episode. Perform the demonstration. Recording state and teleop state are
    independent: pressing a record button does not start SONIC or engage grips.
-8. Press and release **X+B** again to accept the take, or **Y+A** to discard it.
+8. Press and release **X+B** again before the four-minute limit to accept the
+   take, **Y+B** to save it as failed, or **Y+A** to discard it.
+   The default `--max-episode-duration-s 240` automatically discards a take
+   that reaches four minutes and removes its temporary files.
    Wait for local finalization to complete. Inspect the validation result and
    upload status; an accepted take can still fail a later disk operation.
 9. Begin another take when the recorder is ready. Background uploads can
@@ -277,7 +281,7 @@ for a task intentionally requiring no hand action, configure the exporter with
 
 ### Ending the session
 
-Finish or discard the active take and wait for the local finalizer. Stop the
+Save the active take as successful or failed and wait for the local finalizer. Stop the
 exporter with Ctrl-C in pane 2 and let its cleanup run. It drains local saves
 and waits up to the configured upload timeout, 300 seconds by default, for Hub
 work. A forced process kill can interrupt this cleanup.
@@ -307,14 +311,16 @@ do not mix their A+X instructions into the daily direct-controller workflow.
 | Release side grip | Hold that arm's last emitted target and that hand's latest measured position. |
 | Index trigger with its arm enabled | Binary full close on press, full open on release; 0.60/0.40 hysteresis. Release then press after grip engagement. |
 | A | Open both hands; smoothly return arms and waist to the ready/base pose. Walking and recording remain available. |
-| B | Return arms to the stored arms-on-legs resting pose, hold grippers, and preserve waist target. Walking and recording remain available. |
+| B | Recall the measured arm pose captured on 2026-09-11 (sample 53586), hold grippers, and preserve waist target. Walking and recording remain available. |
+| Y | Recall the measured arm pose captured on 2026-09-11 at 16:49:57 Europe/Berlin, hold grippers, and preserve waist target. Walking and recording remain available. |
 | Left stick click | Toggle locomotion; center both sticks before movement can resume. |
 | Left stick up/down | Forward/back while locomotion is enabled. |
 | Right stick left/right | Turn while locomotion is enabled. |
 | Forward/back and turn together | Command no movement until only one action is requested. |
-| X | Toggle normal/slow speed while locomotion is enabled; center sticks to rearm. |
+| X | Recall the measured arm pose captured on 2026-09-11 (sample 55826), hold grippers, and preserve waist target. Walking speed follows the configured initial gait. |
 | X+B | Start recording or accept the active episode. |
-| Y+A | Discard the active episode. |
+| Y+B | Stop and save the active episode as failed. |
+| Y+A | Discard the active episode and delete its temporary recording files. |
 | UI safe idle | Stop locomotion, hold hands, return to idle; AXBY is needed to re-enter. |
 | UI Disconnect SONIC / existing keyboard O stop | Stop controls, separate from the face-button start/mode controls. |
 
@@ -342,20 +348,20 @@ orientation still matters when engaging a grip.
 
 Controller targets pass through without the removed optional motion conditioner,
 velocity/acceleration/jerk filters, or trace/tuning features. The explicitly
-requested A/B returns still interpolate over two seconds by default, controlled
+requested A/B/X/Y returns still interpolate over two seconds by default, controlled
 by `--idle-base-transition-duration`. A generated return trajectory and filtering
 every live controller sample are different operations.
 
 ### Tracking loss and re-entry
 
 A manager watchdog latches a hold when the latest valid PICO sample reaches
-100 ms old, checked on each manager tick, normally at 50 Hz. It holds the last
+200 ms old, checked on each manager tick, normally at 50 Hz. It holds the last
 commanded arm targets, stops locomotion, gates hand input, and cancels an active
-A/B return. Fresh packets alone do not resume motion.
+A/B/X/Y return. Fresh packets alone do not resume motion.
 
 Release **both** side grips and center both sticks, then hold the desired grip
 to capture a new reference. A+X is not required. Direct-controller disconnects
-retain the held target; B explicitly requests the legs resting pose. Cartesian
+retain the held target; B/X/Y explicitly recall their saved arm poses. Cartesian
 hold is still a target tracked by SONIC while it balances, not a mechanical
 joint lock. If the manager itself stops executing, the receiver's disconnect
 handling is the relevant fallback; the Python watchdog cannot run in a dead
@@ -417,7 +423,7 @@ infer a specific physical failure solely from “disconnected” in the browser.
 The default DEX 1 stroke time is 1.35 seconds, with an allowed range of 1.35–30
 seconds. The launcher forwards `--dex1-transition-duration` to its local or
 SSH-launched worker. For a separately managed hand service, configure the
-service itself. The hand target watchdog is separate from PICO's 100 ms tracking
+service itself. The hand target watchdog is separate from PICO's 200 ms tracking
 watchdog; its default target timeout is 0.5 seconds.
 
 Physical motor health checks, hardware limits, and stop behavior remain part
@@ -509,8 +515,11 @@ apparently waiting at this stage may be missing an upstream publisher rather
 than performing disk work.
 
 It resolves the hand profile, derives joint names and widths, adds the selected
-camera features, and creates or resumes the local dataset. An omitted dataset
-name creates a timestamped directory under `outputs/`. The explicit name selects
+camera features, and creates or resumes the local dataset. The launcher and
+standalone exporter read `~/.config/sonic/recording.json` for `root_output_dir`
+and `dataset_name`; explicit CLI options override those values. Without a saved
+configuration, an omitted name creates a timestamped directory under `outputs/`.
+The explicit name selects
 a local directory; it is not automatically the Hub repository name.
 
 The schema includes the configured FPS, hand profile, and selected video fields.
@@ -545,9 +554,9 @@ be reused while they remain valid; capture fields preserve evidence of reuse.
 A future training pipeline must decide which recorded action/observation pairing
 and horizon to use. The exporter does not shift action labels into the future.
 
-### Freshness and admission
+### Freshness flags and admission
 
-| Required source | Default age limit |
+| Required source | Default warning threshold |
 |---|---|
 | Robot state | 100 ms |
 | Required camera frames | 100 ms |
@@ -566,10 +575,20 @@ teleop mode. Base-pose mode 3 is admitted as an intentional pause within an
 existing episode, but a successful episode must also contain the selected
 teleop mode.
 
-If a required input is invalid before any row has been collected, the collector
-waits and reports the reason. A blocked required input after the take has begun
-is retained in the take's validation errors. Recovering the input permits later
-rows, but does not erase the earlier gap from that take's quality report.
+In latest-sample mode, a stale camera, robot, or teleop sample remains in the
+recording with its original source timestamps. It does not fail the episode.
+The quality report in `meta/episode_quality.jsonl` stores
+`validation.frame_diagnostics`: each reason has a count, maximum age, and
+zero-based inclusive `frame_ranges` identifying saved table rows and video
+frames to review or crop. Hand warnings remain in `validation.hand_diagnostics`.
+`flagged_frame_count` counts affected rows once across all warnings.
+
+Missing or malformed required measurements cannot form a row. The recorder
+reports these omissions in `validation.input_gaps`, with elapsed recording
+times and the next saved frame index (which can equal episode length at the
+end). Such gaps remain validation errors after the first saved row; the take
+is still preserved on Stop & Save. Optional sender-time recording retains its
+strict synchronization admission checks described below.
 
 ### Why 50 Hz does not mean 50 unique images
 
@@ -710,7 +729,7 @@ not interchangeable with a raw sensor packet log.
 | `control.hand_applied_position` | Applied hand position command, distinct from both requested intent and measured motion. |
 | `teleop.*` | Mode-dependent targets, hand intent, planner fields, VR 3-point fields, and SMPL compatibility fields. |
 | `observation.images.*` | Selected RGB or depth-visualization video features. |
-| `episode.success` | Per-row outcome flag written at finalization: 1 for accepted-valid, 0 for discarded/invalid. |
+| `episode.success` | Per-row outcome flag written at finalization: 1 for accepted-valid, 0 for failed. |
 | `capture.*` | Source identities, sequences, timestamps, and optional synchronization metadata. |
 
 DEX 1 has one active motor per hand: its assembled state has 31 entries
@@ -748,7 +767,34 @@ for tracking physical mounting, camera calibration, headset setup, firmware,
 or the actual binaries and processes used during a run. In particular, an old
 process can keep running after the worktree has moved to a new commit.
 
-## Saving, discarding, and uploading
+## Saving outcomes and uploading
+
+### Persistent local folder and manual upload
+
+This Thor is configured to append to `/home/unitree/recordings/g1_teleop` on
+subsequent launches. The machine-local configuration is
+`/home/unitree/.config/sonic/recording.json`. Changing cameras, hand profile, or
+FPS requires a compatible schema or a different dataset folder.
+
+Upload the saved episodes manually with:
+
+```bash
+/home/unitree/recordings/upload_to_hf.sh MicroAGI-Labs/g1-teleop --dry-run
+/home/unitree/recordings/upload_to_hf.sh MicroAGI-Labs/g1-teleop
+```
+
+The repository name is an example; choose the desired organization/name.
+The script defaults to a private dataset. Dry-run checks local files without
+contacting Hugging Face. It snapshots committed episodes, including accepted
+takes with failed validation, and excludes active recordings and recovery
+files. Recording can continue during this standalone upload. A save changing
+metadata during snapshot creation causes a retryable error. Rerun the command
+to include episodes saved after the snapshot. Existing remote episodes must
+match local data before the script will append more.
+
+For another checkout, invoke
+`.venv_data_collection/bin/python gear_sonic/scripts/upload_local_recordings.py ORG/NAME`
+and optionally pass `--dataset-dir /path/to/dataset`.
 
 ### Three separate milestones
 
@@ -767,10 +813,17 @@ that a take is durable locally or available remotely.
 ### Video and local finalization
 
 Video writers open lazily on an episode's first frame. Each uses a bounded
-50-frame queue with a 250 ms enqueue timeout and an encoding thread. An encoder
-failure or persistently full queue is surfaced as an error; the implementation
-does not silently claim that all frames were written. By default these videos
-use H.264.
+50-frame queue and an encoding thread. Queue capacity is reduced if needed to
+fit a 256 MiB aggregate raw-image queue budget per take (about 220 MiB for five
+640×480 RGB cameras). Encoder working memory and measurement buffers are extra.
+Images are compressed continuously as H.264 (veryfast, CRF 23, zerolatency).
+Every camera queue is checked before admitting a synchronized row; a full queue
+stops the take as unsuccessful rather than silently dropping a camera frame.
+
+Each take owns a unique `.recording/<id>/` directory on the dataset disk.
+On acceptance, video containers are closed and moved to their final paths,
+then the table and metadata are committed. No full-episode raw image buffer
+is retained.
 
 At stop, `detach_episode()` hands the completed buffer and existing writers to
 the finalizer and creates an empty next buffer. It does not eagerly open the
@@ -785,22 +838,41 @@ collector, so an earlier failure cannot abandon that later buffer.
 The exporter checks episode timestamps before file work, preserves the source
 buffer, and restores in-memory metadata state when finalization raises. On
 failure, the finalizer attempts to stop its writers and persists the owned
-buffer and validation result to `recovery/episode_<index>.pkl` using a temporary
+measurements, video references, and validation result to
+`recovery/episode_<index>.pkl` using a temporary
 file, flush/fsync, and replacement. The error remains visible and blocks new
 recordings. Recovery is for deliberate inspection/repair; it is not an automatic
 replay service or a guarantee against power loss during any multi-file write.
 
-### What discard means
+### Success and failure both save
 
-A nonempty discarded take is **preserved**, with `episode.success = 0`, an entry
-in `discarded_episode_indices`, and a validation record. A take that fails
-quality checks is also preserved as unsuccessful. Both can be uploaded to the
-configured Hub dataset. Discard means “exclude from successful demonstrations,”
-not “erase every file.” An empty take is skipped.
+**Y+B**, the `f` command, and the browser's **Stop & Save Failure** button all
+stop the take and save its measurements and videos as a failure. Successful and
+failed saves advance the episode index. **Y+A**, `x`, the browser's **Discard**
+button, and the four-minute limit delete the active take's temporary files and
+do not add an episode. The next take can reuse that unsaved episode number.
+
+Recording chords trigger once after all face buttons are released. Their full
+button union is tracked so a third button cancels the recording/pose action,
+even with staggered releases. All four buttons remain SONIC-only. Y+B cannot
+also invoke B/Y's saved pose or the legacy return-to-base action during recording.
+
+Failed takes have `episode.success = 0`, an entry in `failed_episode_indices`,
+and a quality report in `meta/episode_quality.jsonl`. Failure reports preserve
+frame flags and gaps for cropping, with a `failure_reason` such as
+`operator_marked_failure`. Failed quality checks,
+technical stops, and shutdown also preserve captured data as unsuccessful.
+All saved outcomes are included in a later manual upload. An empty take has no
+data to save and is skipped.
+
+New failures are not added to the legacy `discarded_episode_indices` removal
+list. Older datasets may retain those historical markers; the processor's
+`--remove-discarded` option only acts on that legacy list.
 
 Validation includes required-input errors, allowed teleop modes, sender-time
-gaps when enabled, and external-hand activity. By default at least one requested
-hand joint must span 0.02 rad. This tests requested command activity, not proof
+gaps when enabled, and optional external-hand activity. With
+`--require-hand-activity`, at least one requested hand joint must span 0.02 rad.
+This tests requested command activity, not proof
 that an object was grasped or that the intended task succeeded. Stream rates
 remain diagnostic.
 

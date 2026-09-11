@@ -28,6 +28,7 @@ import numpy as np
 import tyro
 import zmq
 
+from gear_sonic.camera.depth_preview import camera_images_with_depth_preview
 from gear_sonic.camera.sensor_server import ImageMessageSchema, SensorClient
 from gear_sonic.end_effectors.protocol import (
     DEFAULT_HAND_CONTROL_PORT,
@@ -162,8 +163,9 @@ _INDEX_HTML = """<!doctype html>
           <textarea id="dataset-prompt" maxlength="1000">__DEFAULT_TASK_PROMPT__</textarea>
         </label>
         <div class="dataset-actions">
-          <span id="dataset-message">Choose an existing empty repo or enter a new name.</span>
+          <span id="dataset-message">Recordings save locally. Select a destination when ready to upload.</span>
           <button id="dataset-configure" disabled>Create / Select</button>
+          <button id="dataset-upload" disabled>Upload saved recordings</button>
         </div>
       </div>
     </section>
@@ -174,6 +176,7 @@ _INDEX_HTML = """<!doctype html>
         <div id="record-detail"></div>
       </div>
       <button id="record-toggle" disabled>Start Recording</button>
+      <button id="record-failure" class="discard" disabled>Stop &amp; Save Failure</button>
       <button id="record-discard" class="discard" disabled>Discard</button>
     </section>
     <section class="control-card rate-card">
@@ -284,12 +287,14 @@ _INDEX_HTML = """<!doctype html>
     const recordDetail = document.getElementById('record-detail');
     const recordToggle = document.getElementById('record-toggle');
     const recordDiscard = document.getElementById('record-discard');
+    const recordFailure = document.getElementById('record-failure');
     const datasetState = document.getElementById('dataset-state');
     const datasetRepo = document.getElementById('dataset-repo');
     const datasetRepos = document.getElementById('dataset-repos');
     const datasetPrompt = document.getElementById('dataset-prompt');
     const datasetPrivate = document.getElementById('dataset-private');
     const datasetConfigure = document.getElementById('dataset-configure');
+    const datasetUpload = document.getElementById('dataset-upload');
     const datasetMessage = document.getElementById('dataset-message');
     const repoPrefix = document.getElementById('repo-prefix');
     const rateBody = document.getElementById('rate-body');
@@ -306,6 +311,7 @@ _INDEX_HTML = """<!doctype html>
     let configurationPending = false;
     let datasetSetupError = null;
     let hydratedRepo = null;
+    let hydratedDatasetRoot = null;
     let lastRecorderStatus = null;
     let handCommandPending = false;
     const rateLabels = {
@@ -378,10 +384,12 @@ _INDEX_HTML = """<!doctype html>
           recordDetail.textContent = '';
           recordToggle.disabled = true;
           recordDiscard.disabled = true;
+          recordFailure.disabled = true;
           updateDatasetStatus(status);
           return;
         }
-        const state = status.recording ? 'RECORDING' : (status.saving ? 'SAVING' : 'IDLE');
+        const state = status.recording ? 'RECORDING' :
+          (status.saving ? 'SAVING' : (status.discarding ? 'DISCARDING' : 'IDLE'));
         recordState.textContent = state;
         recordState.className = status.recording ? 'recording' : (status.saving ? 'saving' : '');
         recordMessage.textContent = status.message || state;
@@ -398,15 +406,17 @@ _INDEX_HTML = """<!doctype html>
             : 'sources and teleop ready';
         recordDetail.textContent =
           `episode ${status.episode_index} · ${status.frame_count} frames · ` +
+          `${((status.buffered_video_bytes || 0) / 1048576).toFixed(0)} MiB video queue · ` +
           `${status.dataset_root} · ${readiness} · ` +
           (status.recording
-            ? 'headset: release A+X or X+B to save, release Y+A to discard'
+            ? 'headset: X+B saves success; Y+B saves failure; Y+A discards (on release)'
             : 'headset: release X+B to start; A+X twice toggles teleop');
         recordToggle.textContent = status.recording ? 'Stop & Save' : 'Start Recording';
         recordToggle.className = status.recording ? 'stop' : '';
-        recordToggle.disabled = commandPending || status.saving ||
-          (!status.recording && (!ready || (hub.required && !hub.ready)));
+        recordToggle.disabled = commandPending ||
+          (!status.recording && (!ready || status.ready_to_record === false || (hub.required && !hub.ready)));
         recordDiscard.disabled = commandPending || !status.recording;
+        recordFailure.disabled = commandPending || !status.recording;
         updateDatasetStatus(status);
       } catch (_) {
         recordMessage.textContent = 'Recorder status request failed';
@@ -417,8 +427,12 @@ _INDEX_HTML = """<!doctype html>
       const connected = Boolean(status.connected);
       const hub = status.hub || {};
       const finalizer = status.finalizer || {};
-      const locked = Boolean(status.recording || status.saving || status.total_episodes > 0 ||
+      const locked = Boolean(status.recording || status.saving ||
         finalizer.finalizing || finalizer.pending || hub.uploading || hub.pending);
+      if (status.dataset_root && hydratedDatasetRoot !== status.dataset_root) {
+        datasetPrompt.value = hub.prompt || datasetPrompt.value;
+        hydratedDatasetRoot = status.dataset_root;
+      }
       if (hub.ready && hub.repo_id && hydratedRepo !== hub.repo_id) {
         datasetRepo.value = hub.repo_id.split('/').slice(1).join('/');
         datasetPrompt.value = hub.prompt || datasetPrompt.value;
@@ -429,32 +443,34 @@ _INDEX_HTML = """<!doctype html>
         datasetRepo.value = status.dataset_root.split('/').filter(Boolean).pop() || '';
       }
       datasetRepo.disabled = locked;
-      datasetPrompt.disabled = locked;
+      datasetPrompt.disabled = locked || status.total_episodes > 0;
       datasetPrivate.disabled = locked;
       datasetConfigure.disabled = configurationPending || !connected || locked;
+      datasetUpload.disabled = commandPending || configurationPending || !connected || locked ||
+        !hub.ready || !(status.total_episodes > 0) || Boolean(finalizer.error);
 
       if (hub.uploading) {
         datasetState.textContent = 'UPLOADING';
         datasetState.className = 'uploading';
         const queued = hub.pending > 1 ? ` · ${hub.pending} episodes queued` : '';
         datasetMessage.textContent =
-          `Uploading to ${hub.repo_id}${queued}… you can keep recording.`;
+          `Uploading to ${hub.repo_id}${queued}… recording resumes when upload finishes.`;
       } else if (hub.retrying || hub.error) {
         datasetState.textContent = 'RETRYING';
         datasetState.className = 'error';
         datasetMessage.textContent =
-          `Upload error (recording still allowed): ${hub.error || 'retrying automatically'}`;
+          `Upload error; local files are saved: ${hub.error || 'retrying automatically'}`;
       } else if (hub.ready) {
-        datasetState.textContent = 'READY';
+        datasetState.textContent = 'LOCAL';
         datasetState.className = 'ready';
         const uploaded = Number.isInteger(hub.last_uploaded_episode)
           ? ` · episode ${hub.last_uploaded_episode} uploaded` : '';
-        datasetMessage.textContent = `${hub.repo_id}${uploaded}`;
+        datasetMessage.textContent = `${status.total_episodes || 0} episodes saved locally · ${hub.repo_id}${uploaded}`;
       } else {
-        datasetState.textContent = datasetSetupError ? 'ERROR' : (connected ? 'SETUP' : 'OFFLINE');
+        datasetState.textContent = datasetSetupError ? 'ERROR' : (connected ? 'LOCAL' : 'OFFLINE');
         datasetState.className = datasetSetupError ? 'error' : '';
         datasetMessage.textContent = datasetSetupError || (connected
-          ? 'Choose an existing empty repo or enter a new name.'
+          ? 'Recordings save locally. Select a destination when ready to upload.'
           : 'Recorder must be online before configuring the dataset.');
       }
     }
@@ -511,6 +527,7 @@ _INDEX_HTML = """<!doctype html>
       commandPending = true;
       recordToggle.disabled = true;
       recordDiscard.disabled = true;
+      recordFailure.disabled = true;
       try {
         await fetch(path, {method: 'POST'});
       } finally {
@@ -526,21 +543,17 @@ _INDEX_HTML = """<!doctype html>
         if (!status.enabled) return;
         const sides = status.sides || {};
         const sideNames = Object.keys(sides);
-        const connectedSides = sideNames.filter(side => sides[side].connected);
-        const fullyConnected = status.connected && status.mode !== 'fault'
-          && status.mode !== 'disconnected' && sideNames.length > 0
-          && connectedSides.length === sideNames.length;
-        handState.textContent = fullyConnected ? 'CONNECTED' : 'RECOVERING';
-        handState.className = fullyConnected ? 'connected' : 'recovering';
-        handMessage.textContent = fullyConnected
-          ? `Hands ready · ${connectedSides.join(' + ')}`
-          : (status.error || 'Hand worker is reconnecting…');
+        const labels = {connected: 'CONNECTED', reconnecting: 'RECONNECTING',
+                        fault: 'FAULT', stale: 'STALE', offline: 'OFFLINE'};
+        handState.textContent = labels[status.connection_state] || 'OFFLINE';
+        handState.className = status.connected ? 'connected' : 'recovering';
+        handMessage.textContent = status.status_message || 'Waiting for hand status…';
         const errors = sideNames
           .filter(side => sides[side].error)
           .map(side => `${side}: ${sides[side].error}`);
         handDetail.textContent = errors.length
           ? errors.join(' · ')
-          : `mode: ${status.mode || 'offline'} · automatic recovery enabled`;
+          : (status.connected ? `mode: ${status.mode}` : '');
         handReconnect.disabled = handCommandPending;
       } catch (_) {
         handState.textContent = 'OFFLINE';
@@ -599,8 +612,10 @@ _INDEX_HTML = """<!doctype html>
     }
 
     recordToggle.addEventListener('click', () => sendRecorderCommand('/recording/toggle'));
+    recordFailure.addEventListener('click', () => sendRecorderCommand('/recording/failure'));
     recordDiscard.addEventListener('click', () => sendRecorderCommand('/recording/discard'));
     datasetConfigure.addEventListener('click', configureDataset);
+    datasetUpload.addEventListener('click', () => sendRecorderCommand('/dataset/upload'));
     for (const field of [datasetRepo, datasetPrompt, datasetPrivate]) {
       field.addEventListener('input', () => { datasetSetupError = null; });
     }
@@ -755,12 +770,7 @@ class CameraFrameHub:
                 continue
 
             decoded = ImageMessageSchema.deserialize(message)
-            images = dict(decoded.images)
-            depth = decoded.depths.get("ego_view_depth")
-            if depth is not None:
-                preview = colorize_depth(depth)
-                if preview is not None:
-                    images["ego_view_depth"] = preview
+            images = camera_images_with_depth_preview(decoded.images, decoded.depths)
             jpeg = compose_camera_jpeg(
                 images,
                 max_tile_width=self.config.max_tile_width,
@@ -800,7 +810,7 @@ class RecorderControlHub:
         self._thread.join(timeout=2.0)
 
     def send(self, command: str) -> None:
-        if command not in {"c", "x"}:
+        if command not in {"c", "x", "f", "upload"}:
             raise ValueError(f"unsupported recorder command: {command}")
         self._commands.put(command)
 
@@ -831,12 +841,15 @@ class RecorderControlHub:
 
         status = self.status()
         if status.get("recording") or status.get("saving"):
-            raise RuntimeError("stop or discard the active episode first")
+            raise RuntimeError("save the active episode as successful or failed first")
         finalizer = status.get("finalizer") or {}
         if finalizer.get("pending") or finalizer.get("finalizing"):
             raise RuntimeError("wait for local episode finalization before changing dataset")
-        if int(status.get("total_episodes", 0) or 0) > 0:
-            raise RuntimeError("repository and prompt are locked after the first saved episode")
+        hub = status.get("hub") or {}
+        if hub.get("pending") or hub.get("uploading"):
+            raise RuntimeError("wait for the current upload before changing destination")
+        if int(status.get("total_episodes", 0) or 0) > 0 and prompt != hub.get("prompt"):
+            raise RuntimeError("the task prompt is locked after the first saved episode")
 
         repo_id = f"{self.config.hf_namespace}/{repo_name}"
         api = HfApi()
@@ -944,15 +957,39 @@ class HandControlHub:
             payload = dict(self._status or {})
             age = time.monotonic() - self._status_received_at if self._status else None
         state_age = payload.get("state_age_s")
+        publisher_connected = age is not None and 0 <= age < 1.0
         state_is_fresh = (
             state_age is None
             or (
                 not isinstance(state_age, bool)
                 and isinstance(state_age, (int, float))
-                and state_age < 1.0
+                and age is not None
+                and 0 <= state_age < 1.0 - age
             )
         )
-        payload["connected"] = age is not None and age < 1.0 and state_is_fresh
+        sides = payload.get("sides") or {}
+        healthy_sides = bool(sides) and all(
+            side.get("connected") is True and side.get("valid") is True
+            and not side.get("error")
+            for side in sides.values()
+        )
+        mode = payload.get("mode")
+        if not publisher_connected:
+            connection_state, message = "offline", "Hand service is offline; start the hand service"
+        elif mode == "fault":
+            connection_state, message = "fault", "Hands stopped on a fault; inspect the cause, then reconnect"
+        elif mode == "disconnected":
+            connection_state, message = "reconnecting", "Hand connection lost; retrying automatically"
+        elif not state_is_fresh:
+            connection_state, message = "stale", "Hand feedback stopped updating; reconnect hands"
+        elif mode in {"hold", "tracking"} and healthy_sides:
+            connection_state, message = "connected", "Hands ready · " + " + ".join(sides)
+        else:
+            connection_state, message = "fault", "Hand feedback is invalid; inspect the cause, then reconnect"
+        payload["publisher_connected"] = publisher_connected
+        payload["connected"] = connection_state == "connected"
+        payload["connection_state"] = connection_state
+        payload["status_message"] = message
         payload["enabled"] = True
         payload["last_status_age_s"] = round(age, 3) if age is not None else None
         return payload
@@ -1119,23 +1156,6 @@ def compose_camera_jpeg(images: dict[str, np.ndarray], max_tile_width: int, jpeg
     return encoded.tobytes() if ok else None
 
 
-def colorize_depth(depth: np.ndarray) -> np.ndarray | None:
-    """Create a display-only RGB preview from a float depth map."""
-    values = np.asarray(depth, dtype=np.float32)
-    if values.ndim != 2 or values.size == 0:
-        return None
-    valid = np.isfinite(values) & (values > 0)
-    if not np.any(valid):
-        return None
-    low, high = np.percentile(values[valid], [2, 98])
-    if high <= low:
-        high = low + 1.0
-    normalized = np.clip((values - low) / (high - low), 0.0, 1.0)
-    normalized[~valid] = 0.0
-    # Near objects are warm and far objects are cool; invalid pixels are black.
-    return cv2.applyColorMap((normalized * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
-
-
 def make_handler(
     frame_hub: CameraFrameHub,
     recorder_hub: RecorderControlHub,
@@ -1186,8 +1206,12 @@ def make_handler(
             path = self.path.split("?", 1)[0]
             if path == "/recording/toggle":
                 recorder_hub.send("c")
+            elif path == "/recording/failure":
+                recorder_hub.send("f")
             elif path == "/recording/discard":
                 recorder_hub.send("x")
+            elif path == "/dataset/upload":
+                recorder_hub.send("upload")
             elif path == "/dataset/configure":
                 try:
                     request = self._read_json()

@@ -51,7 +51,8 @@ def test_running_camera_without_stream_reports_readiness_failure_without_sudo(mo
         launcher._switch_camera_source(launcher.DataCollectionLaunchConfig())
 
 
-def test_launcher_keeps_direct_vr_controls_inside_restart_loop(monkeypatch):
+@pytest.mark.parametrize("record_cameras", [True, False])
+def test_launcher_keeps_direct_vr_controls_inside_restart_loop(monkeypatch, record_cameras):
     import shlex
 
     commands = {}
@@ -65,6 +66,10 @@ def test_launcher_keeps_direct_vr_controls_inside_restart_loop(monkeypatch):
     config = launcher.DataCollectionLaunchConfig(
         hand_backend="none", camera_viewer=False, camera_server_logs=False,
     )
+    if not record_cameras:
+        config.record_wrist_cameras = False
+        config.record_zed_stereo = False
+        config.max_episode_duration_s = 0.0
     launcher.main(config)
     lexer = shlex.shlex(commands[1], posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
@@ -75,3 +80,11 @@ def test_launcher_keeps_direct_vr_controls_inside_restart_loop(monkeypatch):
         assert args[args.index(flag) + 1] == expected
     assert "--manager" in args
     assert not any("limiter" in arg or arg.startswith("--vr-max-") for arg in args)
+    from gear_sonic.scripts.run_data_exporter import SonicDataExporterConfig
+    import tyro
+
+    exporter_args = shlex.split(commands[2].split("run_data_exporter.py ", 1)[1])
+    exporter_config = tyro.cli(SonicDataExporterConfig, args=exporter_args)
+    assert exporter_config.record_wrist_cameras is record_cameras
+    assert exporter_config.record_zed_stereo is record_cameras
+    assert exporter_config.max_episode_duration_s == (240.0 if record_cameras else 0.0)

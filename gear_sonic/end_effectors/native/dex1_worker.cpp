@@ -17,6 +17,7 @@
 #include <string>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <termios.h>
 #include <thread>
 #include <unistd.h>
 
@@ -25,10 +26,23 @@ volatile std::sig_atomic_t interrupted = 0;
 constexpr float kTorque = 1.0f, kSpeed = 9.0f, kP = 8.0f, kD = .35f;
 constexpr double kWatchdog = .25;
 constexpr int kTransportExitCode = 75;
+constexpr float kOutputTurn = 6.2831853071795864769f;
 void on_signal(int) { interrupted = 1; }
 void check(bool ok, const std::string& why) { if (!ok) throw std::runtime_error(why); }
 struct CommunicationError : std::runtime_error { using std::runtime_error::runtime_error; };
 double seconds(Clock::duration d) { return std::chrono::duration<double>(d).count(); }
+
+float startup_position_offset(float raw, float lower, float upper) {
+    // This measured pair can return on the adjacent output-shaft turn after
+    // power loss (confirmed against manual closure on motor 1). Its admitted
+    // travel is less than one turn, so at most one representative can fit.
+    // This is a coordinate correction, not a new zero or a wider travel range.
+    check(std::isfinite(raw) && std::isfinite(lower) && std::isfinite(upper)
+          && lower < upper && upper-lower < 6, "invalid position reference");
+    for (float offset : {0.0f, kOutputTurn, -kOutputTurn})
+        if (raw-offset >= lower && raw-offset <= upper) return offset;
+    throw std::runtime_error("position limit: no admitted startup turn");
+}
 
 struct Reference { float q, dq; };
 Reference reference(float start, float end, float t, float duration) {
@@ -68,11 +82,14 @@ struct Motor {
     int id;
     std::string port_name;
     float lower, upper;
+    float position_offset = 0;
+    bool position_reference_ready = false;
     std::unique_ptr<SerialPort> serial;
     MotorData data;
     int lock_fd = -1;
     Clock::time_point last_reply = Clock::now();
-    float q() const { return data.q/25; }
+    float raw_q() const { return data.q/25; }
+    float q() const { return raw_q()-position_offset; }
     float dq() const { return data.dq/25; }
     float tau() const { return data.tau*25; }
     float voltage() { return data.get_motor_recv_data()[5]/2.0f; }
@@ -95,6 +112,14 @@ struct Motor {
             check(ioctl(lock_fd, TIOCEXCL) == 0, "cannot claim serial device");
         } catch (...) { ::close(lock_fd); lock_fd = -1; throw; }
     }
+    void require_empty_receive_queue() {
+        int pending = 0;
+        if (ioctl(lock_fd, FIONREAD, &pending) != 0)
+            throw CommunicationError("cannot inspect motor receive queue: " + port_name);
+        if (pending != 0)
+            throw CommunicationError("stale motor feedback: port=" + port_name +
+                                     " queued_bytes=" + std::to_string(pending));
+    }
     void exchange(int mode, float tau_command = 0, bool enabling = false) {
         check(!interrupted, "interrupted");
         check(std::isfinite(tau_command) && std::abs(tau_command) <= kTorque, "torque command limit");
@@ -102,13 +127,29 @@ struct Motor {
         MotorData next;
         next.motorType = MotorType::M4010; next.correct = false;
         auto c = command(id, mode, tau_command);
+        // Replies have neither a sequence number nor a motor timestamp. A
+        // buffered reply can pass CRC and still be several control ticks old.
+        // Never send another torque command into an existing receive backlog.
+        require_empty_receive_queue();
         if (!serial->sendRecv(&c, &next) || !next.correct || next.motor_id != id)
             throw CommunicationError("invalid motor response: port=" + port_name + " motor_id=" + std::to_string(id));
+        require_empty_receive_queue();
         data = next; last_reply = Clock::now();
         check(std::isfinite(q()) && std::isfinite(dq()) && std::isfinite(tau()), "nonfinite feedback");
         check(data.merror == 0, "motor fault " + std::to_string(data.merror));
         check(voltage() >= 24 && voltage() <= 64, "supply outside 24-64 V");
         check(data.temp < 55 && data.get_motor_recv_data()[4] < 80, "temperature limit");
+        if (!position_reference_ready) {
+            check(mode == 0 && data.mode == 0, "drive not disabled during startup");
+            position_offset = startup_position_offset(raw_q(), lower, upper);
+            position_reference_ready = true;
+            if (position_offset != 0)
+                std::cerr << "DEX1 startup position reference: motor_id=" << id
+                          << " raw_q=" << raw_q() << " offset=" << position_offset
+                          << " profile_q=" << q() << '\n';
+        }
+        // Keep the offset fixed for this worker's lifetime. A runtime encoder
+        // jump or travel violation must fault, never silently select a new turn.
         check(q() >= lower && q() <= upper, "position limit");
         if (mode == 1 && !enabling) check(data.mode == 1 && data.timeout == 0, "drive not enabled");
     }
@@ -122,6 +163,11 @@ struct Motor {
         while (true) {
             try {
                 exchange(0);
+                check(data.mode == 0, "drive not disabled during startup");
+                // Failed startup requests can reply late and in a burst. Wait
+                // with the drive disabled before accepting the handshake.
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                require_empty_receive_queue();
                 if (retries)
                     std::cerr << "DEX1 startup recovered: motor_id=" << id << " retries=" << retries << '\n';
                 return;
@@ -131,6 +177,10 @@ struct Motor {
                         "; startup timed out with drive disabled; check motor power and data cable");
                 ++retries;
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                // Only the disabled handshake may discard input and retry.
+                // Runtime queue faults unwind through stop() instead.
+                if (tcflush(lock_fd, TCIFLUSH) != 0)
+                    throw CommunicationError("cannot clear motor receive queue: " + port_name);
             }
         }
     }
@@ -153,9 +203,10 @@ void feedback(Motor& m, Reference r, int mode, unsigned long long sequence) {
     const int size = std::snprintf(line, sizeof(line),
         "{\"version\":1,\"monotonic_ns\":%lld,\"sequence\":%llu,\"mode\":%d,"
         "\"q\":%.7g,\"dq\":%.7g,\"tau\":%.7g,\"applied_q\":%.7g,"
-        "\"voltage\":%.7g,\"temperature\":%d,\"motor_error\":%d}\n",
+        "\"voltage\":%.7g,\"temperature\":%d,\"motor_error\":%d,"
+        "\"raw_q\":%.7g,\"position_offset\":%.7g}\n",
         static_cast<long long>(ns), sequence, mode, m.q(), m.dq(), m.tau(), r.q,
-        m.voltage(), m.data.temp, m.data.merror);
+        m.voltage(), m.data.temp, m.data.merror, m.raw_q(), m.position_offset);
     // Less than PIPE_BUF: nonblocking atomic write, drop a snapshot if full.
     const auto written = ::write(STDOUT_FILENO, line, size);
     check(written == size || (written < 0 && (errno == EAGAIN || errno == EINTR)), "feedback pipe closed");

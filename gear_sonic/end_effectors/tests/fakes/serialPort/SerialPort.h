@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <unistd.h>
 
 enum class MotorType { M4010 };
 inline float queryGearRatio(MotorType) { return 25; }
@@ -37,11 +38,25 @@ struct SerialPort {
         ++calls;
         if (const auto* log = std::getenv("DEX1_TEST_EXCHANGE_LOG"))
             std::ofstream(log,std::ios::app) << c->mode << '\n';
+        if (const auto* fd = std::getenv("DEX1_TEST_RX_MASTER_FD")) {
+            const bool inject = std::getenv("DEX1_TEST_RX_AT_STARTUP") ? calls == 1 : c->mode == 1;
+            if (inject) {
+                const char queued[26]{};
+                if (::write(std::stoi(fd), queued, sizeof(queued)) != sizeof(queued))
+                    return false;
+                // Allow the PTY line discipline to make injected bytes visible.
+                ::usleep(1000);
+            }
+        }
         if (const auto* failures = std::getenv("DEX1_TEST_STARTUP_FAILURES"))
             if (calls <= std::stoi(failures)) return false;
         if (std::getenv("DEX1_TEST_ACTIVE_FAILURE") && c->mode == 1) return false;
         d->correct = true; d->motor_id = c->id; d->mode = c->mode;
         d->tau = c->tau; d->bytes[5] = 50; d->bytes[4] = 30;
+        if (const auto* q = std::getenv("DEX1_TEST_FEEDBACK_POSITION")) d->q = std::stof(q)*25;
+        if (const auto* q = std::getenv("DEX1_TEST_ACTIVE_POSITION"))
+            if (c->mode == 1) d->q = std::stof(q)*25;
+        if (std::getenv("DEX1_TEST_STARTUP_ENABLED")) d->mode = 1;
         if (const auto* speed = std::getenv("DEX1_TEST_FEEDBACK_SPEED")) d->dq = std::stof(speed)*25;
         if (const auto* torque = std::getenv("DEX1_TEST_FEEDBACK_TORQUE")) d->tau = std::stof(torque)/25;
         if (std::getenv("DEX1_TEST_LOW_VOLTAGE")) d->bytes[5] = 20;

@@ -211,6 +211,15 @@ Left and right are from the robot's perspective.
 Serial paths use `/dev/serial/by-id`, so USB enumeration cannot swap the hands.
 Changing grippers or adapters requires measuring and updating the profile;
 these values are not universal factory calibration. No calibration is written.
+After a power interruption, this pair can report a position on an adjacent
+output-shaft turn. The native worker selects the unique position within the
+existing profile by subtracting zero or one signed full turn during its first
+healthy, disabled handshake. This was checked against manual right-hand closure
+on 2026-09-11: raw 3.90671 rad corresponds to -2.37648 rad in the saved profile.
+The offset stays fixed until that worker exits; runtime position jumps still
+fault. Positions outside all three admitted startup representations still fault.
+Feedback and recording positions use the original profile coordinates; hand
+health also reports `encoder_position_rad` and `encoder_offset_rad` for diagnosis.
 Do not run the stock DDS gripper service or the standalone movement tools at
 the same time. Each native worker claims its port exclusively against new opens.
 
@@ -242,6 +251,10 @@ it does not depend on local changes to the SDK constructors.
   holds, and discards queued input before accepting fresh headset intent.
 - Motor health, command validation, watchdog, and other worker faults latch in
   the UI. Check the Hands pane and device, then use **Reconnect hands**.
+  The browser distinguishes **FAULT** (operator attention required),
+  **RECONNECTING** (automatic transport recovery), **STALE** (feedback no longer
+  advances), and **OFFLINE** (the hand service stopped publishing). A live status
+  publisher alone does not count as connected hands.
 - Normal shutdown, EOF, and handled SIGINT/SIGTERM/SIGHUP send three stop
   packets per motor. SIGKILL, power loss, and an unresponsive transport cannot
   guarantee delivery of a software stop packet.

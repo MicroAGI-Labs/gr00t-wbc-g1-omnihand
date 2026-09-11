@@ -6,7 +6,7 @@ from scipy.spatial.transform import Rotation
 from .pose_transition import validate_vr_pose
 
 XR_TO_ROBOT = np.array(((0., 0., -1.), (-1., 0., 0.), (0., 1., 0.)))
-CONTROLLER_STALE_SECONDS = 0.100
+CONTROLLER_STALE_SECONDS = 0.200
 
 
 def controller_poses(left, right, head):
@@ -45,9 +45,6 @@ class PicoLocomotion:
             self.enabled = not self.enabled
             self.neutral_required = True
         self.clicked = click
-        if action == "x" and self.enabled:
-            self.slow = not self.slow
-            self.neutral_required = True
         if self.neutral_required:
             if not click and max(abs(v) for v in axes) <= 0.15:
                 self.neutral_required = False

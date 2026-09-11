@@ -213,6 +213,8 @@ class Dex1Backend:
             "voltage_v": [sample["voltage"]],
             "torque_nm": [sample["tau"]],
             "velocity_rad_s": [sample["dq"]],
+            "encoder_position_rad": [sample.get("raw_q", sample["q"])],
+            "encoder_offset_rad": [sample.get("position_offset", 0.0)],
             "feedback_age_s": (time.monotonic_ns() - sample["monotonic_ns"]) / 1e9,
             "serial_port": self.port,
             "motor_id": self.motor_id,

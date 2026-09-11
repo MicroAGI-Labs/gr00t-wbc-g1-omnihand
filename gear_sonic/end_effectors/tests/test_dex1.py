@@ -9,6 +9,7 @@ import socket
 import subprocess
 import threading
 import time
+import tty
 from types import SimpleNamespace
 from urllib.request import Request, urlopen
 
@@ -97,6 +98,85 @@ def assert_stopped(log):
 
 
 @pytest.mark.parametrize(
+    "side,raw,expected,offset",
+    [
+        ("right", 3.90671, 3.90671 - 2 * np.pi, 2 * np.pi),
+        ("right", 2.84 + 2 * np.pi, 2.84, 2 * np.pi),
+        ("right", -2.36 - 2 * np.pi, -2.36, -2 * np.pi),
+        ("right", -2.36, -2.36, 0),
+        ("left", 0.12 + 2 * np.pi, 0.12, 2 * np.pi),
+        ("left", 5.30 - 2 * np.pi, 5.30, -2 * np.pi),
+        ("left", 5.30, 5.30, 0),
+    ],
+)
+def test_startup_turn_preserves_profile_positions_and_measured_hold(
+    fake_worker, tmp_path, monkeypatch, side, raw, expected, offset
+):
+    master, slave = os.openpty()
+    log = tmp_path / "motor.log"
+    monkeypatch.setenv("DEX1_TEST_FEEDBACK_POSITION", str(raw))
+    monkeypatch.setenv("DEX1_TEST_MOTOR_LOG", str(log))
+    monkeypatch.setitem(dex1.USB_PORTS, side, os.ttyname(slave))
+    backend = None
+    try:
+        backend = dex1.Dex1Backend(side, DEX1.side(side), worker=fake_worker, command_enabled=True)
+        measured = backend.read_positions()
+        assert measured == pytest.approx([expected], abs=2e-6)
+        assert backend.read_health()["encoder_position_rad"] == pytest.approx([raw], abs=2e-6)
+        assert backend.read_health()["encoder_offset_rad"] == pytest.approx([offset], abs=2e-6)
+        backend.write_positions(measured)
+        run_for(backend, 0.12)
+        assert backend.applied_positions == pytest.approx(measured, abs=2e-6)
+        commands = [line.split() for line in log.read_text().splitlines()]
+        assert any(int(mode) == 1 for mode, _ in commands)
+        assert max(abs(float(torque)) for _, torque in commands) < 1e-5
+    finally:
+        if backend is not None:
+            backend.close()
+            assert_stopped(log)
+        os.close(slave)
+        os.close(master)
+
+
+@pytest.mark.parametrize(
+    "raw,extra,detail,active_request",
+    [
+        (3.3, {}, "position limit", False),
+        (-2.8, {}, "position limit", False),
+        (3.3 + 2 * np.pi, {}, "position limit", False),
+        (-2.36 + 4 * np.pi, {}, "position limit", False),
+        (float("nan"), {}, "nonfinite feedback", False),
+        (3.90671, {"DEX1_TEST_LOW_VOLTAGE": "1"}, "supply outside", False),
+        (3.90671, {"DEX1_TEST_STARTUP_ENABLED": "1"}, "drive not disabled", False),
+        (3.90671, {"DEX1_TEST_ACTIVE_POSITION": str(3.90671 + 2 * np.pi)}, "position limit", True),
+        (3.90671, {"DEX1_TEST_ACTIVE_POSITION": str(3.90671 - 2 * np.pi)}, "position limit", True),
+        (-2.36, {"DEX1_TEST_ACTIVE_POSITION": "3.2"}, "position limit", True),
+    ],
+)
+def test_startup_turn_keeps_health_and_runtime_position_guards(
+    fake_worker, tmp_path, raw, extra, detail, active_request
+):
+    master, slave = os.openpty()
+    log = tmp_path / "exchanges.log"
+    try:
+        result = subprocess.run(
+            [str(fake_worker), os.ttyname(slave), "1", "-2.60", "3.10", "1.35", "1"],
+            input="C 1 0 -2.36\n", capture_output=True, text=True, timeout=3,
+            env={**os.environ, "DEX1_TEST_FEEDBACK_POSITION": str(raw),
+                 "DEX1_TEST_EXCHANGE_LOG": str(log), **extra},
+        )
+        assert result.returncode == 2, result.stderr
+        assert detail in result.stderr
+        modes = [int(line) for line in log.read_text().splitlines()]
+        assert modes == ([0, 1, 0, 0, 0] if active_request else [0, 0, 0, 0])
+        if not active_request:
+            assert "startup position reference" not in result.stderr
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
+@pytest.mark.parametrize(
     "fault,value,success,detail",
     [
         ("DEX1_TEST_STARTUP_FAILURES", "3", True, "startup recovered"),
@@ -128,6 +208,61 @@ def test_native_startup_retries_only_disabled_communication(fake_worker, tmp_pat
         if fault == "DEX1_TEST_LOW_VOLTAGE":
             assert len(modes) == 4  # health fault is never retried
     finally:
+        os.close(slave)
+        os.close(master)
+
+
+@pytest.mark.parametrize("during_startup", [True, False])
+def test_native_receive_backlog_is_cleared_only_while_disabled(fake_worker, tmp_path, during_startup):
+    master, slave = os.openpty()
+    tty.setraw(slave)
+    log = tmp_path / "exchanges.log"
+    env = {**os.environ, "DEX1_TEST_RX_MASTER_FD": str(master), "DEX1_TEST_EXCHANGE_LOG": str(log)}
+    if during_startup:
+        env["DEX1_TEST_RX_AT_STARTUP"] = "1"
+    try:
+        result = subprocess.run(
+            [str(fake_worker), os.ttyname(slave), "0", "-0.1", "5.75", "1.5", "1"],
+            input="C 1 0 2.5\n", capture_output=True, text=True, timeout=3,
+            env=env, pass_fds=(master,),
+        )
+        modes = [int(line) for line in log.read_text().splitlines()]
+        if during_startup:
+            assert result.returncode == 0, result.stderr
+            assert "startup recovered" in result.stderr
+            assert modes[:3] == [0, 0, 1]
+        else:
+            assert result.returncode == dex1.TRANSPORT_EXIT_CODE, result.stderr
+            assert "stale motor feedback" in result.stderr
+            assert modes == [0, 1, 0, 0, 0]
+        assert modes[-3:] == [0, 0, 0]
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
+def test_native_pending_reply_prevents_next_command(fake_worker, tmp_path):
+    master, slave = os.openpty()
+    tty.setraw(slave)
+    log = tmp_path / "exchanges.log"
+    process = subprocess.Popen(
+        [str(fake_worker), os.ttyname(slave), "0", "-0.1", "5.75", "1.5", "1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**os.environ, "DEX1_TEST_EXCHANGE_LOG": str(log)},
+    )
+    try:
+        # First feedback establishes that startup is complete and the worker
+        # is waiting for an operator command with its motor disabled.
+        assert json.loads(process.stdout.readline())["mode"] == -1
+        os.write(master, b"\0" * 130)
+        process.wait(timeout=2)
+        assert process.returncode == dex1.TRANSPORT_EXIT_CODE
+        assert "stale motor feedback" in process.stderr.read()
+        assert set(log.read_text().splitlines()) == {"0"}
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=2)
         os.close(slave)
         os.close(master)
 

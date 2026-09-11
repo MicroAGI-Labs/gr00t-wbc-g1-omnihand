@@ -88,6 +88,22 @@ def test_recording_allowed_while_upload_is_in_flight(uploader):
     assert hub.can_record() is True
 
 
+def test_recorder_restart_restores_existing_upload_destination(uploader):
+    hub, exporter = uploader
+    original = hub.status()
+    hub.close()
+    restored = EpisodeHubUploader(exporter, upload_runner=exporter.upload_snapshot)
+    try:
+        assert restored.can_record()
+        assert restored.status()["repo_id"] == original["repo_id"]
+        assert restored.status()["prompt"] == original["prompt"]
+        assert restored.status()["private"] == original["private"]
+        assert restored.status()["pending"] == 0
+        assert exporter.calls == []  # Restoration itself never sends anything.
+    finally:
+        restored.close()
+
+
 def test_failed_upload_retries_without_blocking_recording(uploader):
     hub, exporter = uploader
     _write_episode(exporter.root, 0)
@@ -211,7 +227,7 @@ def test_recording_is_blocked_only_until_a_dataset_is_chosen(tmp_path):
         hub.close(timeout=5.0)
 
 
-def test_local_finalization_and_upload_enqueue_run_in_background():
+def test_local_finalization_never_enqueues_an_upload():
     class _LocalExporter:
         def __init__(self):
             self.started = threading.Event()
@@ -250,14 +266,14 @@ def test_local_finalization_and_upload_enqueue_run_in_background():
 
         exporter.gate.set()
         assert finalizer.wait_until_idle(timeout=2.0)
-        assert hub.episodes == [4]
+        assert hub.episodes == []
         assert finalizer.status()["last_finalized_episode"] == 4
     finally:
         exporter.gate.set()
         finalizer.close(timeout=2.0)
 
 
-def test_upload_staging_failure_does_not_turn_local_save_into_failure():
+def test_unavailable_uploader_does_not_affect_local_save():
     class _LocalExporter:
         def save_episode(self, episode_buffer, **kwargs):
             return None
@@ -268,7 +284,7 @@ def test_upload_staging_failure_does_not_turn_local_save_into_failure():
 
         @staticmethod
         def status():
-            return {"ready": True}
+            raise AssertionError("local saving must not consult the uploader")
 
         @staticmethod
         def enqueue(episode_index):
@@ -290,7 +306,7 @@ def test_upload_staging_failure_does_not_turn_local_save_into_failure():
         assert finalizer.wait_until_idle(timeout=2.0)
         assert finalizer.status()["error"] is None
         assert finalizer.status()["last_finalized_episode"] == 7
-        assert hub.reported == (7, "snapshot staging failed")
+        assert hub.reported is None
     finally:
         finalizer.close(timeout=2.0)
 

@@ -42,6 +42,7 @@ def test_each_arm_refreshes_headset_heading_only_on_its_own_press():
 
 
 @pytest.mark.parametrize("gesture, action", [(("a",), "a"), (("b",), "b"), (("x",), "x"),
+    (("y",), "y"), (("x", "y"), None), (("b", "y"), "by"),
     (("x", "b"), "xb"), (("y", "a"), "ya"), (("a", "x"), None),
     (("a", "x", "b", "y"), None)])
 def test_face_gestures_do_not_leak_partial_actions(gesture, action):
@@ -60,7 +61,7 @@ def test_face_gestures_do_not_leak_partial_actions(gesture, action):
     assert update(()) is None  # Fresh release required after loss.
 
 
-def test_locomotion_is_exclusive_and_requires_neutral_after_mode_and_speed_changes():
+def test_locomotion_is_exclusive_and_x_does_not_change_speed():
     controls = PicoLocomotion()
     def step(forward=0., turn=0., click=False, action=None, fresh=True):
         return controls.update((0, forward, turn, 0), click, action, fresh=fresh)
@@ -74,8 +75,8 @@ def test_locomotion_is_exclusive_and_requires_neutral_after_mode_and_speed_chang
     assert step(turn=1) == (0, 1)
     assert step(turn=-1) == (0, -1)
     assert step(forward=1, turn=1) == (0, 0)
-    assert step(forward=1, action="x") == (0, 0)
-    assert controls.slow
+    assert step(forward=1, action="x") == (1, 0)
+    assert not controls.slow
     step()
     assert step(forward=1) == (1, 0)
     assert step(fresh=False) == (0, 0)
@@ -234,7 +235,8 @@ def test_rest_return_uses_saved_idle_arms_and_preserves_waist(direct_streamer):
 def test_slow_walk_commands_06_mps_at_full_stick_and_stops_at_neutral(direct_streamer, forward):
     streamer, state, tick = direct_streamer
     streamer.locomotion.enabled = True
-    tick(action="x")
+    streamer.locomotion.slow = True
+    tick()
     state.axes[1] = forward
     tick()
     packet = unpack_pose_message(streamer.packets[-1], "planner")
@@ -256,7 +258,7 @@ def test_slow_turn_halves_yaw_without_translation(direct_streamer):
     state.axes[2] = 1.
     tick()
     normal_yaw = streamer.yaw_accumulator.yaw_angle_change()
-    tick(action="x")
+    streamer.locomotion.slow = True
     state.axes[2] = 0.
     tick()
     state.axes[2] = 1.
@@ -292,7 +294,7 @@ def test_latched_tracking_loss_reanchors_after_stopping_without_ax(direct_stream
     assert streamer.vr_arm_clutch.tracking.all()
 
 
-def test_tracking_timeout_holds_at_100ms_and_requires_recalibration(direct_streamer):
+def test_tracking_timeout_holds_at_200ms_and_requires_recalibration(direct_streamer):
     streamer, state, tick = direct_streamer
     state.pose[2, 3:] = [1, 0, 0, 0]
     streamer.locomotion.enabled = True
@@ -305,12 +307,13 @@ def test_tracking_timeout_holds_at_100ms_and_requires_recalibration(direct_strea
     held = streamer.last_vr_pose.copy()
     np.testing.assert_allclose(held[:2, 0], vr_pose()[:2, 0] + 0.03)  # No smoothing.
     sample = streamer.reader.get_latest()
-    state.now = state.source_time + 0.099
-    assert fresh_controller_sample(sample, state.now)
-    assert streamer.run_once(manager.StreamMode.PLANNER_VR_3PT)
-    assert not streamer.vr_fault
-    assert np.linalg.norm(unpack_pose_message(streamer.packets[-1], "planner")["movement"]) > 0
-    state.now = state.source_time + 0.100
+    for age in (0.099, 0.100, 0.150, 0.199):
+        state.now = state.source_time + age
+        assert fresh_controller_sample(sample, state.now)
+        assert streamer.run_once(manager.StreamMode.PLANNER_VR_3PT)
+        assert not streamer.vr_fault
+        assert np.linalg.norm(unpack_pose_message(streamer.packets[-1], "planner")["movement"]) > 0
+    state.now = state.source_time + 0.200
     assert not fresh_controller_sample(sample, state.now)
     assert streamer.run_once(manager.StreamMode.PLANNER_VR_3PT)
     assert streamer.controller_input_lost
@@ -341,8 +344,8 @@ def test_tracking_timeout_holds_at_100ms_and_requires_recalibration(direct_strea
     np.testing.assert_allclose(moved[1:], held[1:], atol=1e-7)
 
 
-@pytest.mark.parametrize("return_button", ["a", "b"])
-def test_timeout_interrupts_generated_return_even_after_fresh_input(direct_streamer, return_button):
+@pytest.mark.parametrize("return_button", ["a", "b", "x", "y"])
+def test_timeout_interrupts_generated_return_even_after_fresh_input(direct_streamer, return_button, monkeypatch):
     streamer, state, tick = direct_streamer
     tick()
     if return_button == "a":
@@ -350,12 +353,12 @@ def test_timeout_interrupts_generated_return_even_after_fresh_input(direct_strea
         home[:, 2] += 0.2
         transition = streamer.begin_vr_return(to_base=True, duration_s=0.2, goal_override=home)
     else:
-        streamer.last_vr_pose[:2, 2] += 0.2
-        transition = streamer.begin_vr_rest_return(duration_s=0.2)
+        monkeypatch.setattr(streamer, "vr_pose_from_upper_body", lambda joints: vr_pose())
+        transition = streamer.begin_vr_saved_arm_return(button=return_button, duration_s=0.2)
     state.advance()
     assert streamer.send_vr_return_sample(transition, state.now)[0]
     held = streamer.last_vr_pose.copy()
-    state.now = state.source_time + 0.100
+    state.now = state.source_time + 0.200
     for fresh in (False, True):
         for _ in range(20):
             state.advance(fresh)
@@ -365,7 +368,8 @@ def test_timeout_interrupts_generated_return_even_after_fresh_input(direct_strea
             np.testing.assert_allclose(streamer.held_vr_pose, held, atol=1e-12)
 
 
-def test_manager_start_home_rest_record_and_ui_stop(direct_streamer, monkeypatch):
+@pytest.mark.parametrize("arm_button", ["b", "x", "y"])
+def test_manager_start_home_arm_return_record_and_ui_stop(direct_streamer, monkeypatch, arm_button):
     from gear_sonic.end_effectors.protocol import decode_intent
     from gear_sonic.utils.teleop.pose_transition import IDLE_BASE_UPPER_BODY_RAD
 
@@ -403,13 +407,16 @@ def test_manager_start_home_rest_record_and_ui_stop(direct_streamer, monkeypatch
     streamer.socket = socket
     monkeypatch.setattr(manager.zmq, "Context", lambda: SimpleNamespace(
         socket=lambda *args: next(sockets), term=lambda: None))
-    rest_requests = []
-    begin_rest = streamer.begin_vr_rest_return
-    def return_to_legs(**kwargs):
-        rest_requests.append(frame[0])
-        return begin_rest(**kwargs)
-    monkeypatch.setattr(streamer, "begin_vr_rest_return", return_to_legs)
-    gestures = {1: "abxy", 9: "xb", 15: "a", 29: "b", 42: "xb", 45: "xb", 48: "ya", 115: "abxy"}
+    arm_requests, arm_presets = [], []
+    method = "begin_vr_saved_arm_return"
+    begin_arm_return = getattr(streamer, method)
+    def return_arms(**kwargs):
+        arm_requests.append(frame[0])
+        arm_presets.append(kwargs.get("button"))
+        return begin_arm_return(**kwargs)
+    monkeypatch.setattr(streamer, method, return_arms)
+    gestures = {1: "abxy", 5: "by", 9: "xb", 15: "a", 29: arm_button, 42: "xb",
+                45: "xb", 48: "by", 50: "xb", 52: "ya", 115: "abxy"}
     def buttons(reader):
         frame[0] += 1
         i = frame[0]
@@ -430,34 +437,39 @@ def test_manager_start_home_rest_record_and_ui_stop(direct_streamer, monkeypatch
               if data.startswith(b"manager_state")}
     assert states[2]["stream_mode"][0] == manager.StreamMode.PLANNER_VR_3PT.value
     assert all(states[i]["stream_mode"][0] == manager.StreamMode.PLANNER_VR_3PT.value
-               for i in range(10, 55))  # A and B returns remain recordable.
-    assert rest_requests == [30]  # Neither AXBY nor XB leaks a B return.
-    assert [i for i, value in states.items() if value["toggle_data_collection"][0]] == [10, 43, 46]
-    assert [i for i, value in states.items() if value["toggle_data_abort"][0]] == [49]
+               for i in range(10, 55))  # A/B/X/Y returns stay in VR_3PT and remain recordable.
+    assert arm_requests == [30]  # AXBY, XB, YB and YA cannot leak an arm return.
+    assert arm_presets == [arm_button]
+    assert [i for i, value in states.items() if value["toggle_data_collection"][0]] == [10, 43, 46, 51]
+    assert [i for i, value in states.items() if value["toggle_data_failure"][0]] == [49]
+    assert [i for i, value in states.items() if value["toggle_data_abort"][0]] == [53]
     hands = {i: decode_intent(data) for i, data in emitted if data.startswith(b"hand_intent ")}
     assert hands[14]["left"]["closed"] and not hands[14]["left"]["hold"]
     for i in range(16, 26):
         assert not hands[i]["left"]["closed"] and not hands[i]["left"]["hold"]
     for i in range(30, 40):
-        assert hands[i]["hold"]  # B freezes the hand instead of issuing open/close.
+        assert hands[i]["hold"]  # B, X and Y hold the grippers throughout the return.
     assert not hands[42]["hold"] and hands[42]["left"]["hold"]
     planner = {i: unpack_pose_message(data, "planner") for i, data in emitted if data.startswith(b"planner")}
     for i in range(16, 40):
-        assert np.linalg.norm(planner[i]["movement"]) > 0  # A and B keep walking.
+        assert np.linalg.norm(planner[i]["movement"]) > 0
+        assert "vr_position" in planner[i] and "vr_orientation" in planner[i]
+        assert not {"upper_body_position", "upper_body_velocity", "upper_body_mask"} & planner[i].keys()
     np.testing.assert_allclose(planner[28]["vr_position"].reshape(3, 3), home[:, :3], atol=1e-7)
     np.testing.assert_allclose(planner[42]["vr_position"].reshape(3, 3), vr_pose()[:, :3], atol=1e-7)
-    assert not streamer.locomotion.slow  # XB never leaks X.
+    assert not streamer.locomotion.slow  # Pose returns preserve the selected gait speed.
     assert all(states[i]["stream_mode"][0] == manager.StreamMode.PLANNER.value for i in range(90, 115))
     assert all(np.linalg.norm(planner[i]["movement"]) == 0 for i in range(55, 115))
     assert states[115]["stream_mode"][0] == manager.StreamMode.PLANNER_VR_3PT.value
 
 
-@pytest.mark.parametrize("return_button", [None, "a", "b"])
+@pytest.mark.parametrize("return_button", [None, "a", "b", "x", "y"])
 @pytest.mark.parametrize("outage_seconds", [0, 20])
 def test_manager_timeout_cancels_returns_and_waits_for_grip_recalibration(
     direct_streamer, monkeypatch, return_button, outage_seconds,
 ):
     streamer, state, _ = direct_streamer
+    sample_times = {}
     streamer.last_vr_pose = None
     home = vr_pose()
     home[:2, 2] += 0.2
@@ -468,11 +480,17 @@ def test_manager_timeout_cancels_returns_and_waits_for_grip_recalibration(
     streamer.reader.disconnected = False
     streamer.reader.stop = streamer.three_point.close = lambda: None
     reconnects = []
+    before_reconnect = []
     def reconnect():
         reconnects.append(state.now)
+        before_reconnect.append(streamer.last_vr_pose.copy())
         state.now += outage_seconds
         streamer.reader.disconnected = False
-        streamer.feedback_reader.vr_pose = streamer.last_vr_pose.copy()
+        # Direct control must retain its exact sent target even if feedback
+        # differs (e.g. old visualization coordinates or a delayed sample).
+        feedback = streamer.last_vr_pose.copy()
+        feedback[:, :3] = Rotation.from_euler("z", 30, degrees=True).apply(feedback[:, :3])
+        streamer.feedback_reader.vr_pose = feedback
     streamer.reader.reconnect = reconnect
     monkeypatch.setattr(manager, "PicoReader", type(streamer.reader))
     monkeypatch.setattr(manager, "_init_input_source", lambda *args: streamer.reader)
@@ -495,6 +513,7 @@ def test_manager_timeout_cancels_returns_and_waits_for_grip_recalibration(
         if i == 42:
             raise KeyboardInterrupt
         state.advance(fresh=not 11 <= i < 25)
+        sample_times[i] = (state.now, state.source_time)
         state.click = i == 4
         state.axes[1] = 1 if 6 <= i < 32 else 0
         state.grips[:] = [1, 1] if 6 <= i < 35 else ([1, 0] if i >= 37 else [0, 0])
@@ -505,14 +524,27 @@ def test_manager_timeout_cancels_returns_and_waits_for_grip_recalibration(
         return tuple(key in (gesture or "") for key in "abxy")
     monkeypatch.setattr(manager, "get_abxy_buttons", buttons)
     manager.run_pico_manager(teleop_mode="vr3pt", input_source="xrt", target_fps=50,
-                             idle_base_transition_duration=0.2)
+                             idle_base_transition_duration=0.4)  # Still transitioning at the 200 ms timeout.
     states = {i: unpack_pose_message(data, "manager_state")["stream_mode"][0]
               for i, data in emitted if data.startswith(b"manager_state")}
     planner = {i: data for i, data in emitted if data.startswith(b"planner")}
     assert bool(reconnects) == bool(outage_seconds)
-    assert all(states[i] == manager.StreamMode.PLANNER_IDLE_BASE_POSE.value for i in range(20, 35))
-    held = decode_vr(planner[20])
-    for i in range(20, 38):
+    hold_frame = next(i for i in range(11, 25)
+                      if states[i] == manager.StreamMode.PLANNER_IDLE_BASE_POSE.value)
+    if not outage_seconds:
+        # Check the first manager tick at/after 200 ms, accounting for the
+        # simulated clock's floating-point rounding near the exact boundary.
+        expected_frame = next(i for i in range(11, 25)
+                              if sample_times[i][0] >= sample_times[i][1] + 0.200)
+        assert hold_frame == expected_frame
+        assert 0.200 <= sample_times[hold_frame][0] - sample_times[hold_frame][1] <= 0.220 + 1e-9
+    assert all(states[i] == manager.StreamMode.PLANNER_IDLE_BASE_POSE.value for i in range(hold_frame, 35))
+    held = decode_vr(planner[hold_frame])
+    if outage_seconds:
+        np.testing.assert_allclose(held, before_reconnect[0], atol=1e-7)
+    else:
+        np.testing.assert_allclose(held, decode_vr(planner[hold_frame - 1]), atol=1e-7)
+    for i in range(hold_frame, 38):
         np.testing.assert_allclose(decode_vr(planner[i]), held, atol=1e-7)
         np.testing.assert_array_equal(unpack_pose_message(planner[i], "planner")["movement"], [0, 0, 0])
     assert states[35] == manager.StreamMode.PLANNER_VR_3PT.value

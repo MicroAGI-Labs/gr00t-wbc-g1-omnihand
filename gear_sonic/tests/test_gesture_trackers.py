@@ -63,7 +63,7 @@ def test_only_ya_discards_an_active_recording():
         )
         == "discard"
     )
-    for face_command in (None, "by", "ab", "xy"):
+    for face_command in (None, "ab", "xy"):
         assert (
             recording_face_action(
                 face_command,
@@ -72,6 +72,12 @@ def test_only_ya_discards_an_active_recording():
             )
             is None
         )
+
+
+@pytest.mark.parametrize("ready", [True, False])
+def test_by_saves_failure_only_during_recording(ready):
+    assert recording_face_action("by", recorder_is_recording=True, recording_mode_ready=ready) == "failure"
+    assert recording_face_action("by", recorder_is_recording=False, recording_mode_ready=ready) is None
 
 
 def test_xb_starts_only_when_recording_mode_is_ready():

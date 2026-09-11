@@ -57,6 +57,7 @@ from gear_sonic.trl.utils.torch_transform import (
 from gear_sonic.utils.teleop import input_readers
 from gear_sonic.utils.teleop.vr_arm_clutch import VRArmClutch
 from gear_sonic.utils.teleop.pico_controls import (
+    CONTROLLER_STALE_SECONDS,
     PicoHandGate, PicoLocomotion, controller_poses, fresh_controller_sample,
 )
 from gear_sonic.utils.teleop.pico_body_diagnostics import DEFAULT_PICO_BODY_PORT, PicoBodyPublisher
@@ -65,9 +66,12 @@ from gear_sonic.utils.teleop.gesture_trackers import (
     recording_face_action,
 )
 from gear_sonic.utils.teleop.pose_transition import (
+    B_ARM_POSE_RAD,
     IDLE_BASE_UPPER_BODY_MASK,
     IDLE_BASE_UPPER_BODY_RAD,
     UPPER_BODY_WIDTH,
+    X_ARM_POSE_RAD,
+    Y_ARM_POSE_RAD,
     JointPoseTransition,
     VRPoseTransition,
     validate_vr_pose,
@@ -205,7 +209,7 @@ class FaceChordTracker:
 
     Any third face button cancels the candidate. This lets the four-button
     policy chord be pressed and released in any order without leaking subsets.
-    The controller profile also supports solo A, B and X, with union-based tracking
+    The controller profile also supports solo A, B, X and Y, with union-based tracking
     so staggered chord releases cannot become solo actions.
     """
 
@@ -248,7 +252,9 @@ class FaceChordTracker:
             self.reset()
             self._armed = True
             return {frozenset(("a",)): "a", frozenset(("b",)): "b", frozenset(("x",)): "x",
-                    frozenset(("x", "b")): "xb", frozenset(("y", "a")): "ya"}.get(gesture)
+                    frozenset(("y",)): "y",
+                    frozenset(("x", "b")): "xb", frozenset(("y", "a")): "ya",
+                    frozenset(("y", "b")): "by"}.get(gesture)
         if not pressed:
             confirmed = self._candidate if self._active and not self._cancelled else None
             self.reset()
@@ -257,7 +263,8 @@ class FaceChordTracker:
         if not self._active:
             self._active = True
 
-        if len(pressed) > 2:
+        self._gesture.update(pressed)
+        if len(self._gesture) > 2:
             self._cancelled = True
             self._candidate = None
         elif len(pressed) == 2 and not self._cancelled:
@@ -1667,7 +1674,7 @@ class PoseStreamer:
 
         # Data collection controls avoid grip/trigger inputs so starting a
         # recording cannot alter the demonstrated hand pose.
-        # X+B = start/stop-success, Y+A = discard the active take.
+        # Legacy standalone stream: X+B = start/stop-success, Y+A = discard.
         toggle_data_collection_tmp = x_pressed and b_pressed
         toggle_data_abort_tmp = y_pressed and a_pressed
 
@@ -2135,8 +2142,17 @@ class FeedbackReader:
         unpacked = msgpack.unpackb(data, raw=False)
         self.vr_pose = None
         try:
+            # g1_debug rotates positions for visualization using the target
+            # root quaternion. Recover command coordinates before using this
+            # feedback as a held/return target. Orientations are sent unchanged.
+            base_quat = np.asarray(unpacked["base_quat_target"], dtype=np.float64)
+            if base_quat.shape != (4,) or not np.all(np.isfinite(base_quat)):
+                raise ValueError("invalid feedback root quaternion")
+            command_positions = sRot.from_quat(base_quat, scalar_first=True).inv().apply(
+                np.asarray(unpacked["vr_3point_position"], dtype=np.float64).reshape(3, 3)
+            )
             self.vr_pose = validate_vr_pose(np.column_stack((
-                np.asarray(unpacked["vr_3point_position"]).reshape(3, 3),
+                command_positions,
                 np.asarray(unpacked["vr_3point_orientation"]).reshape(3, 4),
             )))
         except (KeyError, ValueError, TypeError):
@@ -2255,7 +2271,7 @@ class PlannerStreamer:
         self.vr_arm_clutch = VRArmClutch(controller_frame=True)
         self.first_vr_pose = None
         self.held_vr_pose = self.last_vr_pose.copy()
-        print("[PlannerLoop] Pico input stale for 100 ms; holding arms and stopping locomotion. "
+        print(f"[PlannerLoop] Pico input stale for {CONTROLLER_STALE_SECONDS * 1000:g} ms; holding arms and stopping locomotion. "
               "Release both grips and center sticks, then press a grip to recalibrate that arm.")
 
 
@@ -2384,6 +2400,25 @@ class PlannerStreamer:
             to_base=True, duration_s=duration_s, goal_override=self.disconnect_idle_pose,
         )
 
+    def begin_vr_saved_arm_return(self, *, button: str, duration_s: float) -> VRPoseTransition | None:
+        """Recall a measured B/X/Y arm preset relative to the current torso target."""
+        arm_pose = {"b": B_ARM_POSE_RAD, "x": X_ARM_POSE_RAD, "y": Y_ARM_POSE_RAD}[button]
+        if self.last_vr_pose is None:
+            print(f"[PlannerLoop] Cannot recall {button.upper()} arm pose without a current VR target")
+            return None
+        joints = np.zeros(UPPER_BODY_WIDTH, dtype=np.float64)
+        joints[3:] = arm_pose.T.reshape(-1)
+        goal = self.vr_pose_from_upper_body(joints)
+        # FK above uses a neutral waist. Move the entire arm configuration into
+        # the held torso frame so B/X/Y cannot restore the capture's waist or legs.
+        held = self.last_vr_pose
+        rotation = (sRot.from_quat(held[2, 3:], scalar_first=True)
+                    * sRot.from_quat(goal[2, 3:], scalar_first=True).inv())
+        goal[:2, :3] = held[2, :3] + rotation.apply(goal[:2, :3] - goal[2, :3])
+        goal[:2, 3:] = (rotation * sRot.from_quat(goal[:2, 3:], scalar_first=True)).as_quat(scalar_first=True)
+        goal[2] = held[2]
+        return self.begin_vr_return(to_base=True, duration_s=duration_s, goal_override=goal)
+
     def send_vr_return_sample(self, transition: VRPoseTransition, now: float,
                               *, allow_locomotion=False, face_command=None) -> tuple[bool, bool]:
         pose, complete = transition.sample(now)
@@ -2455,7 +2490,7 @@ class PlannerStreamer:
                 if not controller_fresh:
                     self.hold_for_controller_loss()
                 if self.controller_input_lost:
-                    # This also interrupts a generated A/B return. Fresh packets
+                    # This also interrupts a generated A/B/X/Y return. Fresh packets
                     # alone cannot resume motion against the old calibration.
                     vr_pose_override = self.held_vr_pose
                     force_locomotion_idle = True
@@ -2645,7 +2680,7 @@ class PlannerStreamer:
                 if self.controller_tracking:
                     # SONIC caches this fallback for a publisher outage. Keep
                     # holding indefinitely, including while the SDK reconnects;
-                    # the arms-on-legs pose remains available through B only.
+                    # pose presets require an explicit face-button command.
                     base_pose = sent_vr_pose[:2].reshape(-1).tolist()
                 elif self.disconnect_idle_pose is not None:
                     # Keep the legacy wire name; the endpoint is planner idle,
@@ -2731,8 +2766,8 @@ def run_pico_manager(
     """
     Manager: publishes body and latest-only hand intent from one fixed-rate loop.
     Default VR controls: AXBY starts, grips calibrate/gate each arm and hand,
-    A opens hands and returns home, B returns arms to legs, left stick click toggles locomotion, and
-    X toggles slow speed. XB records/saves; YA discards. Other modes and
+    A opens hands and returns home, left stick click toggles locomotion, and
+    B/X/Y recall their saved arm poses. XB records/saves; YB saves failure; YA discards. Other modes and
     --legacy-vr-controls retain the SMPL/A+X navigation flow.
     """
     controller_tracking = teleop_mode == "vr3pt" and not legacy_vr_controls
@@ -2825,7 +2860,7 @@ def run_pico_manager(
     )
     print("[Manager] Calibrated VR poses pass through directly")
     if controller_tracking:
-        print("[Manager] Pico watchdog: 100 ms stale input latches arm hold; release both grips, "
+        print(f"[Manager] Pico watchdog: {CONTROLLER_STALE_SECONDS * 1000:g} ms stale input latches arm hold; release both grips, "
               "center sticks, then press a grip to recalibrate. No automatic return to legs.")
     hand_intent = HandIntentStream()
 
@@ -2851,7 +2886,7 @@ def run_pico_manager(
     if not controller_tracking:
         print(
             f"Manager controls: twice within 2s A+X=advance toward {teleop_mode.upper()} teleop, "
-            "X+B=record/save, Y+A=only discard, "
+            "X+B=record/save, Y+B=save failure, Y+A=discard, "
             f"A+B+X+Y=start policy (start-only); initial gait={initial_mode.name}"
         )
     current_mode = StreamMode.OFF
@@ -2869,8 +2904,8 @@ def run_pico_manager(
     face_chords = FaceChordTracker(singles=controller_tracking)
     if controller_tracking:
         print("[Manager] Controller controls: AXBY=start; grips=calibrate arms/enable hands; "
-              "triggers=open/close; A=open/home; B=arms to legs (walking stays live); left stick click=locomotion; "
-              "X=normal/slow; XB=record/save; YA=discard. No A+X calibration.")
+              "triggers=open/close; A=open/home; left stick click=locomotion; "
+              "B/X/Y=saved arm poses (walking stays live); XB=record/save; YB=save failure; YA=discard. No A+X calibration.")
     ax_double_press = DoublePressTracker(window_seconds=2.0)
     manager_period = 1.0 / max(target_fps, 1)
     manager_deadline = time.monotonic()
@@ -2943,9 +2978,11 @@ def run_pico_manager(
                     while reader.disconnected:
                         time.sleep(0.5)
 
-                if disconnect_hold_active:
-                    # SONIC may have returned to base during the outage. Never
-                    # replace that target with our pre-disconnect cached pose.
+                if disconnect_hold_active and not controller_tracking:
+                    # Legacy body tracking may return to base during an outage;
+                    # follow that target. Direct controllers instead keep the
+                    # exact last command in both SONIC and this manager, so a
+                    # reconnect must never replace their frozen target.
                     while True:
                         if planner_streamer.poll_fresh_feedback():
                             pose = planner_streamer.feedback_reader.vr_pose
@@ -2957,7 +2994,7 @@ def run_pico_manager(
                                 planner_streamer.held_vr_pose = planner_streamer.last_vr_pose.copy()
                                 break
                         time.sleep(0.1)
-                    if (not controller_tracking and planner_streamer.disconnect_idle_pose is not None and
+                    if (planner_streamer.disconnect_idle_pose is not None and
                             (return_started or time.monotonic() - disconnect_started_at >= 15.0)):
                         transition = planner_streamer.begin_vr_return(
                             to_base=True, duration_s=idle_base_transition_duration,
@@ -3061,10 +3098,9 @@ def run_pico_manager(
                         "to advance toward teleop"
                     )
 
-            # B+Y returns from teleoperation to base without stopping a take.
-            by_pressed = face_command == "by" and (
-                not recorder_is_recording or current_mode == StreamMode.PLANNER_VR_3PT
-            )
+            # Legacy idle navigation only. During recording Y+B exclusively
+            # saves failure and must not also start an arm/base transition.
+            by_pressed = face_command == "by" and not recorder_is_recording
 
             new_mode = current_mode
             requested_transition: StreamMode | None = None
@@ -3118,7 +3154,7 @@ def run_pico_manager(
                     neutral = max(abs(v) for v in get_controller_axes(reader)) <= JOYSTICK_DEADZONE
                     if controller_resume_allowed and neutral and max(inputs[3:]) <= 0.4:
                         new_mode = StreamMode.PLANNER_VR_3PT
-                elif current_mode == StreamMode.PLANNER_VR_3PT and face_command in {"a", "b"}:
+                elif current_mode == StreamMode.PLANNER_VR_3PT and face_command in {"a", "b", "x", "y"}:
                     requested_transition = StreamMode.PLANNER_VR_3PT
             elif current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
@@ -3181,10 +3217,8 @@ def run_pico_manager(
                 if by_pressed and not prev_by_pressed:
                     requested_transition = StreamMode.PLANNER_IDLE_BASE_POSE
 
-            recording_navigation = recorder_is_recording and (
-                (face_command == "by" and current_mode == StreamMode.PLANNER_VR_3PT)
-                or (face_command == "ax" and current_mode == StreamMode.PLANNER_IDLE_BASE_POSE)
-            )
+            recording_navigation = (recorder_is_recording and face_command == "ax"
+                                    and current_mode == StreamMode.PLANNER_IDLE_BASE_POSE)
             if recorder_is_recording and not controller_tracking and not recording_navigation and (
                 new_mode != current_mode or requested_transition is not None
             ):
@@ -3194,15 +3228,15 @@ def run_pico_manager(
                 print(
                     "[Manager] Mode change ignored while recording: "
                     f"{current_mode.name} -> {attempted_mode.name}; "
-                    "save with A+X or X+B, or discard with Y+A first"
+                    "save success with A+X or X+B, save failure with Y+B, or discard with Y+A first"
                 )
 
             if requested_transition is not None:
                 needs_planner_target = requested_transition == StreamMode.PLANNER
                 if teleop_stream_mode == StreamMode.PLANNER_VR_3PT:
-                    if controller_tracking and face_command == "b":
-                        upper_body_transition = planner_streamer.begin_vr_rest_return(
-                            duration_s=idle_base_transition_duration,
+                    if controller_tracking and face_command in {"b", "x", "y"}:
+                        upper_body_transition = planner_streamer.begin_vr_saved_arm_return(
+                            button=face_command, duration_s=idle_base_transition_duration,
                         )
                     else:
                         upper_body_transition = planner_streamer.begin_vr_return(
@@ -3268,7 +3302,7 @@ def run_pico_manager(
                         new_mode = current_mode
 
             # Keep the public source state until the final target is sent.
-            # Controller A/B returns retain live locomotion; arms use generated VR targets.
+            # Controller A/B/X/Y returns retain live locomotion; arms use generated VR targets.
             transition_completed = False
             if isinstance(upper_body_transition, VRPoseTransition):
                 planner_sent, transition_completed = planner_streamer.send_vr_return_sample(
@@ -3362,7 +3396,8 @@ def run_pico_manager(
             )
             toggle_dc_requested = face_command == "xb"
             toggle_dc = recording_action in {"start", "save"}
-            toggle_da = recording_action == "discard" or safe_idle_abort_requested
+            toggle_da = recording_action == "discard"
+            toggle_df = recording_action == "failure" or safe_idle_abort_requested
             if toggle_dc_requested and not toggle_dc:
                 print(
                     "[Manager] Recorder start rejected: enter the active teleop mode first: "
@@ -3377,13 +3412,13 @@ def run_pico_manager(
                     f"[Manager] Recorder {gesture} -> "
                     f"{'stop/save' if was_recording else 'start'}"
                 )
-            elif toggle_da:
+            elif toggle_da or toggle_df:
                 recorder_is_recording = False
                 recorder_command_timestamp = time.time()
                 if safe_idle_abort_requested:
-                    print("[Manager] Recorder UI safe-idle -> discard")
+                    print("[Manager] Recorder UI safe-idle -> save failure")
                 else:
-                    print("[Manager] Recorder Y+A -> discard")
+                    print("[Manager] Recorder Y+B -> save failure" if toggle_df else "[Manager] Recorder Y+A -> discard")
             socket.send(
                 pack_pose_message(
                     {
@@ -3399,6 +3434,7 @@ def run_pico_manager(
                         ),
                         "toggle_data_collection": np.array([toggle_dc], dtype=bool),
                         "toggle_data_abort": np.array([toggle_da], dtype=bool),
+                        "toggle_data_failure": np.array([toggle_df], dtype=bool),
                         "publisher_monotonic_ns": np.array(
                             [time.monotonic_ns()], dtype=np.int64
                         ),

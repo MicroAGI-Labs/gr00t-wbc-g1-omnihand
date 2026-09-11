@@ -97,6 +97,36 @@ def test_missing_source_time_never_falls_back_to_receipt_time():
     assert "missing positive producer timestamp" in selection.problems[0]
 
 
+def test_recorder_can_keep_held_hand_snapshot_with_original_source_time():
+    sync = populated()
+    sync.observe("hand", {"state_age_s": .4}, 600 * MS, 990 * MS)
+    assert not sync.select(1000 * MS, hand=True, max_ages=LIMITS).ready
+    selected = sync.select(1000 * MS, hand=True, max_ages=LIMITS, allow_stale_hand=True)
+    assert selected.ready
+    assert selected.samples["hand"]["_sync_source_ns"] == 600 * MS
+    assert selected.samples["hand"]["_sync_received_ns"] == 990 * MS
+    sync.histories["camera.ego_view"].pop()
+    assert not sync.select(1000 * MS, hand=True, max_ages=LIMITS, allow_stale_hand=True).ready
+
+
+def test_allowing_stale_hands_still_requires_a_recorded_past_measurement():
+    sync = populated()
+    assert not sync.select(1000 * MS, hand=True, max_ages=LIMITS, allow_stale_hand=True).ready
+    sync.observe("hand", {}, 1020 * MS, 1030 * MS)
+    assert not sync.select(1000 * MS, hand=True, max_ages=LIMITS, allow_stale_hand=True).ready
+
+
+def test_late_hand_feedback_is_retained_for_next_rows_without_vetoing_outcome():
+    sync = populated()
+    sync.allow_stale_hand = True
+    sync.advance(1000 * MS)
+    sync.observe("hand", {}, 995 * MS, 1110 * MS)
+    assert sync.late == 1
+    assert sync.errors == []
+    assert sync.histories["hand"][-1]["_sync_source_ns"] == 995 * MS
+    assert sync.select(1000 * MS, hand=True, max_ages=LIMITS).ready
+
+
 def test_late_sample_and_out_of_order_timestamp_invalidate_episode():
     sync = populated()
     sync.advance(1000 * MS)
@@ -203,7 +233,7 @@ def test_collector_waits_then_uses_explicit_inputs_and_drains_stop(monkeypatch):
     c.latest_proprio_msg = {"value": "future live state"}
     c.current_stream_mode = 1
     rows = []
-    c._add_data_frame_sonic = lambda started, inputs: rows.append(inputs) or True
+    c._add_data_frame_sonic = lambda started, inputs, **kwargs: rows.append(inputs) or True
     now = 1099 * MS
     monkeypatch.setattr("gear_sonic.scripts.run_data_exporter.time.monotonic_ns", lambda: now)
     assert not c._add_sender_frame()
