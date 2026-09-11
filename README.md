@@ -58,9 +58,8 @@ that the task succeeded. See the handbook for required inputs and dataset meanin
 
 - [Runtime code map](README_DATA_COLLECTION.md#code-tour-and-cleanup-boundaries)
 - [Validation and hardware work](README_DATA_COLLECTION.md#validation-and-remaining-work)
-- [NVIDIA foundation and model reference](README_UPSTREAM.md)
+- [Original NVIDIA overview and model reference](README_UPSTREAM.md)
 - [Citation](CITATION.cff), [license](LICENSE), and [third-party notices](legal/)
 
-MotionBricks has been removed. SONIC training and older controller code remain
-pending dependency review; their presence does not make them part of the operator
-workflow.
+Training, MotionBricks and older controller code remain pending dependency review;
+their presence does not make them part of the operator workflow.

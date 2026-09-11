@@ -179,6 +179,7 @@ huggingface/
 *.engine
 !decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Balance.onnx
 !decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Walk.onnx
+!motionbricks/out/**/*.ckpt
 
 
 # Mujoco
