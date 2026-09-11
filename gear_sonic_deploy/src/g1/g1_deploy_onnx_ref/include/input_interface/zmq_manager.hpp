@@ -26,8 +26,10 @@
  * ## Planner Timeout
  *
  * If no planner message arrives within 1 second (PLANNER_TIMEOUT), the manager
- * automatically resets the locomotion to IDLE and clears upper-body / hand-joint
- * control flags.
+ * automatically resets locomotion to IDLE and holds the most recent arm target.
+ * After 15 seconds of holding, VR wrists return smoothly to the cached base
+ * pose over two seconds. This runs without the Python manager. Without a valid
+ * cached base target, the original hold is retained. Loss is announced once.
  *
  * ## Keyboard Shortcuts (via stdin)
  *
@@ -51,6 +53,9 @@
 #include <thread>
 #include <chrono>
 #include <mutex>
+#include <utility>
+#include <bit>
+#include <Eigen/Geometry>
 
 #include "input_interface.hpp"
 #include "input_command.hpp"
@@ -72,6 +77,7 @@
  * ZMQPackedMessageSubscriber instances for the command and planner topics.
  */
 class ZMQManager : public InputInterface {
+    friend class ZMQManagerTestPeer;
   public:
     static constexpr bool DEBUG_LOGGING = false;
 
@@ -256,7 +262,15 @@ class ZMQManager : public InputInterface {
                 if (time_since_last_planner < PLANNER_MESSAGE_TIMEOUT) {
                   // Valid planner message within timeout - use it
                   // Update upper body control state based on this message
-                  has_upper_body_control_ = latest_planner_message_.upper_body_position.has_value();
+                  if (latest_planner_message_.upper_body_position.has_value()) {
+                    has_upper_body_control_ = true;
+                    planner_timeout_hold_active_ = false;
+                  } else if (has_vr_3point_control_) {
+                    has_upper_body_control_ = false;
+                    planner_timeout_hold_active_ = false;
+                  } else if (!planner_timeout_hold_active_) {
+                    has_upper_body_control_ = false;
+                  }
 
                   // Update hand joints control state based on this message
                   has_hand_joints_ = latest_planner_message_.left_hand_joints.has_value() || 
@@ -272,10 +286,12 @@ class ZMQManager : public InputInterface {
                 std::lock_guard<std::mutex> lock(planner_mutex_);
                 latest_planner_message_.valid = false;
                 latest_planner_message_.timestamp = {};
+                pico_lost_at_.reset();
                 is_planner_ready_ = false;
                 switch_from_teleop_to_planner_ = true;
               }
               std::cout << "[ZMQManager] Cleared planner buffer" << std::endl;
+              planner_timeout_hold_active_ = false;
             }
           }
 
@@ -329,9 +345,11 @@ class ZMQManager : public InputInterface {
           std::lock_guard<std::mutex> lock(planner_mutex_);
           latest_planner_message_.valid = false;
           latest_planner_message_.timestamp = {};
+          pico_lost_at_.reset();
         }
         // Clear upper body control state
         has_upper_body_control_ = false;
+        planner_timeout_hold_active_ = false;
         
         // Clear hand joints control state
         has_hand_joints_ = false;
@@ -352,9 +370,11 @@ class ZMQManager : public InputInterface {
           std::lock_guard<std::mutex> lock(planner_mutex_);
           latest_planner_message_.valid = false;
           latest_planner_message_.timestamp = {};
+          pico_lost_at_.reset();
         }
         // Clear upper body control state
         has_upper_body_control_ = false;
+        planner_timeout_hold_active_ = false;
         
         // Clear hand joints control state
         has_hand_joints_ = false;
@@ -442,6 +462,11 @@ class ZMQManager : public InputInterface {
         return pose_interface_->GetLastUpdateTime();
       }
       return InputInterface::GetLastUpdateTime();
+    }
+
+    std::string TakeStatusAnnouncement() override {
+      std::lock_guard<std::mutex> lock(planner_mutex_);
+      return std::exchange(status_announcement_, {});
     }
 
   private:
@@ -576,16 +601,30 @@ class ZMQManager : public InputInterface {
 
       // Apply planner commands if planner is ready
       if (planner_state.enabled && planner_state.initialized) {
-        std::lock_guard<std::mutex> lock(planner_mutex_);
+        bool planner_timed_out = false;
+        std::chrono::milliseconds planner_timeout_age{0};
+        std::unique_lock<std::mutex> lock(planner_mutex_);
         
         // Check for planner timeout (1 second)
         constexpr auto PLANNER_TIMEOUT = std::chrono::milliseconds(1000);
         auto time_since_last_planner = std::chrono::steady_clock::now() - latest_planner_message_.timestamp;
         
         if (latest_planner_message_.valid) {
+          if (pico_lost_at_) {
+            status_announcement_ = "Pico connection restored. Arms held.";
+            pico_lost_at_.reset();
+          }
           // Valid planner message within timeout - use it
           // Update upper body control state based on this message
-          has_upper_body_control_ = latest_planner_message_.upper_body_position.has_value();
+          if (latest_planner_message_.upper_body_position.has_value()) {
+            has_upper_body_control_ = true;
+            planner_timeout_hold_active_ = false;
+          } else if (has_vr_3point_control_) {
+            has_upper_body_control_ = false;
+            planner_timeout_hold_active_ = false;
+          } else if (!planner_timeout_hold_active_) {
+            has_upper_body_control_ = false;
+          }
 
           // Update hand joints control state based on this message
           has_hand_joints_ = latest_planner_message_.left_hand_joints.has_value() || 
@@ -621,9 +660,9 @@ class ZMQManager : public InputInterface {
           latest_planner_message_.valid = false;
 
         } else if (!latest_planner_message_.valid && time_since_last_planner >= PLANNER_TIMEOUT) {
-          // Planner timeout - reset to IDLE and clear buffer
-          has_upper_body_control_ = false;
-
+          // Stop locomotion immediately. Arm ownership is latched below after
+          // releasing planner_mutex_, so taking current_motion_mutex cannot
+          // invert the lock order used by the planner/control loop.
           has_hand_joints_ = false;
 
           auto current_facing = movement_state_buffer.GetDataWithTime().data->facing_direction;
@@ -637,17 +676,34 @@ class ZMQManager : public InputInterface {
           movement_state_buffer.SetData(idle_state);
           
           if (latest_planner_message_.timestamp != std::chrono::steady_clock::time_point{}) {
-            std::cout << "[ZMQManager] Planner timeout (" 
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(time_since_last_planner).count()
-                      << "ms) - reset to IDLE and cleared buffer" << std::endl;
-
+            planner_timed_out = true;
+            planner_timeout_age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                time_since_last_planner);
             // Clear planner buffer to avoid using stale data
             latest_planner_message_.valid = false;
             latest_planner_message_.timestamp = {};
           }
           
         }
+
+        if (planner_timed_out) {
+          pico_lost_at_ = std::chrono::steady_clock::now();
+          status_announcement_ = "Pico connection lost. Holding position.";
+          return_announced_ = false;
+          timeout_vr_position_ = GetVR3PointPosition().second;
+          timeout_vr_orientation_ = GetVR3PointOrientation().second;
+          lock.unlock();
+          const bool arms_held = latchPlannerTimeoutArmHold(
+              current_motion, current_frame, current_motion_mutex);
+          std::cout << "[ZMQManager] Planner timeout (" << planner_timeout_age.count()
+                    << "ms) - locomotion IDLE; "
+                    << (arms_held ? "holding last arm target"
+                                  : "no arm target available")
+                    << std::endl;
+        }
       }
+
+      advancePicoDisconnectReturn(std::chrono::steady_clock::now());
 
       if (has_vr_3point_control_ && !last_has_vr_3point_control_) {
         std::cout << "[ZMQManager] VR 3-point control enabled" << std::endl;
@@ -1212,14 +1268,150 @@ class ZMQManager : public InputInterface {
         has_vr_3point_control_ = false;
       }
 
+      // Cache resting planner wrists before input can disappear. vr_base_pose
+      // is the legacy wire name; the publisher supplies the final idle pose.
+      // Reject malformed fallback data without replacing the previous target.
+      std::optional<std::array<double, 14>> base_pose;
+      for (size_t i = 0; i < hdr.fields.size(); ++i) {
+        const auto& field = hdr.fields[i];
+        constexpr size_t count = 14;
+        if (field.name != "vr_base_pose" || field.shape != std::vector<size_t>{count}) continue;
+        const size_t width = field.dtype == "f32" ? 4 : field.dtype == "f64" ? 8 : 0;
+        if (!width || i >= bufs.size() || bufs[i].size != count * width) continue;
+        std::array<double, 14> candidate{};
+        bool valid = true;
+        for (size_t j = 0; j < count; ++j) {
+          const auto* data = static_cast<const uint8_t*>(bufs[i].data) + j * width;
+          if (width == 4) {
+            float value;
+            std::memcpy(&value, data, 4);
+            candidate[j] = needs_swap ? byte_swap(value) : value;
+          } else {
+            double value;
+            std::memcpy(&value, data, 8);
+            candidate[j] = needs_swap ? byte_swap(value) : value;
+          }
+          // Keep validation effective in the deployment's -ffast-math build.
+          valid &= (std::bit_cast<uint64_t>(candidate[j]) & 0x7ff0000000000000ULL) != 0x7ff0000000000000ULL;
+        }
+        for (size_t offset : {size_t{3}, size_t{10}}) {
+          double norm = 0;
+          for (size_t j = 0; j < 4; ++j) norm += candidate[offset + j] * candidate[offset + j];
+          valid &= norm > 1e-12 && (std::bit_cast<uint64_t>(norm) & 0x7ff0000000000000ULL) != 0x7ff0000000000000ULL;
+          if (norm > 1e-12) {
+            for (size_t j = 0; j < 4; ++j) candidate[offset + j] /= std::sqrt(norm);
+          }
+        }
+        if (valid) base_pose = candidate;
+      }
+
       // Update buffer directly (no queue) and set timestamp
       std::lock_guard<std::mutex> lock(planner_mutex_);
+      if (base_pose) vr_base_pose_ = base_pose;
       latest_planner_message_ = msg;
       latest_planner_message_.timestamp = std::chrono::steady_clock::now();
     }
     
 
   private:
+    void advancePicoDisconnectReturn(std::chrono::steady_clock::time_point now) {
+      std::lock_guard<std::mutex> lock(planner_mutex_);
+      if (!pico_lost_at_ || !has_vr_3point_control_ || !vr_base_pose_) return;
+      const double elapsed = std::chrono::duration<double>(now - *pico_lost_at_).count();
+      if (elapsed <= 15.0) return;
+      if (!return_announced_) {
+        status_announcement_ = "Pico still disconnected. Returning arms to rest on legs.";
+        std::cout << "[ZMQManager] Pico lost for 15s; returning arms to resting pose" << std::endl;
+        return_announced_ = true;
+      }
+      // Legacy body tracking returns over five seconds. Direct-controller
+      // packets cache the held pose itself, so an outage keeps both arms held.
+      constexpr double duration = 5.0;
+      const double u = std::clamp((elapsed - 15.0) / duration, 0.0, 1.0);
+      const double blend = u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
+      auto position = timeout_vr_position_;
+      auto orientation = timeout_vr_orientation_;
+      for (size_t side = 0; side < 2; ++side) {
+        for (size_t axis = 0; axis < 3; ++axis) {
+          position[3 * side + axis] += blend *
+              ((*vr_base_pose_)[7 * side + axis] - position[3 * side + axis]);
+          if (u >= 1.0) position[3 * side + axis] = (*vr_base_pose_)[7 * side + axis];
+        }
+        const size_t q = 4 * side, b = 7 * side + 3;
+        Eigen::Quaterniond start(orientation[q], orientation[q+1], orientation[q+2], orientation[q+3]);
+        Eigen::Quaterniond end((*vr_base_pose_)[b], (*vr_base_pose_)[b+1], (*vr_base_pose_)[b+2], (*vr_base_pose_)[b+3]);
+        const auto value = start.normalized().slerp(blend, end);
+        orientation[q] = value.w(); orientation[q+1] = value.x();
+        orientation[q+2] = value.y(); orientation[q+3] = value.z();
+      }
+      vr_3point_position_.SetData(position);
+      vr_3point_orientation_.SetData(orientation);
+      pose_interface_->SetVR3PointPosition(position);
+      pose_interface_->SetVR3PointOrientation(orientation);
+    }
+
+    /// Keep arm ownership on a planner publisher failure instead of snapping to
+    /// the planner motion's resting arms. Existing explicit targets are retained;
+    /// VR control retains its Cartesian targets and encoder mode. The planner
+    /// motion's joint reference is not the arm command produced by VR control.
+    bool latchPlannerTimeoutArmHold(
+        const std::shared_ptr<const MotionSequence>& current_motion,
+        int current_frame,
+        std::mutex& current_motion_mutex) {
+      if (has_vr_3point_control_) {
+        // Locomotion has already been stopped by handlePlannerInput. Keep the
+        // same VR controller and target through the entire publisher outage;
+        // switching to planner joints here makes the arms drop on disconnect.
+        return true;
+      }
+      std::array<double, 17> held_position{};
+      bool have_target = has_upper_body_control_;
+
+      if (have_target) {
+        auto buffered = upper_body_joint_positions_.GetDataWithTime();
+        if (buffered.data) {
+          held_position = *buffered.data;
+        } else {
+          have_target = false;
+        }
+      }
+
+      if (!have_target) {
+        std::lock_guard<std::mutex> motion_lock(current_motion_mutex);
+        if (current_motion && current_frame >= 0 &&
+            current_frame < current_motion->timesteps &&
+            current_motion->GetNumJoints() >= G1_NUM_MOTOR) {
+          const double* planner_target = current_motion->JointPositions(current_frame);
+          for (std::size_t i = 0;
+               i < upper_body_joint_isaaclab_order_in_isaaclab_index.size(); ++i) {
+            held_position[i] =
+                planner_target[upper_body_joint_isaaclab_order_in_isaaclab_index[i]];
+          }
+          have_target = true;
+        }
+      }
+
+      has_vr_3point_control_ = false;
+      planner_timeout_hold_active_ = have_target;
+      has_upper_body_control_ = have_target;
+      if (!have_target) {
+        std::cerr << "[ZMQManager] WARNING: No arm target available for planner "
+                     "timeout hold" << std::endl;
+        return false;
+      }
+
+      std::array<double, 17> zero_velocity{};
+      std::array<bool, 17> arms_only_mask{};
+      arms_only_mask.fill(true);
+      arms_only_mask[0] = false;
+      arms_only_mask[1] = false;
+      arms_only_mask[2] = false;
+      upper_body_joint_positions_.SetData(held_position);
+      upper_body_joint_velocities_.SetData(zero_velocity);
+      upper_body_joint_mask_.SetData(arms_only_mask);
+      return true;
+    }
+
     // ------------------------------------------------------------------
     // Configuration (set once in constructor)
     // ------------------------------------------------------------------
@@ -1270,6 +1462,15 @@ class ZMQManager : public InputInterface {
     /// Tracks the previous frame's VR-3-point state to detect enable/disable transitions
     /// and automatically toggle encoder mode accordingly.
     bool last_has_vr_3point_control_ = false;
+    /// Arm hold installed after planner-message timeout. Only an explicit
+    /// upper-body target releases it; ordinary locomotion heartbeats do not.
+    bool planner_timeout_hold_active_ = false;
+    std::optional<std::chrono::steady_clock::time_point> pico_lost_at_;
+    std::optional<std::array<double, 14>> vr_base_pose_;
+    std::array<double, 9> timeout_vr_position_{};
+    std::array<double, 12> timeout_vr_orientation_{};
+    bool return_announced_ = false;
+    std::string status_announcement_;
 };
 
 #endif // ZMQ_MANAGER_HPP

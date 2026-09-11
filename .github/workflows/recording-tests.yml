@@ -24,6 +24,8 @@ jobs:
       GIT_LFS_SKIP_SMUDGE: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Download robot meshes used by FK and dataset tests
+        run: git lfs pull --include="gear_sonic/data/robot_model/model_data/g1/meshes/*" --exclude=""
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
@@ -33,16 +35,7 @@ jobs:
         run: |
           python -m pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e 'gear_sonic[data_collection]' pytest
-      - name: Test recording without robot or camera hardware
+      - name: Test teleop and recording without hardware
         run: |
-          python -m pytest -q \
-            gear_sonic/tests/test_camera_buffering.py \
-            gear_sonic/tests/test_causal_sync.py \
-            gear_sonic/tests/test_episode_finalizer.py \
-            gear_sonic/tests/test_exporter.py \
-            gear_sonic/tests/test_hub_uploader.py \
-            gear_sonic/tests/test_pico_recording_controls.py \
-            gear_sonic/tests/test_recording_pipeline.py \
-            gear_sonic/tests/test_video_writer.py \
-            gear_sonic/tests/test_zed_camera.py \
-            gear_sonic/end_effectors/tests/test_end_effectors.py
+          python -m pytest -q gear_sonic/tests gear_sonic/end_effectors/tests \
+            --ignore=gear_sonic/end_effectors/tests/test_omnihand_mujoco.py

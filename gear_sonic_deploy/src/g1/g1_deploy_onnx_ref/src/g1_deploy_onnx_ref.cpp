@@ -45,6 +45,8 @@
  *   --planner-fp16        | Use FP16 for planner TensorRT engine
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
+
+#include <sstream>
 #include <cmath>
 #include <cuda_runtime_api.h>
 #include <memory>
@@ -254,9 +256,9 @@ class G1Deploy {
     bool report_temperature_ = false;
     std::string pending_tts_;  // One-shot TTS message, consumed by GatherInputInterfaceData()
 
-    // Per-motor high temperature hysteresis (enter at >= 90, exit at < 85)
+    // Per-motor high temperature hysteresis (enter at >= 110, exit at < 85)
     std::array<bool, G1_NUM_MOTOR> motor_high_temp_ = {};
-    static constexpr int16_t HIGH_TEMP_ENTER = 90;
+    static constexpr int16_t HIGH_TEMP_ENTER = 110;
     static constexpr int16_t HIGH_TEMP_EXIT = 85;
     bool high_temp_warning_ = false;
     std::string high_temp_message_;
@@ -2435,6 +2437,16 @@ class G1Deploy {
 
       // Prepare robot configuration for data collection (after all initialization is complete)
       std::map<std::string, std::variant<std::string, int, double, bool>> robot_config;
+      const auto array_to_json = [](const auto& values) {
+        std::ostringstream stream;
+        stream << "[";
+        for (size_t index = 0; index < values.size(); ++index) {
+          if (index != 0) stream << ",";
+          stream << values[index];
+        }
+        stream << "]";
+        return stream.str();
+      };
       robot_config["model_path"] = model_path;
       robot_config["reference_motion_path"] = motion_data_path;
       robot_config["planner_path"] = planner_path.empty() ? "none" : planner_path;
@@ -2446,6 +2458,12 @@ class G1Deploy {
       robot_config["hand_control"] = hand_control_mode_;
       robot_config["policy_fp16"] = policy_fp16;
       robot_config["planner_fp16"] = planner_fp16;
+      // The config transport intentionally supports scalar values only. JSON
+      // strings preserve the exact arrays without widening the wire variant.
+      robot_config["g1_action_scale_json"] = array_to_json(g1_action_scale);
+      robot_config["default_angles_json"] = array_to_json(default_angles);
+      robot_config["isaaclab_to_mujoco_json"] = array_to_json(isaaclab_to_mujoco);
+      robot_config["mujoco_to_isaaclab_json"] = array_to_json(mujoco_to_isaaclab);
 
       // Initialize state logger with complete robot configuration
       try {
@@ -2862,7 +2880,7 @@ class G1Deploy {
         // Extract estimated torque in hardware order
         motor_torque[i] = static_cast<double>(unitree_joint_state[i].tau_est());
 
-        // High temperature hysteresis check (enter >= 90, exit < 85)
+        // High temperature hysteresis check (enter >= 110, exit < 85)
         int16_t max_temp = std::max(unitree_joint_state[i].temperature()[0],
                                     unitree_joint_state[i].temperature()[1]);
         if (motor_high_temp_[i]) {
@@ -3008,6 +3026,11 @@ class G1Deploy {
       auto low_state_data = low_state_buffer_.GetDataWithTime();
       bool low_state_late = (std::chrono::steady_clock::now() - low_state_data.timestamp) > LOW_STATE_LATE_THRESHOLD;
 
+      auto input_announcement = input_interface_->TakeStatusAnnouncement();
+      if (!input_announcement.empty()) {
+        if (!pending_tts_.empty()) pending_tts_ += ". ";
+        pending_tts_ += input_announcement;
+      }
       audio_thread_->SetCommand(
         AudioCommand{
           .streaming_data_absent = streaming_data_absent_debouncer_.state(),

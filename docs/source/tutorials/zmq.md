@@ -129,7 +129,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager
 
 1. **Calibration pose**: Stand upright, feet together, upper arms at your sides, forearms bent 90° forward (L-shape at each elbow), palms facing inward.
 2. On the PICO controllers, press **A + B + X + Y** simultaneously to initialize and calibrate the body tracking.
-3. Press and release **A + X** twice within two seconds on the PICO controllers to start streaming poses.
+3. Press **A + X** on the PICO controllers to start streaming poses.
 4. In Terminal 2 (C++ deployment), press **`]`** to start the control system.
 5. In the MuJoCo window (sim only), press **`9`** to drop the robot to the ground.
 6. Back in Terminal 2, press **`ENTER`** to enable ZMQ streaming. The terminal prints `ZMQ STREAMING MODE: ENABLED`. The robot begins tracking your PICO poses in real time.
@@ -149,11 +149,11 @@ In `--input-type zmq` mode, the C++ deployment side does **not** process PICO co
 
 | PICO Button | Effect |
 |-------------|--------|
-| **A + B + X + Y** | Calibrate body tracking in the streamer. Press once to initialize; press again to stop streaming (emergency stop on the streamer side). |
-| **A + X** | When not recording, two press-and-release gestures within two seconds toggle Pose mode in the streamer. During recording, one gesture saves the take and keeps the current mode. |
+| **A + B + X + Y** | Initialize the manager streamer and calibrate body tracking from OFF. The gesture is ignored after startup and cannot stop SONIC. |
+| **A + X** | Toggle Pose mode in the streamer — starts or stops publishing pose data. When stopped, the robot holds its last pose. **Works as pause/resume.** |
 | **Menu (hold)** | Pauses pose streaming in the streamer while held. The robot holds its last pose until you release. **Works as pause.** Move back close to the robot's current pose before releasing. |
 | **Trigger** | Hand grasp — processed by the streamer and sent as `left_hand_joints` / `right_hand_joints` in the stream. |
-| **B + Y** | One press-and-release toggles between Pose and frozen-upper-body Planner mode in the streamer. |
+| **B + Y** | Toggle Pose mode in the streamer (same effect as A+X) — starts or stops publishing pose data. **Works as pause/resume.** |
 
 All mode control on the deployment side is done from the keyboard:
 

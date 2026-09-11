@@ -1,5 +1,11 @@
 # PICO VR Whole-body Teleop 
 
+For the data-collection stack's default `--teleop-mode vr3pt`, use the
+[Pico controller controls](../references/pico_controller_controls.md): AXBY
+starts SONIC, middle-finger buttons calibrate/enable individual arms and hands,
+and A returns home with locomotion available. No A+X calibration is required.
+The full-body control diagrams below describe the older SMPL workflow.
+
 Full whole-body teleoperation using PICO VR headset and controllers. To teleop, use the option  `--input-type zmq_manager` during deployment. The `zmq_manager` input type switches between a **planner mode** (locomotion commands via ZMQ) and a **streamed motion mode** (full-body SMPL poses from PICO).
 
 ## SONIC Low Latency
@@ -20,7 +26,7 @@ The same `zmq_manager` workflow can also drive the headset through Isaac Teleop 
 
 ```{admonition} Safety Warning
 :class: danger
-Whole-body teleoperation involves fast, agile motions. **Always** maintain a clear safety zone and keep a safety operator at the keyboard ready to trigger an emergency stop (**`O`** in the C++ terminal, or **A+B+X+Y** on the PICO controllers).
+Whole-body teleoperation involves fast, agile motions. **Always** maintain a clear safety zone and keep a safety operator ready to stop SONIC from the UI or terminate the control process (**`O`** in the C++ terminal). **A+B+X+Y is start-only and is not an emergency stop.**
 
 You **must wear tight-fitting pants or leggings** to guarantee line-of-sight for the foot trackers — loose or baggy clothing can make tracking fail unpredictably and may result in dangerous motion.
 ```
@@ -115,9 +121,9 @@ When you turn on the visualization, wait for a window to pop up showing a Unitre
 
 1. **Assume the calibration pose** — stand upright, feet together, upper arms at your sides, forearms bent 90° forward (L-shape at each elbow), palms inward. See [Calibration Pose](#calibration-pose) for details.
 2. Press **A + B + X + Y** simultaneously to engage the control policy and run the initial full calibration (`CALIB_FULL`).
-3. Align your arms with the robot's current pose, then press and release **A + X** twice within two seconds to enter full-body SMPL teleop (**POSE** mode). Move your arms and legs — the robot follows.
-4. Repeat the two **A + X** gestures to fall back to **PLANNER** (idle) mode when not recording.
-5. Press **A + B + X + Y** again to stop the robot.
+3. Align your arms with the robot's current pose, then press **A + X** to enter full-body SMPL teleop (**POSE** mode). Move your arms and legs — the robot follows.
+4. Press **A + X** again to fall back to **PLANNER** (idle) mode.
+5. When finished, stop SONIC from the UI or terminate the control process.
 
 <figure style="margin: 1em 0;">
 <video width="100%" autoplay loop muted playsinline style="border-radius: 8px;">
@@ -157,20 +163,12 @@ The system has **4 operating modes** and **2 calibration types**.
 
 There are 4 modes and 2 control chains. Each chain forms a triangle: **A+X** (or **B+Y**) returns to POSE from *both* the planner node and its VR_3PT sub-mode.
 
-Each A+X mode transition below requires two complete press-and-release gestures;
-the second release must occur within two seconds of the first. A completed pair,
-recording activity, another completed face chord, a mode change, or a headset
-reconnect clears the pending first gesture. During recording, one A+X gesture
-saves the take instead. The four-button policy stop still acts immediately.
-
 ```text
-  ┌──────────────────────────────────────┐
-  │  A+B+X+Y (any mode) ──► OFF          │
-  └──────────────────────────────────────┘
-
   Startup:
     OFF ──(A+B+X+Y)──► PLANNER ──(A+X)──► POSE
           CALIB_FULL
+
+  A+B+X+Y has no policy-control effect after startup.
 
   Chain 1 — G1 encoder listens to planner-generated full-body motion: PLANNER
 
@@ -201,6 +199,7 @@ saves the take instead. The four-button policy stop still acts immediately.
 
 (calibration-pose)=
 
+(vr-3pt-calibration-hint)=
 ### VR_3PT Calibration Hint
 
 The `VR_3PT` mode depends on accurate calibration. Two calibration events occur:
@@ -223,12 +222,6 @@ Launch the teleop script with `--vis_vr3pt` to see the robot's reference pose in
 
 Each time you enter `VR_3PT` via **Left Stick Click**, the system re-calibrates both wrists against the robot's **current** pose. Always align your arms with the robot before clicking.
 
-The switch requires a new feedback packet containing all 29 finite measured joint
-positions. The manager discards any packet already queued and waits up to 100 ms
-for a new valid packet. If none arrives, it keeps the current mode and held targets;
-it does not calibrate from an assumed all-zero pose. Restore robot feedback, then
-release and click the left stick again to retry.
-
 Below is an example of **bad calibration practice** — transitioning into VR_3PT without aligning your arms to the robot's current pose. The robot may not jump immediately, but will exhibit erratic and dangerous motion as soon as you move.
 
 <figure style="margin: 1em 0;">
@@ -248,10 +241,10 @@ Below is an example of **bad calibration practice** — transitioning into VR_3P
 **Recovery from bad VR_3PT calibration:**
 1. Freeze the upper body — switch back via **Left Stick Click**.
 2. Re-align your arms with the robot's current (possibly distorted) pose.
-3. When not recording, switch to **POSE** mode with two **A+X** press-and-release gestures within two seconds.
+3. Switch to **POSE** mode (**A+X**) to reset.
 ```
 
-Below is the **recovery procedure** — if you accidentally enter a badly calibrated VR_3PT state, freeze the upper body (Left Stick Click back), then switch to POSE mode (two A+X gestures within two seconds, when not recording) to reset safely.
+Below is the **recovery procedure** — if you accidentally enter a badly calibrated VR_3PT state, freeze the upper body (Left Stick Click back), then switch to POSE mode (A+X) to reset safely.
 
 <figure style="margin: 1em 0;">
 <video width="100%" autoplay loop muted playsinline style="border-radius: 8px;">
@@ -264,8 +257,8 @@ Below is the **recovery procedure** — if you accidentally enter a badly calibr
 
 | Action | Button | Notes |
 |---|---|---|
-| **Start / Stop policy** | **A+B+X+Y** | First press: engage + CALIB_FULL. Again: emergency stop → OFF. |
-| **Save recording / Toggle POSE** | **A+X** | During recording, one press-and-release saves the take. Otherwise, two gestures within two seconds switch PLANNER ↔ POSE, or VR_3PT → POSE. |
+| **Start policy** | **A+B+X+Y** | From OFF: engage + CALIB_FULL. Ignored after startup. |
+| **Toggle POSE** | **A+X** | Switches between PLANNER ↔ POSE. OR from VR_3PT (entered via PLANNER) → POSE. |
 | **Toggle PLANNER_FROZEN_UPPER** | **B+Y** | Switches between POSE ↔ PLANNER_FROZEN_UPPER. OR from VR_3PT (entered via PLANNER_FROZEN_UPPER) → POSE. |
 | **Toggle VR_3PT** | **Left Stick Click** | From any Planner mode → VR_3PT (triggers CALIB). Click again to return. |
 | **Hand grasp** | **Trigger** (per hand) | Controls the corresponding hand's grasp. |
@@ -301,12 +294,53 @@ Active in **PLANNER**, **PLANNER_FROZEN_UPPER**, and **VR_3PT**:
 
 ---
 
+## Per-arm tracking buttons in VR 3-point mode
+
+Hold the **middle-finger side button** (`left_grip` / `right_grip`) to move the
+corresponding arm. Each press aligns that controller to the arm's held robot
+target and captures a fresh headset heading for that arm. Calibration happens
+once per engagement; movement follows the reference while the button stays held.
+
+Release to hold that arm's last emitted target immediately. Reposition your
+controller and press again to capture a fresh reference without a target jump.
+Both arms and hands start held on VR entry, requiring released side buttons
+before engagement. The other arm's reference is unaffected. Head motion does
+not drive the waist. Each hand holds on grip release; after engagement, release
+then press its **index trigger** to resume binary opening/closing.
+
+The default controller profile needs no A+X mode-entry sequence. Use AXBY to
+start, A for home, and fresh grip engagement after tracking loss. The older
+SMPL/A+X behavior remains selectable with `--legacy-vr-controls`.
+These clutches affect VR 3-point tracking; they do not gate full-body POSE or
+upper-body IK modes. Calibrated VR targets pass through directly.
+Holding a VR target does not lock arm joints against whole-body balancing.
+
 ## Emergency Stop
 
 | Method | Action |
 |---|---|
-| **PICO controllers** | Press **A+B+X+Y** simultaneously → OFF |
+| **Operator UI** | Stop SONIC from the policy control UI |
 | **Keyboard** (C++ terminal) | Press **`O`** for immediate stop |
+| **Process control** | Terminate the SONIC control process |
+
+In the default controller profile, valid Pico input that becomes **200 ms old**
+latches the last commanded arm targets, stops locomotion, gates hand input, and
+cancels any home/rest return. Fresh packets alone cannot resume movement: release
+both grips and center the sticks, then engage each arm to recalibrate it.
+SONIC's separate publisher watchdog holds the same arm targets if the Python
+manager stops sending. Long disconnects keep holding; **B/X/Y** explicitly
+recall their saved arm poses.
+
+The optional legacy SMPL profile retains its disconnect sequence: after a
+one-second publisher timeout, hold the wrists; after 15 seconds, return to the
+cached planner resting pose over five seconds, keeping the head target. If no
+resting pose was received, continue holding. Legacy VR recovery requires
+**A+X twice** to recalibrate, or **B+Y** to return to planner idle. Full-body POSE
+reconnect returns the manager to OFF and requires **A+B+X+Y** to start.
+
+Manual home/rest transitions use `--idle-base-transition-duration` (two seconds
+by default). These are explicit return motions; live calibrated controller
+poses are sent directly.
 
 ---
 
@@ -377,33 +411,4 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager --input-source
 Update the IP in the PICO's XRoboToolKit app to match this machine before starting the default PICO path. For Isaac Teleop, make sure the headset is connected to the in-process CloudXR runtime — see [Isaac Teleop Setup](isaac_teleop_publisher_setup.md).
 ```
 
-Follow the same start sequence: calibration pose → **A+B+X+Y** → two **A+X** press-and-release gestures within two seconds for POSE mode. See [Complete PICO Controls](#pico-controls) for all available commands.
-
-### Staged VR3PT arm alignment
-
-Select `--teleop-mode vr3pt` in `launch_data_collection.py` (or the manager
-entrypoint) to use the learned VR3PT controller with an intermediate arm pose.
-Rebuild the C++ deployment from the same revision first: this path needs the
-`upper_body_mask` support so the planner keeps control of the waist and legs.
-The default `--teleop-mode pose` retains the full-body controls above.
-
-1. Start with A+B+X+Y. The manager enters planner mode.
-2. Complete two A+X gestures within two seconds to move the arms to alignment.
-3. Align with the robot, then complete another A+X pair to calibrate from new
-   measured joints and enter VR3PT.
-4. B+Y returns to alignment; another B+Y returns the arms to the planner target.
-
-Each arm move uses a two-second interpolation with zero endpoint velocity.
-The alignment pose sets shoulder pitch to +20 degrees, elbow to -20 degrees,
-and other arm joints to zero, in the G1 joint convention. During alignment and
-transitions, joystick motion/yaw is suppressed and the hands hold measured
-positions. Each move requires a new valid feedback packet within 100 ms; returning
-to planner mode also requires a valid planner target. Failed requests keep the
-current mode and can be retried. New recordings are blocked during interpolation;
-while recording in VR3PT, A+X saves and B+Y cannot change the mode. A+B+X+Y still
-stops the policy immediately, including during a transition. Tracking loss keeps
-the existing stop/reconnect behavior and preserves the take's interruption policy.
-
-For direct manager use, `--idle-base-transition-duration SECONDS` changes the
-interpolation duration. Software tests cover the transitions; physical alignment
-and return-to-planner behavior still require validation before deployment.
+Follow the same start sequence: calibration pose → **A+B+X+Y** → **A+X** for POSE mode. See [Complete PICO Controls](#pico-controls) for all available commands.

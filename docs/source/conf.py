@@ -75,6 +75,8 @@ suppress_warnings = [
 
 # -- MyST Parser configuration -----------------------------------------------
 
+myst_heading_anchors = 4
+
 myst_enable_extensions = [
     "colon_fence",
     "deflist",

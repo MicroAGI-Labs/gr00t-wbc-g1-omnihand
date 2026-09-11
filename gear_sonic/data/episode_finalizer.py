@@ -1,8 +1,7 @@
-"""Background finalization for detached data-collection episodes."""
+"""Finalize locally owned episode buffers without initiating uploads."""
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -10,61 +9,40 @@ import pickle
 import queue
 import threading
 import time
-from typing import Any
 
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.hub_uploader import EpisodeHubUploader
-from gear_sonic.data.video_writer import VideoWriter
 
 
-@dataclass(frozen=True)
-class EpisodeFinalizationJob:
+@dataclass
+class _EpisodeFinalizationJob:
     episode_index: int
-    episode_buffer: dict[str, Any]
-    video_writers: dict[str, VideoWriter]
-    discarded: bool
-    validation: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class EpisodeFinalizationResult:
-    episode_index: int
-    discarded: bool
-    error: str | None = None
-    recovery_path: str | None = None
-
-    @property
-    def succeeded(self) -> bool:
-        return self.error is None
+    episode_buffer: dict
+    video_writers: dict
+    success: bool
+    validation: dict
+    delete: bool = False
 
 
 class EpisodeFinalizer:
-    """Serialize local episode commits without blocking the capture loop."""
+    """Finalize local episode files without blocking recorder control/status."""
 
     def __init__(
         self,
         data_exporter: Gr00tDataExporter,
-        *,
-        max_pending: int = 2,
-        writer_stop_timeout_s: float = 5.0,
         hub_uploader: EpisodeHubUploader | None = None,
+        max_pending: int = 2,
     ):
-        if max_pending <= 0:
-            raise ValueError("max_pending must be positive")
-        if writer_stop_timeout_s <= 0:
-            raise ValueError("writer_stop_timeout_s must be positive")
         self.data_exporter = data_exporter
         self.max_pending = max_pending
-        self.writer_stop_timeout_s = writer_stop_timeout_s
-        self.hub_uploader = hub_uploader
-        self._queue: queue.Queue[EpisodeFinalizationJob | None] = queue.Queue()
+        self._queue: queue.Queue[_EpisodeFinalizationJob | None] = queue.Queue()
         self._condition = threading.Condition()
-        self._outstanding = 0
+        self._pending = 0
+        self._pending_saves = 0
+        self._pending_discards = 0
         self._finalizing = False
         self._last_finalized_episode: int | None = None
         self._error: str | None = None
-        self._results: deque[EpisodeFinalizationResult] = deque()
-        self._closed = False
         self._thread = threading.Thread(
             target=self._run,
             name="episode-finalizer",
@@ -76,84 +54,74 @@ class EpisodeFinalizer:
         self,
         *,
         episode_index: int,
-        episode_buffer: dict[str, Any],
-        video_writers: dict[str, VideoWriter],
-        discarded: bool,
-        validation: dict[str, Any],
+        episode_buffer: dict,
+        video_writers: dict,
+        success: bool,
+        validation: dict,
+        delete: bool = False,
     ) -> None:
         with self._condition:
-            if self._closed:
-                raise RuntimeError("episode finalizer is closed")
-            if self._error is not None:
-                raise RuntimeError("episode finalizer has a previous failure that requires attention")
-            if self._outstanding >= self.max_pending:
-                raise RuntimeError("episode finalizer queue is at capacity")
-            self._outstanding += 1
+            self._pending += 1
+            if delete:
+                self._pending_discards += 1
+            else:
+                self._pending_saves += 1
             self._condition.notify_all()
         self._queue.put(
-            EpisodeFinalizationJob(
+            _EpisodeFinalizationJob(
                 episode_index=episode_index,
                 episode_buffer=episode_buffer,
                 video_writers=video_writers,
-                discarded=discarded,
+                success=success,
                 validation=validation,
+                delete=delete,
             )
         )
 
-    def can_accept(self) -> bool:
+    def can_record(self) -> bool:
         with self._condition:
-            return not self._closed and self._error is None and self._outstanding < self.max_pending
+            return self._error is None and self._pending < self.max_pending
 
     def status(self) -> dict[str, object]:
         with self._condition:
             return {
-                "pending": self._outstanding,
+                "pending": self._pending,
+                "pending_saves": self._pending_saves,
+                "pending_discards": self._pending_discards,
                 "finalizing": self._finalizing,
                 "last_finalized_episode": self._last_finalized_episode,
                 "error": self._error,
-                "at_capacity": self._outstanding >= self.max_pending,
+                "at_capacity": self._pending >= self.max_pending,
             }
-
-    def drain_results(self) -> list[EpisodeFinalizationResult]:
-        with self._condition:
-            results = list(self._results)
-            self._results.clear()
-            return results
 
     def wait_until_idle(self, timeout: float | None = None) -> bool:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._condition:
-            while self._outstanding:
+            while self._pending or self._finalizing:
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     return False
                 self._condition.wait(timeout=remaining)
             return True
 
-    def close(self, timeout: float = 30.0) -> None:
-        if timeout <= 0:
-            raise ValueError("finalizer close timeout must be positive")
-        if not self.wait_until_idle(timeout=timeout):
-            raise TimeoutError(f"episode finalizer did not become idle within {timeout:.1f}s")
-        with self._condition:
-            if self._closed:
-                return
-            self._closed = True
+    def close(self, timeout: float | None = None) -> None:
+        self.wait_until_idle(timeout=timeout)
         self._queue.put(None)
         self._thread.join(timeout=2.0)
-        if self._thread.is_alive():
-            raise RuntimeError("episode finalizer thread did not stop")
 
-    def _persist_failed_job(self, job: EpisodeFinalizationJob) -> Path:
-        recovery_root = Path(self.data_exporter.root) / "recovery" / f"episode_{job.episode_index:06d}"
+    def _persist_failed_job(self, job: _EpisodeFinalizationJob) -> Path:
+        """Preserve an owned episode buffer if normal finalization fails."""
+        recovery_root = Path(self.data_exporter.root) / "recovery"
         recovery_root.mkdir(parents=True, exist_ok=True)
-        recovery_path = recovery_root / "episode_buffer.pkl"
+        recovery_path = recovery_root / f"episode_{job.episode_index:06d}.pkl"
         temporary_path = recovery_path.with_suffix(".pkl.tmp")
         payload = {
             "episode_index": job.episode_index,
             "episode_buffer": job.episode_buffer,
-            "discarded": job.discarded,
+            "success": job.success,
             "validation": job.validation,
+            "video_paths": {key: str(writer.output_path) for key, writer in job.video_writers.items()
+                            if hasattr(writer, "output_path")},
         }
         with open(temporary_path, "wb") as recovery_file:
             pickle.dump(payload, recovery_file, protocol=pickle.HIGHEST_PROTOCOL)
@@ -162,14 +130,13 @@ class EpisodeFinalizer:
         os.replace(temporary_path, recovery_path)
         return recovery_path
 
-    def _stop_job_writers(self, job: EpisodeFinalizationJob) -> list[str]:
-        errors = []
-        for key, writer in job.video_writers.items():
+    @staticmethod
+    def _stop_job_writers(job: _EpisodeFinalizationJob) -> None:
+        for writer in job.video_writers.values():
             try:
-                writer.stop(timeout_s=self.writer_stop_timeout_s)
-            except Exception as exc:
-                errors.append(f"{key}: {exc}")
-        return errors
+                writer.stop()
+            except Exception:
+                pass
 
     def _run(self) -> None:
         while True:
@@ -179,55 +146,42 @@ class EpisodeFinalizer:
             with self._condition:
                 self._finalizing = True
                 self._condition.notify_all()
-            result: EpisodeFinalizationResult | None = None
             try:
-                if job.discarded:
-                    self.data_exporter.save_episode_as_discarded(
-                        job.episode_buffer,
-                        video_writers=job.video_writers,
-                        validation=job.validation,
-                    )
+                if job.delete:
+                    self.data_exporter.discard_episode(video_writers=job.video_writers)
                 else:
                     self.data_exporter.save_episode(
                         job.episode_buffer,
                         video_writers=job.video_writers,
+                        success=job.success,
                         validation=job.validation,
                     )
-                result = EpisodeFinalizationResult(
-                    episode_index=job.episode_index,
-                    discarded=job.discarded,
-                )
-                with self._condition:
-                    self._last_finalized_episode = job.episode_index
-                if self.hub_uploader is not None:
-                    self.hub_uploader.enqueue(job.episode_index)
+                if not job.delete:
+                    with self._condition:
+                        self._last_finalized_episode = job.episode_index
             except Exception as exc:
-                writer_errors = self._stop_job_writers(job)
-                try:
-                    recovery_path = self._persist_failed_job(job)
-                    recovery_value = str(recovery_path)
-                except Exception as recovery_exc:
-                    recovery_value = None
-                    writer_errors.append(f"recovery: {recovery_exc}")
-                detail = str(exc)
-                if writer_errors:
-                    detail = f"{detail}; cleanup errors: {'; '.join(writer_errors)}"
-                result = EpisodeFinalizationResult(
-                    episode_index=job.episode_index,
-                    discarded=job.discarded,
-                    error=detail[-500:],
-                    recovery_path=recovery_value,
-                )
-                print(
-                    f"[Finalizer] Episode {job.episode_index} failed: {result.error}",
-                    flush=True,
-                )
+                if job.delete:
+                    recovery_detail = "; discarded take cleanup failed; check .recording"
+                else:
+                    self._stop_job_writers(job)
+                    try:
+                        recovery_path = self._persist_failed_job(job)
+                        recovery_detail = f"; recovery saved to {recovery_path}"
+                    except Exception as recovery_exc:
+                        recovery_detail = f"; recovery also failed: {recovery_exc}"
+                error = f"{exc}{recovery_detail}"
+                print(f"[Finalizer] Episode {job.episode_index} failed: {error}")
                 with self._condition:
-                    self._error = result.error
+                    self._error = error[-500:]
             finally:
+                # Release completed buffers and encoders before waiting again.
+                deleted = job.delete
+                del job
                 with self._condition:
-                    if result is not None:
-                        self._results.append(result)
-                    self._outstanding -= 1
+                    self._pending -= 1
+                    if deleted:
+                        self._pending_discards -= 1
+                    else:
+                        self._pending_saves -= 1
                     self._finalizing = False
                     self._condition.notify_all()

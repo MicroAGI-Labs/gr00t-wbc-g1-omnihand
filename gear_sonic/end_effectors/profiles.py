@@ -141,16 +141,20 @@ DEX3 = HandProfile(
     ),
 )
 
+# Output-shaft radians for the measured Thor pair. These encoder offsets are
+# device-specific; this profile deliberately does not rewrite motor calibration.
+# Sides are from the robot's perspective: left FTBQ776H/0, right FTBWJBC1/1.
 DEX1 = HandProfile(
     "dex1.v1",
-    SideProfile(("left_gripper_motor_joint",), (-2.60,), (3.10,), (9.0,), (2.84,), (-2.36,)),
-    SideProfile(("right_gripper_motor_joint",), (-0.10,), (5.75,), (9.0,), (5.30,), (0.12,)),
+    SideProfile(("left_gripper_motor_joint",), (-0.10,), (5.75,), (9.0,), (5.30,), (0.12,)),
+    SideProfile(("right_gripper_motor_joint",), (-2.60,), (3.10,), (9.0,), (2.84,), (-2.36,)),
 )
 
 PROFILES = {profile.name: profile for profile in (DEX3, OMNIHAND_O10, DEX1)}
 
 
 def raw_hand_name(profile: HandProfile | None) -> str:
+    """Preserve existing dataset names while identifying native DEX 1 channels."""
     return "dex1" if profile is not None and profile.name == DEX1.name else "omnihand"
 
 

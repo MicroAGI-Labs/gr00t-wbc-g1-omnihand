@@ -14,7 +14,8 @@ Starts the full data collection stack in one visible tmux dashboard. With
     └───────────────────────┴───────────────────────┘
 
 The simulator and hand panes are included only when their corresponding
-options are enabled.
+options are enabled. Real-hardware runs also include a read-only camera-server
+log pane; systemd remains the owner of the camera process.
 
 Prerequisites:
     - tmux installed (sudo apt install tmux)
@@ -71,7 +72,16 @@ def _bootstrap_venv():
 
 _bootstrap_venv()
 
+# Worktrees may reuse installed environments whose editable package points to
+# another checkout. All panes must import the source selected by this launcher.
+_SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
+sys.path.insert(0, _SOURCE_ROOT)
+os.environ["PYTHONPATH"] = _SOURCE_ROOT + os.pathsep + os.environ.get("PYTHONPATH", "")
+
 import tyro  # noqa: E402
+
+from gear_sonic.utils.data_collection.hub_config import DEFAULT_TASK_PROMPT  # noqa: E402
+from gear_sonic.utils.data_collection.local_recordings import resolve_recording_destination  # noqa: E402
 
 
 def _get_local_ip() -> str:
@@ -120,33 +130,36 @@ class DataCollectionLaunchConfig:
     hand_backend: Literal["dex3", "omnihand", "dex1", "none"] = "dex3"
     """Hand owner. OmniHand uses the external controller in sim and hardware."""
 
+    sender_time_recording: bool = False
+    """Opt in to producer-time recording; requires a dataset with synchronization metadata."""
+
+    synchronization_delay: float = 0.1
+    synchronization_wait_timeout: float = 0.25
+    hand_clock_port: int = 5574
+
     hand_server_host: str | None = None
-    """Run physical DEX1 hands on a remote Orin host over SSH."""
+    """Launch DEX 1 hands on this host over SSH; omit to launch locally."""
 
     start_hand_server: bool = True
-    """Start the remote hand service from the dashboard when configured."""
+    """Start remote hands in the dashboard; disable to use an existing service."""
 
     hand_server_repo: str = "/home/unitree/gr00t-wbc-g1-omnihand"
+    """Prepared checkout on the remote hand host (SSH uses your normal user/config)."""
 
-    dex1_transition_duration: float = 1.5
-    """Seconds per DEX1 stroke; supported range is 1.35–30."""
-
-    check_only: bool = False
-    """Validate prerequisites and print commands without starting tmux."""
-
-    hand_intent_port: int = 5569
-    hand_state_port: int = 5570
-    hand_control_port: int = 5572
-    teleop_control_port: int = 5573
-
-    omnihand_close_scale: float = 0.35
-    """Fraction of the provisional O10 closed pose admitted for hardware motion."""
+    omnihand_close_scale: float = 1.0
+    """Fraction of the calibrated O10 closing range used for hardware motion."""
 
     omnihand_sim_close_scale: float = 1.0
     """Fraction of the O10 closed pose used by the Atlas MuJoCo model."""
 
-    omnihand_transition_duration: float = 1.0
-    """Seconds for either simulated or physical OmniHand to open or close."""
+    omnihand_transition_duration: float = 0.2
+    """Seconds for OmniHand to open or close; lower values respond faster."""
+
+    dex1_transition_duration: float = 1.35
+    """Seconds per DEX 1 stroke (1.35–30) for locally or SSH-launched hands."""
+
+    check_only: bool = False
+    """Check launch prerequisites and print the hand command without starting services."""
 
     omnihand_left_interface: str = "can11"
     """Serial-bound SocketCAN interface for the physical left O10."""
@@ -154,15 +167,29 @@ class DataCollectionLaunchConfig:
     omnihand_right_interface: str = "can10"
     """Serial-bound SocketCAN interface for the physical right O10."""
 
+    hand_intent_port: int = 5569
+    """Dedicated latest-only hand-intent ZMQ port."""
+
+    hand_state_port: int = 5570
+    """External-hand state port shared by the exporter and browser UI."""
+
+    hand_control_port: int = 5572
+    """Browser UI command port used to request a clean hand-worker restart."""
+
+    teleop_control_port: int = 5573
+    """Browser UI command port used to request a smooth return to idle."""
+
     # Teleop streamer options
     pico_manager: bool = True
     """Run pico_manager_thread_server with --manager flag."""
 
+    body_control_mode: Literal[
+        "vr3pt-slow-planner", "ik-upper-slow-planner", "full-smpl"
+    ] = "vr3pt-slow-planner"
+    """PICO body tracking and locomotion ownership used by data collection."""
+
     pico_input_source: str = "xrt"
     """Teleop input source for pico_manager_thread_server.py (xrt or isaac-teleop)."""
-
-    teleop_mode: Literal["pose", "vr3pt"] = "pose"
-    """VR3PT uses staged arm alignment; pose keeps the full-body controls."""
 
     pico_vis_vr3pt: bool = False
     """Enable VR 3-point visualization on the teleop streamer."""
@@ -173,21 +200,30 @@ class DataCollectionLaunchConfig:
     pico_waist_tracking: bool = False
     """Enable waist tracking on the teleop streamer."""
 
+    idle_base_transition_duration: float = 2.0
+    """Seconds for smooth arm motion into and out of the teleop alignment pose."""
+
     # Data exporter options
-    task_prompt: str = "demo"
+    task_prompt: str = DEFAULT_TASK_PROMPT
     """Language task prompt for the data exporter."""
 
-    require_hub_upload: bool = False
-    """Require browser dataset selection before recording (use with --remote-ui)."""
+    dataset_name: str | None = None
+    """Use the saved local destination by default; override to select another dataset."""
 
-    dataset_name: str = ""
-    """Dataset name for the data exporter. Leave empty to auto-generate from timestamp."""
+    root_output_dir: str | None = None
+    """Override the saved local recording directory."""
 
     data_exporter_frequency: int = 50
     """Data collection frequency (Hz) for the data exporter."""
 
-    record_wrist_cameras: bool = False
+    max_episode_duration_s: float = 240.0
+    """Discard a recording at this elapsed duration; 0 disables the limit."""
+
+    record_wrist_cameras: bool = True
     """Record wrist camera streams (left_wrist, right_wrist) in the dataset."""
+
+    record_zed_stereo: bool = True
+    """Record both ZED eyes and the same depth visualization video as the browser UI."""
 
     text_to_speech: bool = True
     """Enable voice feedback via espeak (data exporter)."""
@@ -205,11 +241,17 @@ class DataCollectionLaunchConfig:
     manage_camera_service: bool = True
     """Stop the ZED system service for simulation and start it for hardware."""
 
+    camera_server_logs: bool = True
+    """Show the systemd camera-server log in a read-only hardware pane."""
+
     sim_elastic_band: bool = False
     """Suspend the simulated robot with MuJoCo's virtual elastic band."""
 
     remote_ui: bool = False
-    """Run MuJoCo headlessly and serve a browser UI through an SSH port forward."""
+    """Serve the camera and recorder UI through an SSH port forward.
+
+    In simulation this also runs MuJoCo headlessly.
+    """
 
     remote_ui_port: int = 8080
     """Loopback-only HTTP port used by the browser UI."""
@@ -225,12 +267,20 @@ SIM_PANE = 4
 def _check_prerequisites(config: DataCollectionLaunchConfig):
     """Verify that required tools and venvs exist."""
     errors = []
+    if config.sender_time_recording:
+        if config.camera_host not in {"localhost", "127.0.0.1", "::1"}:
+            errors.append("sender-time recording currently requires the camera publisher on this host")
+        if not all(math.isfinite(v) and v > 0 for v in
+                   (config.synchronization_delay, config.synchronization_wait_timeout)):
+            errors.append("synchronization delay and wait timeout must be positive finite seconds")
+        if not 1 <= config.hand_clock_port <= 65535 or config.hand_clock_port in (
+            config.hand_intent_port, config.hand_state_port, config.hand_control_port,
+        ):
+            errors.append("hand clock port must be within 1..65535 and distinct from other hand ports")
 
     if not shutil.which("tmux"):
         errors.append("tmux is not installed. Install with: sudo apt install tmux")
 
-    if config.remote_ui and not config.sim:
-        errors.append("--remote-ui is only supported with --sim")
     if config.remote_ui_port == config.camera_port:
         errors.append("--remote-ui-port and --camera-port must be different")
     if not 1 <= config.remote_ui_port <= 65535:
@@ -240,8 +290,24 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
 
     repo_root = Path(__file__).resolve().parent.parent.parent
 
+    teleop_python = repo_root / ".venv_teleop" / "bin" / "python"
     if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
         errors.append(".venv_teleop not found. Run: bash install_scripts/install_pico.sh")
+    elif config.body_control_mode == "ik-upper-slow-planner":
+        ik_import = subprocess.run(
+            [
+                str(teleop_python),
+                "-c",
+                "import pink, qpsolvers; assert qpsolvers.available_solvers",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if ik_import.returncode != 0:
+            errors.append(
+                "Upper-body IK dependencies are missing from .venv_teleop. "
+                "Run: bash install_scripts/install_pico.sh"
+            )
 
     if not (repo_root / ".venv_data_collection" / "bin" / "activate").exists():
         errors.append(".venv_data_collection not found. Run: bash install_scripts/install_data_collection.sh")
@@ -270,31 +336,25 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
     if config.hand_server_host is not None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", config.hand_server_host):
             errors.append("--hand-server-host must be an IPv4 address or hostname")
+        if config.start_hand_server and not shutil.which("ssh"):
+            errors.append("ssh is required to launch the remote hand server")
         if config.hand_backend != "dex1" or config.sim:
             errors.append("--hand-server-host requires physical --hand-backend dex1")
-        if config.start_hand_server and not shutil.which("ssh"):
-            errors.append("ssh is required to start the remote hand server")
 
     if config.hand_backend == "dex1":
+        from gear_sonic.end_effectors.backends.dex1 import USB_PORTS
+
         if config.sim:
-            errors.append("DEX1 currently supports physical USB grippers only")
+            errors.append("DEX 1 currently supports physical USB grippers only; no DEX 1 MuJoCo scene is configured")
         if config.hand_server_host is None:
             worker = repo_root / "build/dex1/dex1_worker"
             if not os.access(worker, os.X_OK):
-                errors.append("DEX1 worker missing. Run: bash install_scripts/install_dex1.sh")
+                errors.append("DEX 1 worker missing. Run: bash install_scripts/install_dex1.sh")
+            for side, port in USB_PORTS.items():
+                if not os.access(port, os.R_OK | os.W_OK):
+                    errors.append(f"DEX 1 {side} serial adapter unavailable or inaccessible: {port}")
         if not math.isfinite(config.dex1_transition_duration) or not 1.35 <= config.dex1_transition_duration <= 30:
             errors.append("--dex1-transition-duration must be between 1.35 and 30 seconds")
-
-    hand_ports = [
-        config.hand_intent_port,
-        config.hand_state_port,
-        config.hand_control_port,
-        config.teleop_control_port,
-    ]
-    if any(not 1 <= port <= 65535 for port in hand_ports):
-        errors.append("hand and teleop control ports must be between 1 and 65535")
-    if len(set([config.camera_port, config.remote_ui_port, *hand_ports])) != 2 + len(hand_ports):
-        errors.append("camera, remote UI, hand, and teleop ZMQ ports must all be different")
 
     if not 0.0 <= config.omnihand_close_scale <= 1.0:
         errors.append("--omnihand-close-scale must be between zero and one")
@@ -302,11 +362,25 @@ def _check_prerequisites(config: DataCollectionLaunchConfig):
         errors.append("--omnihand-sim-close-scale must be between zero and one")
     if config.omnihand_transition_duration <= 0.0:
         errors.append("--omnihand-transition-duration must be positive")
+    hand_ports = {
+        "--hand-intent-port": config.hand_intent_port,
+        "--hand-state-port": config.hand_state_port,
+        "--hand-control-port": config.hand_control_port,
+        "--teleop-control-port": config.teleop_control_port,
+    }
+    for name, port in hand_ports.items():
+        if not 1 <= port <= 65535:
+            errors.append(f"{name} must be between 1 and 65535")
+    reserved_ports = [config.camera_port, config.remote_ui_port, *hand_ports.values()]
+    if len(reserved_ports) != len(set(reserved_ports)):
+        errors.append("camera, remote UI, hand, and teleop ZMQ ports must all be different")
 
     if config.pico_input_source not in {"xrt", "isaac-teleop"}:
         errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
-    if config.teleop_mode != "pose" and not config.pico_manager:
-        errors.append("--teleop-mode vr3pt requires the PICO manager")
+    if config.idle_base_transition_duration <= 0.0:
+        errors.append("--idle-base-transition-duration must be positive")
+    if not math.isfinite(config.max_episode_duration_s) or config.max_episode_duration_s < 0:
+        errors.append("--max-episode-duration-s must be finite and nonnegative")
 
     if errors:
         print("ERROR: Prerequisites not met:\n")
@@ -339,25 +413,106 @@ def _switch_camera_source(config: DataCollectionLaunchConfig) -> None:
     service = "composed_camera_server.service"
     action = "stop" if config.sim else "start"
     source = "MuJoCo" if config.sim else "ZED"
-    print(f"Switching camera source to {source} on port {config.camera_port}...")
-    result = subprocess.run(["sudo", "systemctl", action, service])
-    if result.returncode != 0:
-        raise RuntimeError(f"Could not {action} {service}")
+    currently_active = subprocess.run(
+        ["systemctl", "is-active", "--quiet", service],
+        capture_output=True,
+    ).returncode == 0
+    expected_listening = not config.sim
+    if (
+        currently_active == (action == "start")
+        and _camera_port_is_listening(config.camera_port) == expected_listening
+    ):
+        print(f"Camera source already set to {source} on port {config.camera_port}.")
+        return
+    if currently_active != (action == "start"):
+        print(f"Switching camera source to {source} on port {config.camera_port}...")
+        result = subprocess.run(["sudo", "-n", "systemctl", action, service])
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not {action} {service} without a password prompt. "
+                f"Run 'sudo systemctl {action} {service}' once, then launch again."
+            )
+    else:
+        print(f"Waiting for camera port {config.camera_port} to {'be ready' if expected_listening else 'be free'}...")
 
     deadline = time.monotonic() + (10.0 if config.sim else 60.0)
-    expected_listening = not config.sim
     while time.monotonic() < deadline:
         if _camera_port_is_listening(config.camera_port) == expected_listening:
             return
         time.sleep(0.25)
 
     state = "become free" if config.sim else "start listening"
-    raise RuntimeError(f"Camera port {config.camera_port} did not {state} after service {action}")
+    raise RuntimeError(
+        f"Camera port {config.camera_port} did not {state}. "
+        f"Check camera availability and service logs: journalctl -u {service} -n 50 --no-pager"
+    )
+
+
+def _launch_hands(config: DataCollectionLaunchConfig) -> bool:
+    return config.hand_backend in {"omnihand", "dex1"} and (
+        config.hand_server_host is None or config.start_hand_server
+    )
+
+
+def _remote_hand_ssh_args(config: DataCollectionLaunchConfig) -> list[str]:
+    args = [
+        "ssh", "-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=2", "-o", "ServerAliveCountMax=3",
+    ]
+    key = Path.home() / ".ssh" / f"id_ed25519_sonic_{config.hand_server_host}"
+    if key.is_file():
+        args += ["-i", str(key), "-o", "IdentitiesOnly=yes"]
+    return args
+
+
+def _check_remote_hand_connection(config: DataCollectionLaunchConfig) -> None:
+    """Check authentication before replacing a dashboard or starting services."""
+    if config.hand_server_host is None or not config.start_hand_server:
+        return
+    args = _remote_hand_ssh_args(config)
+    args[1] = "-T"
+    try:
+        result = subprocess.run(
+            [*args, "--", config.hand_server_host, "true"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit("Orin connection timed out; check the robot network.") from None
+    if result.returncode != 0:
+        setup = shlex.join(["bash", "tools/setup_orin_ssh.sh", config.hand_server_host])
+        raise SystemExit(
+            f"Cannot connect to hand host {config.hand_server_host} without a password.\n"
+            f"One-time pairing: {setup}\n"
+            f"SSH: {result.stderr.strip()}"
+        )
+
+
+def _remote_hand_command(config: DataCollectionLaunchConfig) -> str:
+    """Keep the remote process attached to the hand pane, including shutdown."""
+    command = (
+        f"cd {shlex.quote(config.hand_server_repo)} && "
+        # SSH_CONNECTION supplies Thor's address as seen by the hand host.
+        'exec .venv_hands/bin/python -m gear_sonic.end_effectors.server '
+        '--teleop-host "${SSH_CONNECTION%% *}" '
+        f"--intent-port {config.hand_intent_port} --state-port {config.hand_state_port} "
+        f"--control-port {config.hand_control_port} "
+        f"--dex1-transition-duration {config.dex1_transition_duration} --enable-command"
+    )
+    if config.sender_time_recording:
+        command += f" --clock-port {config.hand_clock_port}"
+    return shlex.join([
+        *_remote_hand_ssh_args(config), "--", str(config.hand_server_host), command,
+    ])
 
 
 def _hand_pane(config: DataCollectionLaunchConfig) -> int:
     """Return the OmniHand pane index for the selected launch configuration."""
     return CORE_PANE_COUNT + int(config.sim)
+
+
+def _camera_server_log_pane(config: DataCollectionLaunchConfig) -> int:
+    """Return the hardware camera log pane after optional sim/hand panes."""
+    return CORE_PANE_COUNT + int(config.sim) + int(_launch_hands(config))
 
 
 def _create_tmux_session(config: DataCollectionLaunchConfig):
@@ -385,7 +540,12 @@ def _create_tmux_session(config: DataCollectionLaunchConfig):
         check=True,
     )
 
-    pane_count = CORE_PANE_COUNT + int(config.sim) + int(_launch_hands(config))
+    pane_count = (
+        CORE_PANE_COUNT
+        + int(config.sim)
+        + int(_launch_hands(config))
+        + int(not config.sim and config.camera_server_logs)
+    )
     for _ in range(1, pane_count):
         subprocess.run(
             ["tmux", "split-window", "-d", "-t", DASHBOARD_WINDOW],
@@ -414,6 +574,9 @@ def _select_dashboard():
 def _send_to_pane(pane_index: int, cmd: str, wait: float = 1.0):
     """Send a command string to a tmux pane."""
     target = f"{DASHBOARD_WINDOW}.{pane_index}"
+    # An existing tmux server retains its old environment. Pass the source
+    # checkout explicitly even when the launcher reused an installed venv.
+    cmd = f"export PYTHONPATH={shlex.quote(_SOURCE_ROOT)} && {cmd}"
 
     subprocess.run(
         ["tmux", "send-keys", "-t", target, cmd, "C-m"],
@@ -432,13 +595,8 @@ def _check_pane_alive(pane_index: int) -> bool:
     return result.stdout.strip() != "1"
 
 
-def _launch_hands(config: DataCollectionLaunchConfig) -> bool:
-    return config.hand_backend in {"omnihand", "dex1"} and (
-        config.hand_server_host is None or config.start_hand_server
-    )
-
-
 def _hand_worker_command(config: DataCollectionLaunchConfig) -> tuple[str, str]:
+    """Return the environment and complete external-hand worker command."""
     if config.hand_backend == "dex1":
         return ".venv_data_collection", shlex.join([
             "python", "-m", "gear_sonic.end_effectors.controller", "run",
@@ -460,25 +618,11 @@ def _hand_worker_command(config: DataCollectionLaunchConfig) -> tuple[str, str]:
     ])
 
 
-def _remote_hand_command(config: DataCollectionLaunchConfig) -> str:
-    command = (
-        f"cd {shlex.quote(config.hand_server_repo)} && "
-        "exec .venv_hands/bin/python -m gear_sonic.end_effectors.server "
-        '--teleop-host "${SSH_CONNECTION%% *}" '
-        f"--intent-port {config.hand_intent_port} --state-port {config.hand_state_port} "
-        f"--control-port {config.hand_control_port} "
-        f"--dex1-transition-duration {config.dex1_transition_duration} --enable-command"
-    )
-    return shlex.join(
-        [
-            "ssh", "-tt", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=2",
-            "-o", "ServerAliveCountMax=3", "--", config.hand_server_host, command,
-        ]
-    )
-
-
 def main(config: DataCollectionLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
+    config.root_output_dir, config.dataset_name = resolve_recording_destination(
+        config.dataset_name, config.root_output_dir,
+    )
 
     _check_prerequisites(config)
     if config.check_only:
@@ -487,13 +631,12 @@ def main(config: DataCollectionLaunchConfig):
             if config.start_hand_server:
                 print(_remote_hand_command(config))
             else:
-                print(
-                    f"Using existing hand server at "
-                    f"{config.hand_server_host}:{config.hand_state_port}"
-                )
+                print(f"Using existing hand server at {config.hand_server_host}:{config.hand_state_port}")
         elif _launch_hands(config):
             print(_hand_worker_command(config)[1])
         return
+
+    _check_remote_hand_connection(config)
 
     print("=" * 60)
     print("  SONIC Data Collection Launcher")
@@ -501,26 +644,25 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Mode:            {'Simulation' if config.sim else 'Real Robot'}")
     print(f"  Task prompt:     {config.task_prompt}")
     print(f"  Dataset name:    {config.dataset_name or '(auto)'}")
+    print(f"  Local folder:    {Path(config.root_output_dir) / config.dataset_name}")
     print(f"  Deploy input:    {config.deploy_input_type}")
     print(f"  Teleop input:    {config.pico_input_source}")
+    print(f"  Body control:    {config.body_control_mode}")
     print(f"  Hand backend:    {config.hand_backend}")
+    print(f"  Hand server:     {config.hand_server_host or 'local (managed by launcher)'}")
     if config.deploy_checkpoint:
         print(f"  Checkpoint:      {config.deploy_checkpoint}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
     print(f"  DC frequency:    {config.data_exporter_frequency} Hz")
+    print(f"  Episode limit:   {config.max_episode_duration_s:g}s (0 = disabled)")
     viewer_mode = "Browser" if config.remote_ui else ("Native" if config.camera_viewer else "No")
     print(f"  Camera viewer:   {viewer_mode}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
+    print(f"  ZED eyes/depth:  {'Yes' if config.record_zed_stereo else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
     print(f"  Teleop vis:      vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print("=" * 60)
-
-    if config.hand_backend in {"omnihand", "dex1"} and not config.sim:
-        acknowledgement = input("Physical OmniHand control may move both hands. Type OMNIHAND to continue: ")
-        if acknowledgement != "OMNIHAND":
-            print("OmniHand launch cancelled; no hardware commands were enabled.")
-            return
 
     _kill_existing_session()
     _switch_camera_source(config)
@@ -541,7 +683,7 @@ def main(config: DataCollectionLaunchConfig):
             sim_cmd += " --no-enable-onscreen --stream-camera third_person"
         if not config.sim_elastic_band:
             sim_cmd += " --no-enable-elastic-band"
-        if config.hand_backend in {"omnihand", "dex1"}:
+        if config.hand_backend == "omnihand":
             sim_cmd += " --external-hand-control"
         print(f"Starting MuJoCo simulator (pane {SIM_PANE})...")
         _send_to_pane(SIM_PANE, sim_cmd, wait=3.0)
@@ -551,6 +693,7 @@ def main(config: DataCollectionLaunchConfig):
     deploy_cmd = (
         f"cd {repo_root / 'gear_sonic_deploy'} && "
         f"./deploy.sh "
+        f"--yes "
         f"--input-type {config.deploy_input_type} "
         f"--zmq-host {config.deploy_zmq_host} "
     )
@@ -580,12 +723,27 @@ def main(config: DataCollectionLaunchConfig):
         print("WARNING: C++ deploy pane may have failed to start.")
 
     # --- Pane 1 (top-right): Teleop Streamer ---
+    pico_teleop_mode = {
+        "vr3pt-slow-planner": "vr3pt",
+        "ik-upper-slow-planner": "ik-upper",
+        "full-smpl": "pose",
+    }[config.body_control_mode]
+    required_stream_mode = {
+        "vr3pt-slow-planner": 5,
+        "ik-upper-slow-planner": 6,
+        "full-smpl": 1,
+    }[config.body_control_mode]
     pico_process_cmd = (
         "python gear_sonic/scripts/pico_manager_thread_server.py "
-        f"--input-source {config.pico_input_source}"
+        f"--input-source {config.pico_input_source} "
+        f"--hand-intent-port {config.hand_intent_port} "
+        f"--teleop-control-port {config.teleop_control_port} "
+        f"--teleop-mode {pico_teleop_mode} "
+        f"--idle-base-transition-duration {config.idle_base_transition_duration} "
+        "--initial-locomotion-mode slow_walk"
     )
     if config.pico_manager:
-        pico_process_cmd += f" --manager --teleop-mode {config.teleop_mode}"
+        pico_process_cmd += " --manager"
     if config.pico_vis_vr3pt:
         pico_process_cmd += " --vis_vr3pt"
     if config.pico_vis_smpl:
@@ -611,20 +769,33 @@ def main(config: DataCollectionLaunchConfig):
     print("Starting teleop streamer (pane 1)...")
     _send_to_pane(1, pico_cmd, wait=2.0)
 
-    # --- Dedicated hand controller pane (OmniHand only) ---
+    # --- Dedicated hand controller pane, local or SSH. ---
     if _launch_hands(config):
         hand_pane = _hand_pane(config)
         if config.hand_server_host is not None:
             hand_cmd = _remote_hand_command(config)
         else:
             hand_venv, hand_worker_cmd = _hand_worker_command(config)
+            # The supervisor owns the restart command outside the native SDK
+            # process, so the UI can recover even if a vendor call is wedged.
             hand_cmd = (
                 f"cd {repo_root} && source {hand_venv}/bin/activate && "
                 "python -m gear_sonic.end_effectors.supervisor "
-                f"--control-endpoint tcp://localhost:{config.hand_control_port} -- {hand_worker_cmd}"
+                f"--control-endpoint tcp://localhost:{config.hand_control_port} -- "
+                f"{hand_worker_cmd}"
             )
         print(f"Starting {config.hand_backend} controller (pane {hand_pane})...")
         _send_to_pane(hand_pane, hand_cmd)
+
+    # --- Read-only system camera service log (hardware only) ---
+    if not config.sim and config.camera_server_logs:
+        camera_log_pane = _camera_server_log_pane(config)
+        camera_log_cmd = (
+            "journalctl -u composed_camera_server.service "
+            "--follow --lines 100 --no-pager"
+        )
+        print(f"Following camera server logs (pane {camera_log_pane})...")
+        _send_to_pane(camera_log_pane, camera_log_cmd)
 
     # --- Pane 3 (middle-right): Native or browser camera viewer ---
     if config.remote_ui:
@@ -634,10 +805,14 @@ def main(config: DataCollectionLaunchConfig):
             f"python gear_sonic/scripts/run_camera_web_viewer.py "
             f"--camera-host {config.camera_host} "
             f"--camera-port {config.camera_port} "
-            f"--http-port {config.remote_ui_port}"
+            f"--http-port {config.remote_ui_port} "
+            f"--hand-state-port {config.hand_state_port} "
+            f"--hand-state-host {shlex.quote(config.hand_server_host or 'localhost')} "
+            f"--hand-control-port {config.hand_control_port} "
+            f"--teleop-control-port {config.teleop_control_port}"
         )
         if config.hand_backend in {"omnihand", "dex1"}:
-            viewer_cmd += " --hand-controls"
+            viewer_cmd += " --enable-hand-controls"
         print(f"Starting browser viewer on loopback port {config.remote_ui_port} (pane 3)...")
         _send_to_pane(3, viewer_cmd, wait=2.0)
     elif config.camera_viewer:
@@ -658,22 +833,31 @@ def main(config: DataCollectionLaunchConfig):
         f"python gear_sonic/scripts/run_data_exporter.py "
         f"--task-prompt '{config.task_prompt}' "
         f"--data-collection-frequency {config.data_exporter_frequency} "
+        f"--max-episode-duration-s {config.max_episode_duration_s} "
+        f"--required-stream-mode {required_stream_mode} "
         f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"--camera-port {config.camera_port} "
+        f"--hand-state-port {config.hand_state_port} "
+        f"--hand-state-host {shlex.quote(config.hand_server_host or 'localhost')}"
     )
+    if config.sender_time_recording:
+        exporter_cmd += (
+            f" --sender-time-recording --synchronization-delay {config.synchronization_delay}"
+            f" --synchronization-wait-timeout {config.synchronization_wait_timeout}"
+            f" --hand-clock-port {config.hand_clock_port}"
+        )
     if config.dataset_name:
-        exporter_cmd += f" --dataset-name '{config.dataset_name}'"
-    if config.record_wrist_cameras:
-        exporter_cmd += " --record-wrist-cameras"
-    if config.require_hub_upload:
-        exporter_cmd += " --require-hub-upload"
+        exporter_cmd += f" --dataset-name {shlex.quote(config.dataset_name)}"
+    exporter_cmd += f" --root-output-dir {shlex.quote(config.root_output_dir)}"
+    exporter_cmd += " --record-wrist-cameras" if config.record_wrist_cameras else " --no-record-wrist-cameras"
+    exporter_cmd += " --record-zed-stereo" if config.record_zed_stereo else " --no-record-zed-stereo"
     if not config.text_to_speech:
         exporter_cmd += " --no-text-to-speech"
 
     print("Starting data exporter (pane 2)...")
     _send_to_pane(2, exporter_cmd, wait=1.0)
 
-    # Focus deploy, which may be waiting for confirmation or a sudo password.
+    # Focus deploy for live controller diagnostics.
     _select_dashboard()
 
     print()
@@ -698,9 +882,15 @@ def main(config: DataCollectionLaunchConfig):
         print(f"    Pane {SIM_PANE}: MuJoCo Simulator")
     if _launch_hands(config):
         print(f"    Pane {_hand_pane(config)}: {config.hand_backend} controller")
+    elif config.hand_server_host is not None:
+        print(f"    Hands: existing service on {config.hand_server_host}")
+    if not config.sim and config.camera_server_logs:
+        print(
+            f"    Pane {_camera_server_log_pane(config)}: "
+            "Camera server logs (read-only)"
+        )
     print()
-    print("  ** deploy.sh (pane 0) is waiting for confirmation —")
-    print("     click on pane 0 and press Enter to proceed **")
+    print("  deploy.sh was started with non-interactive confirmation.")
     print()
     print("  Controls:")
     print("    Ctrl+b, arrow keys  - Switch between panes")

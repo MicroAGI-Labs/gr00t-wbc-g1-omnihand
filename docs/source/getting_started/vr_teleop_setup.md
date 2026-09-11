@@ -103,7 +103,7 @@ bash install_scripts/install_pico.sh
 ```
 
 This creates a `.venv_teleop` virtual environment (Python 3.10) that includes:
-- `teleop` extra (ZMQ, Pinocchio, PyVista)
+- `teleop` extra (ZMQ, Pinocchio, Pink/qpsolvers arm IK, PyVista)
 - `sim` extra (MuJoCo, tyro)
 - XRoboToolkit SDK
 - Unitree SDK2 Python bindings

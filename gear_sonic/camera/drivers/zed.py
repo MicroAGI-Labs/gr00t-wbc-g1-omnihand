@@ -4,13 +4,13 @@ The ZED SDK and its Python API are system dependencies and are intentionally
 loaded lazily. Install the SDK on the camera host, then install ``pyzed`` into
 the camera virtual environment with ``/usr/local/zed/get_python_api.py``.
 
-This integration exposes one selected rectified RGB image. Depth needs
-its own lossless wire format and is deliberately kept out of the JPEG pipeline.
+This integration exposes both rectified RGB eyes, the SDK-rendered depth view,
+and a float32 depth map.
 """
 
 from dataclasses import dataclass
 import time
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 
@@ -41,7 +41,8 @@ class ZEDConfig:
     image_dim: tuple[int, int] = (640, 480)
     camera_resolution: str = "HD720"
     camera_fps: int = 60
-    view: Literal["left", "right"] = "left"
+    rotate_180: bool = False
+    record_depth: bool = True
 
     def __post_init__(self):
         if len(self.image_dim) != 2 or min(self.image_dim) <= 0:
@@ -50,12 +51,10 @@ class ZEDConfig:
             raise ValueError("camera_resolution must not be empty")
         if self.camera_fps <= 0:
             raise ValueError(f"camera_fps must be positive, got {self.camera_fps}")
-        if self.view not in {"left", "right"}:
-            raise ValueError(f"view must be left or right, got {self.view!r}")
 
 
 class ZEDSensor(Sensor):
-    """Selected rectified RGB stream from a Stereolabs ZED camera."""
+    """Rectified right-RGB stream from a Stereolabs ZED camera."""
 
     def __init__(
         self,
@@ -79,7 +78,8 @@ class ZEDSensor(Sensor):
         init_params = self._sl.InitParameters()
         init_params.camera_resolution = camera_resolution
         init_params.camera_fps = self.config.camera_fps
-        init_params.depth_mode = self._sl.DEPTH_MODE.NONE
+        depth_name = "PERFORMANCE" if self.config.record_depth else "NONE"
+        init_params.depth_mode = getattr(self._sl.DEPTH_MODE, depth_name)
 
         if device_id is not None:
             try:
@@ -96,8 +96,11 @@ class ZEDSensor(Sensor):
 
         try:
             self._runtime_params = self._sl.RuntimeParameters()
-            self._runtime_params.enable_depth = False
-            self._image = self._sl.Mat()
+            self._runtime_params.enable_depth = self.config.record_depth
+            self._left_image = self._sl.Mat()
+            self._right_image = self._sl.Mat()
+            self._depth = self._sl.Mat() if self.config.record_depth else None
+            self._depth_view = self._sl.Mat() if self.config.record_depth else None
             self._output_resolution = self._sl.Resolution(*self.config.image_dim)
             self._print_camera_info()
         except Exception:
@@ -121,7 +124,7 @@ class ZEDSensor(Sensor):
             )
 
     def read(self) -> dict[str, Any] | None:
-        if self._camera is None or self._image is None:
+        if self._camera is None or self._left_image is None or self._right_image is None:
             return None
 
         grab_status = self._camera.grab(self._runtime_params)
@@ -129,36 +132,73 @@ class ZEDSensor(Sensor):
             print(f"[{self.mount_position}] ZED grab failed: {grab_status}")
             return None
 
-        # Timestamp the successful blocking grab with both host clocks. The
-        # monotonic value remains valid if NTP adjusts CLOCK_REALTIME later.
+        # A successful blocking grab means a new frame is available now.  Use
+        # host clocks at that boundary rather than the ZED IMAGE timestamp:
+        # the SDK's epoch mapping is established when the camera opens and can
+        # retain an old offset if CLOCK_REALTIME is stepped by NTP afterwards.
         capture_time = time.time()
-        capture_monotonic_ns = time.monotonic_ns()
+        sample_monotonic_ns = time.monotonic_ns()
 
-        retrieve_status = self._camera.retrieve_image(
-            self._image,
-            getattr(self._sl.VIEW, self.config.view.upper()),
-            self._sl.MEM.CPU,
-            self._output_resolution,
-        )
-        if retrieve_status != self._sl.ERROR_CODE.SUCCESS:
-            print(f"[{self.mount_position}] ZED image retrieval failed: {retrieve_status}")
-            return None
+        images = {}
+        for view, mat, name in ((self._sl.VIEW.LEFT, self._left_image, f"{self.mount_position}_left"),
+                                (self._sl.VIEW.RIGHT, self._right_image, self.mount_position)):
+            retrieve_status = self._camera.retrieve_image(mat, view, self._sl.MEM.CPU, self._output_resolution)
+            if retrieve_status != self._sl.ERROR_CODE.SUCCESS:
+                print(f"[{self.mount_position}] ZED image retrieval failed: {retrieve_status}")
+                return None
+            image_bgra = np.asarray(mat.get_data())
+            if image_bgra.ndim != 3 or image_bgra.shape[2] < 3 or image_bgra.size == 0:
+                print(f"[{self.mount_position}] ZED returned an invalid image shape: {image_bgra.shape}")
+                return None
+            rgb = image_bgra[..., 2::-1]
+            if self.config.rotate_180:
+                rgb = rgb[::-1, ::-1]
+            images[name] = np.ascontiguousarray(rgb)
 
-        image_bgra = np.asarray(self._image.get_data())
-        if image_bgra.ndim != 3 or image_bgra.shape[2] < 3 or image_bgra.size == 0:
-            print(f"[{self.mount_position}] ZED returned an invalid image shape: {image_bgra.shape}")
-            return None
+        depths = {}
+        if self.config.record_depth and self._depth is not None:
+            depth_name = f"{self.mount_position}_depth"
+            # Capture the SDK's own filtered/colorized depth view so the
+            # recorded video matches the ZED viewer instead of re-encoding
+            # noisy float depth ourselves.
+            if self._depth_view is not None and hasattr(self._sl.VIEW, "DEPTH"):
+                view_status = self._camera.retrieve_image(
+                    self._depth_view, self._sl.VIEW.DEPTH, self._sl.MEM.CPU, self._output_resolution
+                )
+                if view_status != self._sl.ERROR_CODE.SUCCESS:
+                    print(f"[{self.mount_position}] ZED depth view retrieval failed: {view_status}")
+                    return None
+                view_bgra = np.asarray(self._depth_view.get_data())
+                if view_bgra.ndim != 3 or view_bgra.shape[2] < 3 or view_bgra.size == 0:
+                    print(f"[{self.mount_position}] ZED returned an invalid depth view shape: {view_bgra.shape}")
+                    return None
+                depth_view = np.ascontiguousarray(view_bgra[..., 2::-1])
+                if self.config.rotate_180:
+                    depth_view = depth_view[::-1, ::-1]
+                images[depth_name] = depth_view
 
-        # VIEW.LEFT is BGRA. Reordering also makes an owned, contiguous RGB copy;
-        # the SDK-owned Mat buffer may be overwritten by the next grab().
-        image_rgb = np.ascontiguousarray(image_bgra[..., 2::-1])
+            status = self._camera.retrieve_measure(self._depth, self._sl.MEASURE.DEPTH, self._sl.MEM.CPU,
+                                                   self._output_resolution)
+            if status != self._sl.ERROR_CODE.SUCCESS:
+                print(f"[{self.mount_position}] ZED depth retrieval failed: {status}")
+                return None
+            depth = np.asarray(self._depth.get_data(), dtype=np.float32)
+            if depth.ndim == 3:
+                depth = depth[..., 0]
+            if depth.shape != (self.config.image_dim[1], self.config.image_dim[0]):
+                print(f"[{self.mount_position}] ZED returned invalid depth shape: {depth.shape}")
+                return None
+            if self.config.rotate_180:
+                depth = depth[::-1, ::-1]
+            depths[depth_name] = np.ascontiguousarray(depth)
 
+        timestamps = {name: capture_time for name in images}
+        timestamps.update({name: capture_time for name in depths})
         return {
-            "timestamps": {self.mount_position: capture_time},
-            "images": {self.mount_position: image_rgb},
-            "capture_monotonic_ns": {
-                self.mount_position: capture_monotonic_ns,
-            },
+            "timestamps": timestamps,
+            "images": images,
+            "depths": depths,
+            "sample_monotonic_ns": sample_monotonic_ns,
         }
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -167,7 +207,8 @@ class ZEDSensor(Sensor):
         return ImageMessageSchema(
             timestamps=data["timestamps"],
             images=data["images"],
-            capture_monotonic_ns=data.get("capture_monotonic_ns", {}),
+            depths=data.get("depths", {}),
+            sample_monotonic_ns=data.get("sample_monotonic_ns"),
         ).serialize()
 
     def observation_space(self):
@@ -186,13 +227,14 @@ class ZEDSensor(Sensor):
         )
 
     def close(self):
-        image = self._image
-        self._image = None
-        if image is not None:
-            try:
-                image.free()
-            except Exception:
-                pass
+        for attr in ("_left_image", "_right_image", "_depth", "_depth_view"):
+            image = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if image is not None:
+                try:
+                    image.free()
+                except Exception:
+                    pass
 
         camera = self._camera
         self._camera = None

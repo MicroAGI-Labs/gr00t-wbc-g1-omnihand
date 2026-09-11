@@ -69,12 +69,14 @@ def build_planner_message(
     height: float = -1.0,
     upper_body_position: Sequence[float] | None = None,
     upper_body_velocity: Sequence[float] | None = None,
+    upper_body_mask: Sequence[bool] | None = None,
     left_hand_position: Sequence[float] | None = None,
     right_hand_position: Sequence[float] | None = None,
     vr_3pt_position: Sequence[float] | None = None,
     vr_3pt_orientation: Sequence[float] | None = None,
     vr_3pt_compliance: Sequence[float] | None = None,
-    upper_body_mask: Sequence[bool] | None = None,
+    publisher_monotonic_ns: int | None = None,
+    vr_base_pose: Sequence[float] | None = None,
 ) -> bytes:
     """
     Assemble a 'planner' topic message:
@@ -167,6 +169,16 @@ def build_planner_message(
         fields.append({"name": "vr_compliance", "dtype": "f32", "shape": [len(vr_3pt_compliance)]})
         for value in vr_3pt_compliance:
             payload += struct.pack("<f", float(value))
+
+    if publisher_monotonic_ns is not None:
+        fields.append({"name": "publisher_monotonic_ns", "dtype": "i64", "shape": [1]})
+        payload += struct.pack("<q", int(publisher_monotonic_ns))
+
+    if vr_base_pose is not None:
+        if len(vr_base_pose) != 14:
+            raise ValueError("VR base pose must contain two XYZ + wxyz wrist targets")
+        fields.append({"name": "vr_base_pose", "dtype": "f32", "shape": [14]})
+        payload += struct.pack("<14f", *vr_base_pose)
 
     header = _build_header(fields, version=1, count=1)
 

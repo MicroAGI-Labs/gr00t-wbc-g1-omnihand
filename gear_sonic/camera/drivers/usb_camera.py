@@ -81,20 +81,24 @@ class USBCameraSensor(Sensor):
             return None
 
         captured_at = time.time()
-        capture_monotonic_ns = time.monotonic_ns()
+        sample_monotonic_ns = time.monotonic_ns()
         if frame.shape[1::-1] != self.config.image_dim:
             frame = cv2.resize(frame, self.config.image_dim, interpolation=cv2.INTER_AREA)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         return {
             "timestamps": {self.mount_position: captured_at},
-            "capture_monotonic_ns": {self.mount_position: capture_monotonic_ns},
+            "sample_monotonic_ns": sample_monotonic_ns,
             "images": {self.mount_position: frame_rgb},
         }
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
         from gear_sonic.camera.sensor_server import ImageMessageSchema
 
-        serialized_msg = ImageMessageSchema(timestamps=data["timestamps"], images=data["images"])
+        serialized_msg = ImageMessageSchema(
+            timestamps=data["timestamps"],
+            images=data["images"],
+            sample_monotonic_ns=data.get("sample_monotonic_ns"),
+        )
         return serialized_msg.serialize()
 
     def observation_space(self):

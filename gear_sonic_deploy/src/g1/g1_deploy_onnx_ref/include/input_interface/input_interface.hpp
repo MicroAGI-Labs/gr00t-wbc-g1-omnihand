@@ -408,6 +408,9 @@ public:
         return {};
     }
 
+    /// One-shot input status announcement for the robot's audio worker.
+    virtual std::string TakeStatusAnnouncement() { return {}; }
+
     // ------------------------------------------------------------------
     // Shared stdin buffering
     // ------------------------------------------------------------------

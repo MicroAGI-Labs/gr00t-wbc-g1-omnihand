@@ -21,7 +21,7 @@
  * ## `{user_topic}` (e.g. `g1_debug`) — published every tick
  * ---------------------------------------------------------------------------
  *
- * A single msgpack map with up to 30 keys (28 always-present + 2 conditional).
+ * A single msgpack map with source and publish timing metadata plus robot state.
  * All joints are in **MuJoCo order** (remapped from IsaacLab via
  * `isaaclab_to_mujoco`).
  *
@@ -31,6 +31,8 @@
  *   1  | control_loop_type      | string       | Always "cpp".
  *   2  | index                  | int          | Monotonic state-logger entry index.
  *   3  | ros_timestamp          | double       | ROS 2 wall-clock (s); 0.0 if no ROS 2.
+ *   4  | sample_monotonic_ns     | int64        | Host monotonic time when state was sampled.
+ *   5  | publisher_monotonic_ns  | int64        | Host monotonic time immediately before send.
  *      |                        |              |
  *      | **Base IMU**           |              |
  *   4  | base_quat              | double[4]    | Base IMU quaternion (w,x,y,z).
@@ -281,7 +283,7 @@ private:
 
         // State-logger fields: 18 base + 2 optional heading
         // Visualisation fields: output_data_map_.size() (typically 11)
-        int num_state_fields = has_heading_state ? 20 : 18;
+        int num_state_fields = has_heading_state ? 22 : 20;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
         pk.pack_map(num_state_fields + num_viz_fields);
 
@@ -295,6 +297,10 @@ private:
 
         pk.pack("ros_timestamp");
         pk.pack(state.ros_timestamp);
+
+        pk.pack("sample_monotonic_ns");
+        pk.pack(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    state.timestamp_monotonic.time_since_epoch()).count());
 
         pk.pack("base_quat");
         pk.pack_array(4);
@@ -404,6 +410,12 @@ private:
             pk.pack_array(values.size());
             for (const auto& val : values) pk.pack(val);
         }
+
+        // Keep this last so it represents the instant immediately before the
+        // completed buffer is handed to the non-blocking ZMQ send.
+        pk.pack("publisher_monotonic_ns");
+        pk.pack(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
     }
 
     /// Serialise a config map into the given sbuffer.

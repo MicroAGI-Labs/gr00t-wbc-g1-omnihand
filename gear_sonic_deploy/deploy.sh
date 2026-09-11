@@ -212,6 +212,7 @@ show_usage() {
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --hand-control MODE     legacy-dex3, external, or none"
+    echo "  -y, --yes               Skip the deployment confirmation prompt"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -244,6 +245,7 @@ INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
 HAND_CONTROL_DEFAULT="legacy-dex3"
+AUTO_CONFIRM=false
 
 # Initialize with defaults (will be set after parsing)
 CHECKPOINT="$CHECKPOINT_DEFAULT"
@@ -325,6 +327,10 @@ while [[ $# -gt 0 ]]; do
             fi
             HAND_CONTROL="$2"
             shift 2
+            ;;
+        -y|--yes)
+            AUTO_CONFIRM=true
+            shift
             ;;
         sim|real)
             INTERFACE_MODE="$1"
@@ -557,7 +563,12 @@ else
     echo -e "${YELLOW}📋 This will start the simulation control system.${NC}"
 fi
 echo ""
-read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
+if [[ "$AUTO_CONFIRM" == true ]]; then
+    confirm="y"
+    echo -e "${GREEN}Proceeding automatically (--yes).${NC}"
+else
+    read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
+fi
 
 if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""

@@ -37,6 +37,8 @@ teleop = [
     "msgpack",
     "msgpack-numpy",
     "pin",
+    "pin-pink",
+    "qpsolvers[osqp]",
     "pyvista; platform_machine != 'aarch64'",
 ]
 # MuJoCo simulation (run_sim_loop.py and related scripts)

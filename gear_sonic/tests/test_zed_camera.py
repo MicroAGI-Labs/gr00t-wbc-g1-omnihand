@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from gear_sonic.camera import sensor_server
 from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor
 from gear_sonic.camera.drivers import zed as zed_driver
 
@@ -68,6 +69,11 @@ class FakeCamera:
         self.retrieve_args = args
         return self.sdk.retrieve_status
 
+    def retrieve_measure(self, mat, *args):
+        mat.image = self.sdk.depth
+        self.retrieve_measure_args = args
+        return self.sdk.retrieve_status
+
     def get_timestamp(self, time_reference):
         self.time_reference = time_reference
         return FakeTimestamp(self.sdk.timestamp_ns)
@@ -88,10 +94,11 @@ class FakeCamera:
 
 class FakeSDK:
     RESOLUTION = SimpleNamespace(HD720="HD720")
-    DEPTH_MODE = SimpleNamespace(NONE="NONE")
+    DEPTH_MODE = SimpleNamespace(NONE="NONE", PERFORMANCE="PERFORMANCE")
     ERROR_CODE = SimpleNamespace(SUCCESS=0, FAILURE=1)
-    VIEW = SimpleNamespace(LEFT="LEFT")
+    VIEW = SimpleNamespace(LEFT="LEFT", RIGHT="RIGHT")
     MEM = SimpleNamespace(CPU="CPU")
+    MEASURE = SimpleNamespace(DEPTH="DEPTH")
     TIME_REFERENCE = SimpleNamespace(IMAGE="IMAGE")
     InitParameters = FakeInitParameters
     RuntimeParameters = FakeRuntimeParameters
@@ -101,6 +108,7 @@ class FakeSDK:
         if image is None:
             image = np.zeros((480, 640, 4), dtype=np.uint8)
         self.image = image
+        self.depth = np.ones((image.shape[0], image.shape[1]), dtype=np.float32)
         self.open_status = self.ERROR_CODE.SUCCESS
         self.grab_status = self.ERROR_CODE.SUCCESS
         self.retrieve_status = self.ERROR_CODE.SUCCESS
@@ -122,15 +130,15 @@ def fake_sdk(monkeypatch):
     return sdk
 
 
-def test_zed_sensor_configures_hd720_60fps_without_depth(fake_sdk):
+def test_zed_sensor_configures_hd720_60fps_with_stereo_depth(fake_sdk):
     sensor = zed_driver.ZEDSensor(device_id="123456")
 
     init_params = fake_sdk.camera.init_params
     assert init_params.camera_resolution == fake_sdk.RESOLUTION.HD720
     assert init_params.camera_fps == 60
-    assert init_params.depth_mode == fake_sdk.DEPTH_MODE.NONE
+    assert init_params.depth_mode == "PERFORMANCE"
     assert init_params.serial_number == 123456
-    assert sensor._runtime_params.enable_depth is False
+    assert sensor._runtime_params.enable_depth is True
     assert (sensor._output_resolution.width, sensor._output_resolution.height) == (640, 480)
 
 
@@ -152,18 +160,16 @@ def test_zed_sensor_returns_owned_rgb_frame_and_host_timestamps(monkeypatch):
     assert image.flags.c_contiguous
     assert not np.shares_memory(image, bgra)
     assert sample["timestamps"]["ego_view"] == 2_000_000_000.0
-    assert sample["capture_monotonic_ns"]["ego_view"] == 123_456_789
-    serialized = sensor.serialize(sample)
-    assert serialized["capture_monotonic_ns"]["ego_view"] == 123_456_789
-    assert sdk.camera.retrieve_args[1:] == (
-        sdk.VIEW.LEFT,
-        sdk.MEM.CPU,
-        sensor._output_resolution,
-    )
+    assert sample["sample_monotonic_ns"] == 123_456_789
+    assert sensor.serialize(sample)["sample_monotonic_ns"] == 123_456_789
+    assert sample["images"]["ego_view_left"].shape == (480, 640, 3)
+    assert sample["depths"]["ego_view_depth"].shape == (480, 640)
+    assert sdk.camera.retrieve_args[1] == sdk.VIEW.RIGHT
 
 
-def test_zed_sensor_does_not_depend_on_sdk_epoch_after_clock_adjustment(monkeypatch):
+def test_zed_sensor_ignores_sdk_epoch_after_clock_jump(monkeypatch):
     sdk = FakeSDK()
+    sdk.timestamp_ns = 1_700_000_000_000_000_000
     monkeypatch.setattr(zed_driver, "_load_zed_sdk", lambda: sdk)
     monkeypatch.setattr(zed_driver.time, "time", lambda: 2_000_000_000.0)
     monkeypatch.setattr(zed_driver.time, "monotonic_ns", lambda: 987_654_321)
@@ -171,8 +177,79 @@ def test_zed_sensor_does_not_depend_on_sdk_epoch_after_clock_adjustment(monkeypa
     sample = zed_driver.ZEDSensor().read()
 
     assert sample["timestamps"]["ego_view"] == 2_000_000_000.0
-    assert sample["capture_monotonic_ns"]["ego_view"] == 987_654_321
+    assert sample["sample_monotonic_ns"] == 987_654_321
     assert not hasattr(sdk.camera, "time_reference")
+
+
+def test_composed_camera_preserves_source_monotonic_timestamp():
+    composed = object.__new__(ComposedCameraSensor)
+    image = np.zeros((2, 2, 3), dtype=np.uint8)
+
+    serialized = composed.serialize_message(
+        {
+            "ego_view": {
+                "timestamps": {"ego_view": 2_000_000_000.0},
+                "images": {"ego_view": image},
+                "sample_monotonic_ns": 123_456_789,
+            }
+        }
+    )
+
+    assert serialized["sample_monotonic_ns"] == 123_456_789
+
+
+def test_sensor_server_does_not_rederive_supplied_monotonic_timestamp(monkeypatch):
+    class CapturingSocket:
+        def send(self, payload, flags):
+            self.payload = payload
+
+    server = object.__new__(sensor_server.SensorServer)
+    server.socket = CapturingSocket()
+    server.message_sent = 0
+    server.message_dropped = 0
+    monkeypatch.setattr(
+        sensor_server.msgpack, "packb", lambda payload, use_bin_type: payload
+    )
+    monkeypatch.setattr(sensor_server.time, "time", lambda: 2_000_000_010.0)
+    monkeypatch.setattr(sensor_server.time, "monotonic_ns", lambda: 999_999_999)
+
+    server.send_message(
+        {
+            "timestamps": {"ego_view": 1_700_000_000.0},
+            "images": {},
+            "sample_monotonic_ns": 123_456_789,
+        }
+    )
+
+    assert server.socket.payload["sample_monotonic_ns"] == 123_456_789
+    assert server.socket.payload["publisher_monotonic_ns"] == 999_999_999
+
+
+def test_sensor_server_round_trips_lossless_zed_depth(monkeypatch):
+    server = object.__new__(sensor_server.SensorServer)
+    server.socket = SimpleNamespace(send=lambda payload, flags: setattr(server, "payload", payload))
+    server.message_sent = 0
+    server.message_dropped = 0
+    depth = np.asarray([[0.5, 1.25]], dtype=np.float32)
+    server.send_message({"timestamps": {"ego_view_depth": 2.0}, "images": {}, "depths": {"ego_view_depth": depth}})
+    decoded = sensor_server.ImageMessageSchema.deserialize(
+        sensor_server.msgpack.unpackb(server.payload, object_hook=sensor_server.m.decode)
+    )
+    np.testing.assert_array_equal(decoded.depths["ego_view_depth"], depth)
+
+
+def test_zed_sensor_keeps_native_orientation_by_default(monkeypatch):
+    bgra = np.zeros((2, 3, 4), dtype=np.uint8)
+    bgra[-1, -1] = [10, 20, 30, 255]
+    sdk = FakeSDK(image=bgra)
+    monkeypatch.setattr(zed_driver, "_load_zed_sdk", lambda: sdk)
+
+    image = zed_driver.ZEDSensor(config=zed_driver.ZEDConfig(image_dim=(3, 2))).read()[
+        "images"
+    ]["ego_view"]
+
+    np.testing.assert_array_equal(image[0, 0], np.array([0, 0, 0]))
+    assert image.flags.c_contiguous
 
 
 @pytest.mark.parametrize("failure_stage", ["grab", "retrieve"])
@@ -233,4 +310,5 @@ def test_composed_camera_factory_passes_zed_options(monkeypatch):
     assert captured["config"] == zed_driver.ZEDConfig(
         camera_resolution="HD1080",
         camera_fps=30,
+        rotate_180=False,
     )

@@ -22,10 +22,15 @@ USB_PORTS = {
     "right": "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBWJBC1-if00-port0",
 }
 MOTOR_IDS = {"left": 0, "right": 1}
+TRANSPORT_EXIT_CODE = 75
 
 
 class Dex1SafetyError(RuntimeError):
-    """A failed motor worker requires an explicit operator reconnect."""
+    """A motor health or control fault requires an explicit operator reconnect."""
+
+
+class Dex1TransportError(RuntimeError):
+    """USB communication failed; retry with fresh workers and measured holds."""
 
 
 class Dex1Backend:
@@ -39,7 +44,7 @@ class Dex1Backend:
         profile: SideProfile,
         *,
         worker: str | Path = DEFAULT_WORKER,
-        transition_duration: float = 1.5,
+        transition_duration: float = 1.35,
         command_enabled: bool = False,
     ) -> None:
         self.side, self.profile = HandSide(side), profile
@@ -58,8 +63,10 @@ class Dex1Backend:
             raise ValueError("DEX 1 requires one motor per hand")
         try:
             serial_device = str(Path(self.port).resolve(strict=True))
+        except FileNotFoundError as exc:
+            raise Dex1TransportError(f"{self.side.value} DEX 1 adapter unavailable: {self.port}") from exc
         except OSError as exc:
-            raise Dex1SafetyError(f"DEX 1 adapter unavailable: {self.port}") from exc
+            raise Dex1SafetyError(f"{self.side.value} DEX 1 adapter inaccessible: {self.port}") from exc
         self._process = subprocess.Popen(
             [
                 str(worker),
@@ -97,6 +104,7 @@ class Dex1Backend:
             except BlockingIOError:
                 break
             if not data:
+                self._wait_for_worker_exit()
                 break
             self._buffer += data
             if len(self._buffer) > 131072:
@@ -130,8 +138,22 @@ class Dex1Backend:
                 if self._latest is not None and sample["monotonic_ns"] <= self._latest["monotonic_ns"]:
                     raise Dex1SafetyError("replayed DEX 1 feedback")
                 self._latest = sample
+        self._check_worker_exit()
+
+    def _wait_for_worker_exit(self) -> None:
+        # EOF/EPIPE can precede waitpid observing the exit. Preserve the
+        # native fault classification rather than reporting a generic pipe error.
+        try:
+            self._process.wait(timeout=0.15)
+        except subprocess.TimeoutExpired:
+            raise Dex1SafetyError(f"{self.side.value} DEX 1 worker pipe closed without exit") from None
+        self._check_worker_exit()
+
+    def _check_worker_exit(self) -> None:
         status = self._process.poll()
         if status is not None and not self._closed:
+            if status == TRANSPORT_EXIT_CODE:
+                raise Dex1TransportError(f"{self.side.value} DEX 1 USB communication lost; reconnecting")
             raise Dex1SafetyError(
                 f"{self.side.value} DEX 1 worker exited ({status}); inspect Hands pane, then reconnect"
             )
@@ -151,6 +173,7 @@ class Dex1Backend:
         self._mode = mode
 
     def read_positions(self) -> np.ndarray:
+        self._check_worker_exit()
         if self._target is not None:
             self._sequence += 1
             mode = {"hold": 0, "tracking": 1, "fault": 2}[self._mode]
@@ -159,8 +182,11 @@ class Dex1Backend:
             try:
                 if os.write(self._process.stdin.fileno(), packet) != len(packet):
                     raise Dex1SafetyError("partial DEX 1 command")
+            except BrokenPipeError:
+                self._wait_for_worker_exit()
+                raise Dex1SafetyError(f"{self.side.value} DEX 1 command pipe closed") from None
             except OSError as exc:
-                raise Dex1SafetyError("DEX 1 command pipe unavailable") from exc
+                raise Dex1SafetyError(f"{self.side.value} DEX 1 command pipe unavailable") from exc
         return np.array([self._snapshot()["q"]], dtype=np.float64)
 
     @property
@@ -187,6 +213,8 @@ class Dex1Backend:
             "voltage_v": [sample["voltage"]],
             "torque_nm": [sample["tau"]],
             "velocity_rad_s": [sample["dq"]],
+            "encoder_position_rad": [sample.get("raw_q", sample["q"])],
+            "encoder_offset_rad": [sample.get("position_offset", 0.0)],
             "feedback_age_s": (time.monotonic_ns() - sample["monotonic_ns"]) / 1e9,
             "serial_port": self.port,
             "motor_id": self.motor_id,

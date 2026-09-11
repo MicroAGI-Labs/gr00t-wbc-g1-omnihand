@@ -6,8 +6,10 @@ import copy
 from dataclasses import asdict, dataclass
 from functools import partial
 import json
+import os
 from pathlib import Path
 import shutil
+import uuid
 from typing import Any
 
 import datasets
@@ -90,10 +92,45 @@ class ArgsConfig:
 class Gr00tDatasetMetadata(LeRobotDatasetMetadata):
     """Additional metadata on top of LeRobotDatasetMetadata:
     - modality_config: Written to ``meta/modality.json``
-    - discarded_episode_indices: Written to ``meta/info.json``
+    - failed_episode_indices: Saved unsuccessful takes in ``meta/info.json``
+    - discarded_episode_indices: Historical explicit removal markers only
     """
 
     MODALITY_CONFIG_REL_PATH = Path("meta/modality.json")
+    EMPTY_INDEX_FILES = ("tasks.jsonl", "episodes.jsonl", "episodes_stats.jsonl")
+
+    @classmethod
+    def restore_empty_indexes(cls, root: str | Path) -> None:
+        """Complete v2.1 metadata only when no recording has been written."""
+        root = Path(root)
+        missing = [root / "meta" / name for name in cls.EMPTY_INDEX_FILES
+                   if not (root / "meta" / name).exists()]
+        if not missing:
+            return
+        with (root / "meta/info.json").open() as stream:
+            info = json.load(stream)
+        if info.get("codebase_version") != "v2.1":
+            return
+        counts_empty = all(info.get(key) == 0 for key in (
+            "total_episodes", "total_frames", "total_tasks", "total_videos",
+        ))
+        indexes_empty = all(not path.exists() or path.stat().st_size == 0
+                            for path in (root / "meta" / name for name in cls.EMPTY_INDEX_FILES))
+        recording_files = any(path.is_file() for directory in ("data", "videos", "images")
+                              for path in (root / directory).rglob("*"))
+        if not counts_empty or not indexes_empty or recording_files:
+            raise ValueError(
+                f"Incomplete dataset metadata at {root}: missing "
+                f"{', '.join(path.name for path in missing)}. "
+                "Recording data may exist; no files were changed."
+            )
+        for path in missing:
+            # Never truncate an index, including one created concurrently.
+            try:
+                with path.open("x"):
+                    pass
+            except FileExistsError:
+                pass
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -114,6 +151,7 @@ class Gr00tDatasetMetadata(LeRobotDatasetMetadata):
 
         obj.info["script_config"] = script_config
         obj.info["discarded_episode_indices"] = []
+        obj.info["failed_episode_indices"] = []
         with open(obj.root / "meta" / "info.json", "w") as f:
             json.dump(obj.info, f, indent=4)
 
@@ -121,6 +159,7 @@ class Gr00tDatasetMetadata(LeRobotDatasetMetadata):
         with open(obj.root / cls.MODALITY_CONFIG_REL_PATH, "w") as f:
             json.dump(modality_config, f, indent=4)
         obj.modality_config = modality_config
+        cls.restore_empty_indexes(obj.root)
         return obj
 
     @staticmethod
@@ -140,6 +179,10 @@ class Gr00tDatasetMetadata(LeRobotDatasetMetadata):
 # ---------------------------------------------------------------------------
 
 
+class RecordingMemoryLimitError(RuntimeError):
+    """The bounded encoder queues cannot accept another synchronized row."""
+
+
 class Gr00tDataExporter(LeRobotDataset):
     """Exports data collected for a single session to LeRobot Dataset.
 
@@ -148,8 +191,8 @@ class Gr00tDataExporter(LeRobotDataset):
     2. Add frames using add_frame()
     3. Save the episode using save_episode()
        - Flushes the episode buffer to disk
-       - Closes the video writers
-       - Creates an empty buffer; video writers open on the next episode's first frame
+       - Flushes the running video encoders, then commits metadata
+       - Creates an empty buffer for the next episode
     """
 
     def __init__(self, *args, **kwargs):
@@ -185,7 +228,10 @@ class Gr00tDataExporter(LeRobotDataset):
         tolerance_s: float = 1e-4,
         vcodec: str = "h264",
         overwrite_existing: bool = False,
+        max_video_buffer_bytes: int = 256 * 1024**2,
     ) -> "Gr00tDataExporter":
+        if max_video_buffer_bytes <= 0:
+            raise ValueError("video memory budget must be positive")
         if script_config is None:
             script_config = {}
 
@@ -200,6 +246,7 @@ class Gr00tDataExporter(LeRobotDataset):
             shutil.rmtree(save_root)
 
         if (Path(save_root)).exists():
+            Gr00tDatasetMetadata.restore_empty_indexes(save_root)
             try:
                 obj.meta = Gr00tDatasetMetadata(
                     repo_id=repo_id,
@@ -228,6 +275,7 @@ class Gr00tDataExporter(LeRobotDataset):
         obj.tolerance_s = tolerance_s
         obj.video_backend = "pyav"
         obj.vcodec = vcodec
+        obj.max_video_buffer_bytes = max_video_buffer_bytes
         obj.task = task
         obj.image_writer = None
 
@@ -242,17 +290,32 @@ class Gr00tDataExporter(LeRobotDataset):
         obj.video_writers = {}
         return obj
 
-    def create_video_writer(self) -> dict[str, VideoWriter]:
+    @property
+    def buffered_video_bytes(self) -> int:
+        return sum(
+            writer.queue.qsize() * int(np.prod(self.meta.shapes[key]))
+            for key, writer in self.video_writers.items()
+        )
+
+    def create_video_writer(self, episode_index: int | None = None) -> dict[str, VideoWriter]:
+        """Open bounded encoders in a unique directory owned by this take."""
+        if episode_index is None:
+            episode_index = self.episode_buffer["episode_index"]
         video_writers = {}
+        row_bytes = sum(int(np.prod(self.meta.shapes[key])) for key in self.video_keys)
+        if row_bytes > self.max_video_buffer_bytes:
+            raise RecordingMemoryLimitError("video queue budget cannot hold one camera row")
+        buffer_size = min(50, self.max_video_buffer_bytes // max(1, row_bytes))
+        staging_root = self.root / ".recording" / uuid.uuid4().hex
         try:
             for key in self.meta.video_keys:
                 video_writers[key] = VideoWriter(
-                    self.root
-                    / self.meta.get_video_file_path(self.episode_buffer["episode_index"], key),
+                    staging_root / f"{key}.mp4",
                     self.meta.shapes[key][1],
                     self.meta.shapes[key][0],
                     self.fps,
                     self.vcodec,
+                    buffer_size=buffer_size,
                 )
         except Exception:
             for writer in video_writers.values():
@@ -264,7 +327,7 @@ class Gr00tDataExporter(LeRobotDataset):
         return video_writers
 
     def add_frame(self, frame: dict) -> None:
-        """Add a frame to the episode buffer. Videos are handled by the video_writer."""
+        """Stream owned images to encoders and buffer only measurements/references."""
         frame = copy.deepcopy(frame)
         frame["task"] = frame.get("task", self.task)
 
@@ -279,6 +342,13 @@ class Gr00tDataExporter(LeRobotDataset):
 
         if self.video_keys and not self.video_writers:
             self.video_writers = self.create_video_writer()
+        # There is one producer; consumers can only free queue slots. Check
+        # every camera before enqueueing to avoid a partial row on backpressure.
+        for key, writer in self.video_writers.items():
+            if not writer.check_ready(frame[key]):
+                raise RecordingMemoryLimitError("video encoder queue is full")
+        for key, writer in self.video_writers.items():
+            writer.add_frame(frame[key])
 
         frame_index = self.episode_buffer["size"]
         timestamp = frame.pop("timestamp") if "timestamp" in frame else frame_index / self.fps
@@ -296,19 +366,9 @@ class Gr00tDataExporter(LeRobotDataset):
                     f"'{key}' not in '{self.features.keys()}'."
                 )
 
-            if self.features[key]["dtype"] in ["image", "video"]:
-                img_path = self._get_image_file_path(
-                    episode_index=self.episode_buffer["episode_index"],
-                    image_key=key,
-                    frame_index=frame_index,
-                )
-                if frame_index == 0:
-                    img_path.parent.mkdir(parents=True, exist_ok=True)
-
-                self.video_writers[key].add_frame(frame[key])
-                self.episode_buffer[key].append(str(img_path))
-            else:
-                self.episode_buffer[key].append(frame[key])
+            self.episode_buffer[key].append(
+                str(self.video_writers[key].output_path) if key in self.video_keys else frame[key]
+            )
 
         self.episode_buffer["size"] += 1
 
@@ -322,15 +382,14 @@ class Gr00tDataExporter(LeRobotDataset):
 
     def skip_and_start_new_episode(self) -> None:
         """Skip the current episode and start a new one."""
-        self.stop_video_writers()
-        self.episode_buffer = self.create_episode_buffer()
-        self.video_writers = {}
+        _, writers = self.detach_episode(advance_index=False)
+        self.discard_episode(video_writers=writers)
 
-    def detach_episode(self) -> tuple[dict[str, Any], dict[str, VideoWriter]]:
+    def detach_episode(self, *, advance_index: bool = True) -> tuple[dict[str, Any], dict[str, VideoWriter]]:
         """Transfer the completed episode without opening the next video files."""
         episode_buffer = self.episode_buffer
         video_writers = self.video_writers
-        next_episode_index = int(episode_buffer["episode_index"]) + 1
+        next_episode_index = int(episode_buffer["episode_index"]) + int(advance_index)
         self.episode_buffer = self.create_episode_buffer(
             episode_index=next_episode_index
         )
@@ -343,14 +402,29 @@ class Gr00tDataExporter(LeRobotDataset):
         *,
         video_writers: dict[str, VideoWriter] | None = None,
         discarded: bool = False,
+        success: bool | None = None,
         validation: dict[str, Any] | None = None,
     ) -> None:
         active_episode = episode_data is None
+        # The deprecated discarded argument retains its old removal-marker
+        # meaning. A failed outcome alone must never mark a take for removal.
+        if success is None:
+            success = not discarded
         source_buffer = self.episode_buffer if active_episode else episode_data
         # Finalization pops and stacks fields. Retain a detached source buffer
         # unchanged so a failed background job can persist it for recovery.
-        episode_buffer = copy.deepcopy(source_buffer)
+        # Video columns contain staging paths, never whole-episode pixels.
+        episode_buffer = {
+            key: list(value) if key in self.video_keys else copy.deepcopy(value)
+            for key, value in source_buffer.items()
+        }
         writers = self.video_writers if video_writers is None else video_writers
+
+        if "episode.success" in self.features:
+            episode_buffer["episode.success"] = [
+                np.asarray([int(success)], dtype=np.uint8)
+                for _ in range(episode_buffer["size"])
+            ]
 
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
@@ -416,15 +490,17 @@ class Gr00tDataExporter(LeRobotDataset):
             )
 
             self._wait_image_writer()
-            self._save_episode_table(episode_buffer, episode_index)
 
             if self.meta.video_keys:
                 video_paths = self.encode_episode_videos(
                     episode_index,
                     video_writers=writers,
+                    episode_buffer=episode_buffer,
                 )
                 for key in self.meta.video_keys:
                     episode_buffer[key] = video_paths[key]
+
+            self._save_episode_table(episode_buffer, episode_index)
 
             for key in self.meta.video_keys:
                 video_path = self.root / self.meta.get_video_file_path(
@@ -451,11 +527,17 @@ class Gr00tDataExporter(LeRobotDataset):
                         episode_index,
                     ]
 
+            if not success:
+                previous_failed = self.meta.info.get("failed_episode_indices", [])
+                if episode_index not in previous_failed:
+                    self.meta.info["failed_episode_indices"] = [*previous_failed, episode_index]
+
             quality = dict(self.meta.info.get("episode_quality", {}))
             quality[str(episode_index)] = {
                 "discarded": bool(discarded),
+                "success": bool(success),
                 "validation": validation
-                or {"passed": not discarded, "errors": []},
+                or {"passed": bool(success), "errors": []},
             }
             self.meta.info["episode_quality"] = quality
             self.meta.save_episode(
@@ -469,6 +551,24 @@ class Gr00tDataExporter(LeRobotDataset):
                 setattr(self.meta, attribute, value)
             raise
 
+        quality_path = self.root / "meta" / "episode_quality.jsonl"
+        quality_record = {
+            "episode_index": episode_index,
+            "success": bool(success),
+            "validation": validation or {"passed": bool(success), "errors": []},
+        }
+        try:
+            with open(quality_path, "a", encoding="utf-8") as quality_file:
+                quality_file.write(
+                    json.dumps(quality_record, separators=(",", ":")) + "\n"
+                )
+                quality_file.flush()
+                os.fsync(quality_file.fileno())
+        except OSError as exc:
+            # The success flag is also stored per frame. Do not turn a fully
+            # committed episode into a false finalizer failure over this audit log.
+            print(f"[Exporter] Could not append episode quality record: {exc}")
+
         if active_episode:
             self.episode_buffer = self.create_episode_buffer()
             self.video_writers = {}
@@ -478,12 +578,51 @@ class Gr00tDataExporter(LeRobotDataset):
         episode_index: int,
         *,
         video_writers: dict[str, VideoWriter] | None = None,
+        episode_buffer: dict | None = None,
     ) -> dict:
         writers = self.video_writers if video_writers is None else video_writers
+        # Finish every encoder before publishing any video under its final name.
+        for key in self.meta.video_keys:
+            writers[key].stop()
         video_paths = {}
         for key in self.meta.video_keys:
-            video_paths[key] = writers[key].stop()
+            writer = writers[key]
+            source = Path(writer.output_path)
+            destination = self.root / self.meta.get_video_file_path(episode_index, key)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source != destination:
+                if destination.exists():
+                    raise FileExistsError(f"Refusing to overwrite existing video: {destination}")
+                os.replace(source, destination)
+                writer.output_path = destination
+                self._remove_empty_staging_directory(source.parent)
+            video_paths[key] = str(destination)
         return video_paths
+
+    def _remove_empty_staging_directory(self, directory: Path) -> None:
+        if directory.parent == self.root / ".recording":
+            try:
+                directory.rmdir()
+            except OSError:
+                pass  # Other cameras or a failed writer still own files here.
+
+    def discard_episode(self, *, video_writers: dict[str, VideoWriter]) -> None:
+        """Cancel only this take's staged videos; never commit dataset metadata."""
+        errors = []
+        for writer in video_writers.values():
+            path = Path(writer.output_path)
+            if path.parent.parent != self.root / ".recording":
+                raise ValueError(f"Refusing to discard a video outside staging: {path}")
+            try:
+                writer.cancel()
+                # cancel() preserves already closed files; this explicit discard
+                # also removes a closed file still owned by the staged take.
+                path.unlink(missing_ok=True)
+                self._remove_empty_staging_directory(path.parent)
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise RuntimeError("Could not remove all discarded video files") from errors[0]
 
     def save_episode_as_discarded(
         self,
@@ -499,6 +638,7 @@ class Gr00tDataExporter(LeRobotDataset):
             discarded=True,
             validation=validation,
         )
+
 
 
 # ---------------------------------------------------------------------------

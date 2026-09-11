@@ -13,7 +13,7 @@ Whole-body teleoperation is very very hard to get right and there are a lot of m
 
 ```{admonition} Safety Warning
 :class: danger
-The robot will track your full-body movements in real-time. Always maintain a clear 3-meter safety zone around the robot, keep a safety operator at the keyboard ready to press **`O`** for emergency stop and always be prepared to emergecy stop on the PICO controller on your own. Practice extensively in simulation before attempting on real hardware!
+The robot will track your full-body movements in real-time. Always maintain a clear 3-meter safety zone around the robot and keep a safety operator ready to press **`O`** or stop SONIC from the UI. The PICO **A+B+X+Y** gesture is start-only, not an emergency stop. Practice extensively in simulation before attempting on real hardware!
 ```
 
 ## Sample Teleoperation Session
@@ -54,7 +54,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager
 4. **Press A+B+X+Y** on controllers — Initializes the policy and calibrates (enters Planner mode)
 5. **Press and release A+X twice within two seconds** — Switches to Pose mode (whole-body teleoperation active)
 6. **Teleoperate** — Your movements are now mirrored by the robot
-7. **Press A+B+X+Y** when done — Emergency stop and exit. Policy will stop!!!
+7. **Stop from the UI or terminate the control process** when done.
 
 ## Clothing Requirements
 
@@ -154,7 +154,7 @@ The initial calibration is **critical** to successful teleoperation.
 
 **Tips:**
 - Hold the pose steady for 1-2 seconds after pressing A+B+X+Y
-- If the robot seems offset throughout the session, recalibrate (stop with A+B+X+Y, then restart)
+- If the robot seems offset throughout the session, stop it from the UI or terminate the process, then restart and recalibrate with A+B+X+Y
 
 
 ## Mode Switching Safety
@@ -232,14 +232,19 @@ When switching between modes, **always match the robot's current pose first**.
 **Keyboard (deployment terminal):**
 - Press **`O`** for immediate stop
 
-**PICO controllers:**
-- Press **A + B + X + Y** simultaneously
+**Operator UI:**
+- Use the SONIC policy stop control
 
-Both methods immediately halt the policy and exit control mode.
+You can also terminate the SONIC control process. **A+B+X+Y is only accepted
+while the policy is OFF; it cannot stop a running policy.**
+
+If PICO body tracking disconnects, teleop input is suspended and its manager
+returns to OFF, but the SONIC deployment remains running. Reconnect tracking,
+then use A+B+X+Y to recalibrate and resume teleop input.
 
 
 ## Next Steps
 
 - **Understand input interfaces** — See tutorials for [Keyboard](../tutorials/keyboard.md), [Gamepad](../tutorials/gamepad.md), [ZMQ](../tutorials/zmq.md), [Manager](../tutorials/manager.md)
 - **Learn about deployment** — See [Deployment Code & Program Flow](../references/deployment_code)
-- **General troubleshooting** — See [Troubleshooting Guide](troubleshooting) 
+- **General troubleshooting** — See [Troubleshooting Guide](troubleshooting)

@@ -1,6 +1,5 @@
 import os
 import queue
-import sys
 import threading
 import time
 
@@ -38,6 +37,8 @@ class VideoWriter:
             self.stream.width = width
             self.stream.height = height
             self.stream.codec_context.thread_count = min(2, os.cpu_count() or 1)
+            if codec in ("h264", "libx264"):
+                self.stream.options = {"preset": "veryfast", "tune": "zerolatency", "crf": "23"}
         except Exception:
             self.container.close()
             raise
@@ -75,6 +76,15 @@ class VideoWriter:
                 f"video writer queue stayed full for {self._enqueue_timeout_s:.2f}s"
             ) from exc
 
+    def check_ready(self, frame: np.ndarray) -> bool:
+        """Preflight a synchronized row before its single producer queues any camera."""
+        if not self._accepting_frames:
+            raise RuntimeError("cannot add a frame after the video writer has stopped")
+        if self._writer_error is not None:
+            raise RuntimeError("video writer worker failed") from self._writer_error
+        self._assert_dimensions(frame)
+        return not self.queue.full()
+
     def _writer_worker(self) -> None:
         try:
             self._encode_frames()
@@ -105,19 +115,14 @@ class VideoWriter:
                 frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
 
                 if self._first_frame:
-                    stderr_fd = sys.stderr.fileno()
-                    old_stderr = os.dup(stderr_fd)
-                    devnull = os.open(os.devnull, os.O_WRONLY)
-                    os.dup2(devnull, stderr_fd)
-                    try:
+                    # Each camera has its own encoder thread. Capture only its
+                    # startup logs; redirecting process-wide stderr races when
+                    # several videos start together.
+                    with av.logging.Capture(local=True):
                         packets = self.stream.encode(frame)
                         for packet in packets:
                             self.container.mux(packet)
-                    finally:
-                        os.dup2(old_stderr, stderr_fd)
-                        os.close(old_stderr)
-                        os.close(devnull)
-                        self._first_frame = False
+                    self._first_frame = False
                 else:
                     packets = self.stream.encode(frame)
                     for packet in packets:

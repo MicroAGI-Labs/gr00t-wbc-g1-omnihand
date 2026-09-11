@@ -1,9 +1,9 @@
 """ZMQ PUB/SUB transport and image serialisation for the camera server."""
 
 import base64
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from collections.abc import Mapping
 import time
 from typing import Any
 
@@ -52,21 +52,6 @@ class PoseData:
             tz=data.get("tz", 0.0),
         )
 
-    def to_array(self) -> np.ndarray:
-        return np.array([self.qx, self.qy, self.qz, self.qw, self.tx, self.ty, self.tz])
-
-    @staticmethod
-    def from_array(arr: np.ndarray) -> "PoseData":
-        return PoseData(
-            qx=float(arr[0]),
-            qy=float(arr[1]),
-            qz=float(arr[2]),
-            qw=float(arr[3]),
-            tx=float(arr[4]),
-            ty=float(arr[5]),
-            tz=float(arr[6]),
-        )
-
 
 @dataclass
 class PoseMessageSchema:
@@ -112,19 +97,25 @@ class ImageMessageSchema:
 
     * **str** – legacy base64-encoded JPEG.
     * **bytes** – raw JPEG from on-device MJPEG encoder (e.g. OAK).
+
+    Depth maps are carried losslessly in the separate ``depths`` mapping.
     """
 
     timestamps: dict[str, float]
     images: dict[str, np.ndarray]
-    capture_monotonic_ns: dict[str, int] = field(default_factory=dict)
+    sample_monotonic_ns: int | None = None
     publisher_sequence: int | None = None
     publisher_monotonic_ns: int | None = None
+    depths: dict[str, np.ndarray] = field(default_factory=dict)
+    capture_monotonic_ns: dict[str, int] = field(default_factory=dict)
 
     def serialize(self) -> dict[str, Any]:
         serialized_msg: dict[str, Any] = {
             "timestamps": self.timestamps,
             "images": {},
+            "depths": {key: np.asarray(value) for key, value in self.depths.items()},
             "capture_monotonic_ns": self.capture_monotonic_ns,
+            "sample_monotonic_ns": self.sample_monotonic_ns,
             "publisher_sequence": self.publisher_sequence,
             "publisher_monotonic_ns": self.publisher_monotonic_ns,
         }
@@ -137,13 +128,9 @@ class ImageMessageSchema:
 
     @staticmethod
     def deserialize(data: dict[str, Any]) -> "ImageMessageSchema":
-        timestamps_value = data.get("timestamps", {})
-        timestamps = timestamps_value if isinstance(timestamps_value, Mapping) else {}
-        images_value = data.get("images", {})
-        if not isinstance(images_value, Mapping):
-            images_value = {}
+        timestamps = data.get("timestamps", {})
         images = {}
-        for key, value in images_value.items():
+        for key, value in data.get("images", {}).items():
             if isinstance(value, bytes | bytearray):
                 mat = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
                 images[key] = mat[..., ::-1]  # BGR -> RGB
@@ -155,12 +142,14 @@ class ImageMessageSchema:
                 images[key] = m.decode(value)
             else:
                 images[key] = value
+        depths = {key: np.asarray(value) for key, value in data.get("depths", {}).items()}
         capture_values = data.get("capture_monotonic_ns", {})
         if not isinstance(capture_values, Mapping):
             capture_values = {}
         return ImageMessageSchema(
             timestamps=timestamps,
             images=images,
+            depths=depths,
             capture_monotonic_ns={
                 str(key): int(value)
                 for key, value in capture_values.items()
@@ -168,6 +157,7 @@ class ImageMessageSchema:
                 and not isinstance(value, (bool, np.bool_))
                 and int(value) > 0
             },
+            sample_monotonic_ns=data.get("sample_monotonic_ns"),
             publisher_sequence=data.get("publisher_sequence"),
             publisher_monotonic_ns=data.get("publisher_monotonic_ns"),
         )
@@ -176,7 +166,9 @@ class ImageMessageSchema:
         return {
             "timestamps": self.timestamps,
             "images": self.images,
+            "depths": self.depths,
             "capture_monotonic_ns": self.capture_monotonic_ns,
+            "sample_monotonic_ns": self.sample_monotonic_ns,
             "publisher_sequence": self.publisher_sequence,
             "publisher_monotonic_ns": self.publisher_monotonic_ns,
         }
@@ -207,6 +199,19 @@ class SensorServer:
         payload = dict(data)
         published_wall_s = time.time()
         published_monotonic_ns = time.monotonic_ns()
+        capture_times = [
+            float(value)
+            for value in payload.get("timestamps", {}).values()
+            if isinstance(value, (int, float, np.number)) and np.isfinite(value) and value > 0
+        ]
+        supplied_sample_monotonic_ns = payload.get("sample_monotonic_ns")
+        has_sample_monotonic = (
+            isinstance(supplied_sample_monotonic_ns, int)
+            and supplied_sample_monotonic_ns > 0
+        )
+        if capture_times and not has_sample_monotonic:
+            capture_age_ns = int(max(0.0, published_wall_s - max(capture_times)) * 1e9)
+            payload["sample_monotonic_ns"] = published_monotonic_ns - capture_age_ns
         supplied_capture_times = payload.get("capture_monotonic_ns", {})
         capture_monotonic_ns = (
             dict(supplied_capture_times)
@@ -241,7 +246,10 @@ class SensorServer:
         payload["publisher_sequence"] = self.message_sent + 1
         payload["publisher_monotonic_ns"] = published_monotonic_ns
         try:
-            packed = msgpack.packb(payload, use_bin_type=True)
+            try:
+                packed = msgpack.packb(payload, use_bin_type=True)
+            except TypeError:
+                packed = msgpack.packb(payload, use_bin_type=True, default=m.encode)
             self.socket.send(packed, flags=zmq.NOBLOCK)
         except zmq.Again:
             self.message_dropped += 1
@@ -271,7 +279,6 @@ class SensorClient:
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.setsockopt(zmq.CONFLATE, conflate)
         self.socket.setsockopt(zmq.RCVHWM, receive_hwm)
         self.socket.connect(f"tcp://{server_ip}:{port}")

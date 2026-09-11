@@ -99,6 +99,13 @@ def _canfd_link_mismatches(document: Any) -> list[str]:
         missing.append("FD mode")
     if info.get("state") != "ERROR-ACTIVE":
         missing.append("ERROR-ACTIVE CAN state")
+    counters = info.get("berr_counter")
+    try:
+        counters_are_clean = int(counters["tx"]) == 0 and int(counters["rx"]) == 0
+    except (KeyError, TypeError, ValueError):
+        counters_are_clean = False
+    if not counters_are_clean:
+        missing.append("zero CAN error counters")
     if not number_matches(nominal, "bitrate", 1_000_000):
         missing.append("bitrate 1000000")
     if not number_matches(nominal, "sample_point", 0.800):
@@ -195,9 +202,7 @@ class OmniHandBackend:
         if not 0 <= request_interval_ms <= 100:
             raise OmniHandHardwareError("SocketCAN request interval must be between 0 and 100 ms")
         if not 10 <= frame_recv_timeout_ms <= 1000:
-            raise OmniHandHardwareError(
-                "SocketCAN frame receive timeout must be between 10 and 1000 ms"
-            )
+            raise OmniHandHardwareError("SocketCAN frame receive timeout must be between 10 and 1000 ms")
         try:
             self._hand.set_request_interval(request_interval_ms)
             actual_interval = int(self._hand.get_request_interval())
@@ -248,6 +253,10 @@ class OmniHandBackend:
     def read_health(self) -> dict[str, Any]:
         if self._hand is None:
             raise OmniHandHardwareError("OmniHand transport is closed")
+        # Vendor bit 4 is a known O10 report quirk on otherwise qualified
+        # hardware. Independently verify the live kernel transport every time
+        # health is polled so a real CAN degradation still fails closed.
+        _validate_canfd_link(self.interface)
         reports = list(self._hand.get_all_error_reports())
         if len(reports) != self.profile.width:
             raise OmniHandHardwareError("invalid error report width")

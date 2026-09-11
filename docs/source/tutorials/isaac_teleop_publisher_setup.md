@@ -105,7 +105,7 @@ Connecting the client starts the body-data stream the streamer is waiting for.
 - On Thor, change **Video Codec** from the default **AV1** to **H.264** or **H.265 (HEVC)**.
 - Return to the client page and click **Connect**
 
-Once connected, stand in the [calibration pose](vr_wholebody_teleop.md#calibration-pose) and press **A+B+X+Y** on the PICO controllers to start the policy; the first press also runs the startup calibration and enters PLANNER (locomotion) mode. Then press and release **A+X** twice within two seconds to switch to POSE mode for whole-body teleop, where your motion maps directly to the robot. See [Complete PICO Controls](vr_wholebody_teleop.md#pico-controls) for the other modes and the emergency stop.
+Once connected, stand in the [calibration pose](vr_wholebody_teleop.md#vr_3pt-calibration-hint) and press **A+B+X+Y** on the PICO controllers to start the policy; the gesture runs the startup calibration and enters PLANNER (locomotion) mode. It is ignored while the policy is running and cannot stop SONIC. Then press **A+X** to switch to POSE mode for whole-body teleop, where your motion maps directly to the robot. See [Complete PICO Controls](vr_wholebody_teleop.md#complete-pico-controls) for the other modes and stopping methods.
 
 For quick validation, the same client URL can also be opened in a desktop browser.
 
@@ -194,4 +194,3 @@ The streamer logs `[IsaacTeleopReader] No DeviceIO data for 5.0s, flagging disco
 1. The headset is still connected to CloudXR (Step 5).
 2. The Pico body trackers are paired and calibrated (see [VR Teleop Setup → Motion Tracker Setup](../getting_started/vr_teleop_setup.md)).
 3. The first time the schema runs, watch for `[IsaacTeleopReader] Unrecognised body_data schema: type=...` — if you see it, the upstream `FullBodyTrackerPico.get_body_pose().data` shape changed and `_body_data_to_24x7()` in `gear_sonic/utils/teleop/input_readers.py` needs an extra branch for the new layout.
-

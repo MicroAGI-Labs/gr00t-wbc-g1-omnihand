@@ -1,10 +1,14 @@
 #pragma once
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <stop_token>
 #include <thread>
 #include <unitree/robot/g1/audio/g1_audio_client.hpp>
+#include <zmq.hpp>
 
 struct AudioCommand {
   bool streaming_data_absent = false;
@@ -23,8 +27,12 @@ class AudioThread {
 
  private:
   void loop(std::stop_token st);
+  void PollRecordingStatus();
 
   unitree::robot::g1::AudioClient client_;
+  zmq::context_t recording_status_context_;
+  std::unique_ptr<zmq::socket_t> recording_status_socket_;
+  std::uint64_t last_recording_audio_sequence_ = 0;
   std::jthread thread_;
 
   std::mutex command_mutex_;
