@@ -1,4 +1,4 @@
-# Data collection: operator handbook
+# Data collection: PR handbook
 
 This is the operating and design guide for the `data-collection` branch and
 [PR #30](https://github.com/MicroAGI-Labs/gr00t-wbc-g1-omnihand/pull/30).
@@ -1088,9 +1088,8 @@ remain because they have supported uses outside the daily configuration.
 
 The PR does not require resurrecting retired experimental branches or their
 worktrees. Branch names and local SDK/build artifacts are operational state,
-not runtime feature switches. The [upstream project overview](README_UPSTREAM.md) remains available
-for the broader controller, training, and model documentation. See the
-[focused repo plan](docs/teleop_repo_plan.md) for further cleanup.
+not runtime feature switches. The upstream project README remains available
+for the broader controller, training, and model documentation.
 
 ## Validation and remaining work
 
