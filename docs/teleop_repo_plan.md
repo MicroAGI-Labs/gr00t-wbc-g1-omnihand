@@ -32,9 +32,11 @@ Keep active body inference/planning, robot assets, headset input, hand adapters,
 cameras, collector, browser, deployment tools, dataset processing and their tests.
 Preserve licenses, third-party notices and citation.
 
-MotionBricks and controller-training entry points are removal candidates after
-checking imports, configured assets, packaging, CI and documentation. Their
-absence from the daily launch alone does not prove they are unused.
+MotionBricks has been removed after a repository-wide reference search found no
+consumers outside its own tree, the old overview, and its Git/LFS checkpoint rules.
+Controller-training entry points remain candidates after checking imports,
+configured assets, packaging, CI and documentation. Their absence from the daily
+launch alone does not prove they are unused.
 
 Do not delete `decoupled_wbc` wholesale:
 `gear_sonic/utils/teleop/ik_upper_body.py` imports its robot model and IK solver.
@@ -74,3 +76,29 @@ simultaneous mixed hand types are not assumed supported.
    metadata; verify local finalization and upload under the intended camera load.
 6. Merge the PR after validation. Recheck ancestry and the resulting file tree
    immediately before merging. Removing inherited files does not need a force-push.
+
+## First cleanup batch
+
+- Removed the independent `motionbricks/` subtree (192 tracked files), including
+  its animation demos, training code and model/mesh references.
+- Removed `.lfsconfig`, whose only setting excluded the deleted MotionBricks
+  checkpoints, and removed its checkpoint ignore exception. Remaining LFS assets
+  and their `.gitattributes` rules are unchanged.
+- Replaced the copied broad upstream overview with a short NVIDIA reference
+  page and permanent links to the pre-cleanup tree, avoiding broken local links
+  and instructions to download deleted demos.
+- Changed root pytest discovery from the older Decoupled WBC tests to the current
+  SONIC teleop, recording and hand suites. MuJoCo tests still need their optional
+  dependency and downloaded assets; the documented non-MuJoCo command remains valid.
+
+No controller, camera, hand or collector behavior changes in this batch.
+The `data-collection` branch remains the unchanged base; cleanup lives on
+`cleanup/teleop-deployment`.
+
+Validation for this batch: 382 tests passed under Python 3.10 using root pytest
+discovery with `--ignore=gear_sonic/end_effectors/tests/test_omnihand_mujoco.py`.
+The run included actual video/Parquet output, hand recovery, synchronization,
+finalization and upload tests. Dependency deprecation warnings remain. New local
+README links, pytest configuration and `git diff --check` passed. Optional MuJoCo,
+native builds and physical robot validation were not run for this removal-only
+batch; no runtime source files changed.
