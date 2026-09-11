@@ -36,9 +36,6 @@ class ClockEstimate:
     uncertainty_ns: int
     measured_ns: int
 
-    def to_local(self, source_ns: int) -> int:
-        return source_ns - self.offset_ns
-
 
 def estimate_exchange(t1: int, t2: int, t3: int, t4: int, identity: str) -> ClockEstimate:
     """t1/t4 are client send/receive; t2/t3 are server receive/send."""

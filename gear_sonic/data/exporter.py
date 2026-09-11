@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Optional
+from typing import Any
 
 import datasets
 from datasets import load_dataset

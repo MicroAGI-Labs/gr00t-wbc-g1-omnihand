@@ -112,7 +112,12 @@ def test_clock_exchange_accounts_for_processing_and_bounds_asymmetry():
     estimate = estimate_exchange(1000, 6010, 6040, 1060, "boot")
     assert estimate.offset_ns == 4995
     assert estimate.uncertainty_ns == 15
-    assert abs(estimate.to_local(7000) - 2000) <= estimate.uncertainty_ns
+    sync = SenderSynchronizer(
+        camera_names=(), hand_clock=SimpleNamespace(estimate=lambda now: estimate),
+    )
+    sync.observe("hand", {"clock_id": "boot"}, 7000, 2060)
+    mapped = sync.histories["hand"][-1]
+    assert abs(mapped["_sync_time_ns"] - 2000) <= mapped["_sync_uncertainty_ns"]
     with pytest.raises(ValueError):
         estimate_exchange(1000, 6010, 6040, 1020, "boot")
 
