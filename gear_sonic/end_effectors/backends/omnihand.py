@@ -171,7 +171,12 @@ class OmniHandBackend:
         if driver != EXPECTED_DRIVER:
             raise OmniHandHardwareError(f"{interface} uses {driver}, expected {EXPECTED_DRIVER}")
         serial = serial_reader(interface, net_class)
-        if serial != EXPECTED_SERIAL[self.side]:
+        expected_serial = os.environ.get(
+            f"OMNIHAND_{self.side.value.upper()}_SERIAL", EXPECTED_SERIAL[self.side]
+        ).strip()
+        if not expected_serial:
+            raise OmniHandHardwareError(f"empty configured {self.side.value} adapter serial")
+        if serial != expected_serial:
             raise OmniHandHardwareError(
                 f"{interface} serial {serial} is not the configured {self.side.value} adapter"
             )

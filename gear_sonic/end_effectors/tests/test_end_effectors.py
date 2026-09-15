@@ -422,7 +422,13 @@ def test_bilateral_health_gate_precedes_every_write():
     assert len(right.commands) == 1
 
 
-def test_hardware_adapter_probes_without_writing_and_uses_explicit_joint_command(tmp_path):
+@pytest.mark.parametrize("configured_serial", [None, "NEW-ROBOT-RIGHT"])
+def test_hardware_adapter_probes_without_writing_and_uses_explicit_joint_command(
+    tmp_path, monkeypatch, configured_serial
+):
+    monkeypatch.delenv("OMNIHAND_RIGHT_SERIAL", raising=False)
+    if configured_serial is not None:
+        monkeypatch.setenv("OMNIHAND_RIGHT_SERIAL", configured_serial)
     class FakeHand:
         def __init__(self):
             self.commands = []
@@ -479,7 +485,7 @@ def test_hardware_adapter_probes_without_writing_and_uses_explicit_joint_command
         sdk=sdk,
         net_class=net_class,
         interface_index=lambda _: 10,
-        serial_reader=lambda *_: "2082395E534B50052",
+        serial_reader=lambda *_: configured_serial or "2082395E534B50052",
         link_validator=lambda _: None,
     )
     assert hand.commands == []
@@ -533,3 +539,20 @@ def test_runtime_defaults_use_full_fast_omnihand_transition():
     args = build_parser().parse_args(["run"])
     assert args.close_scale == 1.0
     assert args.transition_duration == 0.2
+
+
+@pytest.mark.parametrize("configured", ["WRONG-ADAPTER", ""])
+def test_configured_adapter_still_rejects_wrong_or_empty_serial(tmp_path, monkeypatch, configured):
+    monkeypatch.setenv("OMNIHAND_RIGHT_SERIAL", configured)
+    driver = tmp_path / "drivers" / "gs_usb"
+    driver.mkdir(parents=True)
+    net_class = tmp_path / "net"
+    device = net_class / "can10" / "device"
+    device.mkdir(parents=True)
+    (device / "driver").symlink_to(driver, target_is_directory=True)
+    # No SDK is supplied: admission must reject before opening hardware.
+    with pytest.raises(RuntimeError, match="adapter"):
+        OmniHandBackend(HandSide.RIGHT, OMNIHAND_O10.right, "can10",
+                        net_class=net_class, interface_index=lambda _: 10,
+                        serial_reader=lambda *_: "ACTUAL-RIGHT",
+                        link_validator=lambda _: None)
