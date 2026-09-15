@@ -7,11 +7,13 @@ import os
 from pathlib import Path
 import pickle
 import queue
+import tempfile
 import threading
 import time
 
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.hub_uploader import EpisodeHubUploader
+from gear_sonic.data.recording_identity import recording_identity
 
 
 @dataclass
@@ -113,21 +115,26 @@ class EpisodeFinalizer:
         """Preserve an owned episode buffer if normal finalization fails."""
         recovery_root = Path(self.data_exporter.root) / "recovery"
         recovery_root.mkdir(parents=True, exist_ok=True)
-        recovery_path = recovery_root / f"episode_{job.episode_index:06d}.pkl"
-        temporary_path = recovery_path.with_suffix(".pkl.tmp")
+        identity = recording_identity(job.episode_buffer)
         payload = {
             "episode_index": job.episode_index,
+            "recording": dict(identity),
             "episode_buffer": job.episode_buffer,
             "success": job.success,
             "validation": job.validation,
             "video_paths": {key: str(writer.output_path) for key, writer in job.video_writers.items()
                             if hasattr(writer, "output_path")},
         }
-        with open(temporary_path, "wb") as recovery_file:
+        with tempfile.NamedTemporaryFile(
+            dir=recovery_root, prefix=identity["id"] + "_", suffix=".pkl.tmp", delete=False,
+        ) as recovery_file:
+            temporary_path = Path(recovery_file.name)
             pickle.dump(payload, recovery_file, protocol=pickle.HIGHEST_PROTOCOL)
             recovery_file.flush()
             os.fsync(recovery_file.fileno())
-        os.replace(temporary_path, recovery_path)
+        recovery_path = temporary_path.with_suffix("")
+        os.link(temporary_path, recovery_path)
+        temporary_path.unlink()
         return recovery_path
 
     @staticmethod

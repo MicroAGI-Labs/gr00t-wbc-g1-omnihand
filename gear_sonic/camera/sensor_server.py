@@ -311,7 +311,13 @@ class CameraMountPosition(Enum):
 class ImageUtils:
     @staticmethod
     def encode_image(image: np.ndarray) -> str:
-        _, color_buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        # Every producer feeding this hands over RGB: the ZED driver slices
+        # BGRA->RGB and the USB path applies COLOR_BGR2RGB. cv2.imencode writes
+        # its input as BGR, so encoding RGB directly published a JPEG with red
+        # and blue exchanged -- the blue conveyor arrived red, and policies
+        # trained on correctly-coloured data saw inverted images.
+        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        _, color_buffer = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         return base64.b64encode(color_buffer).decode("utf-8")
 
     @staticmethod

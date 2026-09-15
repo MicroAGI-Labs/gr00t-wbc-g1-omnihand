@@ -19,8 +19,9 @@ from gear_sonic.scripts.run_data_exporter import GrootDataCollector, StreamRateT
 
 
 def sample(name, sequence, received_ns=1_000_000_000):
+    shape = (720, 1280, 3) if name in ("left_wrist", "right_wrist") else (480, 640, 3)
     return {
-        "images": {name: np.full((480, 640, 3), sequence % 255, dtype=np.uint8)},
+        "images": {name: np.full(shape, sequence % 255, dtype=np.uint8)},
         "timestamps": {name: float(sequence)},
         "receiver_monotonic_ns": received_ns,
     }
@@ -35,7 +36,7 @@ def receiver():
     return client
 
 
-def test_usb_uses_stable_path_mjpeg_two_buffers_and_resizes(monkeypatch):
+def test_usb_uses_stable_path_mjpeg_two_buffers_and_native_resolution(monkeypatch):
     properties = {}
     opened = []
     frame = np.full((720, 1280, 3), (10, 20, 30), dtype=np.uint8)
@@ -74,7 +75,7 @@ def test_usb_uses_stable_path_mjpeg_two_buffers_and_resizes(monkeypatch):
     assert properties[cv2.CAP_PROP_FOURCC] == cv2.VideoWriter_fourcc(*"MJPG")
     assert properties[cv2.CAP_PROP_BUFFERSIZE] == 2
     result = sensor.read()
-    assert result["images"]["left_wrist"].shape == (480, 640, 3)
+    assert result["images"]["left_wrist"].shape == (720, 1280, 3)
     np.testing.assert_array_equal(result["images"]["left_wrist"][0, 0], [30, 20, 10])
     assert result["sample_monotonic_ns"] > 0
     assert sensor.serialize(result)["sample_monotonic_ns"] == result["sample_monotonic_ns"]
@@ -146,7 +147,7 @@ def collector(wrists):
     obj.latest_image_msg = sample("ego_view", 1)
     obj.latest_image_msg["camera_received_monotonic_ns"] = {"ego_view": 1_000_000_000}
     obj.stream_rates = StreamRateTracker()
-    obj._last_wrist_camera_timestamps = {}
+    obj._last_camera_timestamps = {}
     return obj
 
 
@@ -172,7 +173,7 @@ def test_wrist_rates_separate_capture_and_fresh_collector_cadence(monkeypatch):
     # The combined message's publisher sequence must not override either rate.
     for tick in range(100):
         now[0] = tick / 50
-        obj._observe_wrist_camera_rates({
+        obj._observe_camera_rates({
             "images": {"left_wrist": object(), "right_wrist": object()},
             "timestamps": {
                 "left_wrist": 1000 + (tick * 60 // 50) / 60,
@@ -193,7 +194,7 @@ def test_cached_wrist_rate_goes_stale_while_other_wrist_keeps_arriving(monkeypat
     monkeypatch.setattr("gear_sonic.scripts.run_data_exporter.time.monotonic", lambda: now[0])
     for tick in range(150):
         now[0] = tick / 50
-        obj._observe_wrist_camera_rates({
+        obj._observe_camera_rates({
             "images": {"left_wrist": object(), "right_wrist": object()},
             "timestamps": {
                 "left_wrist": 1000 + min(tick, 49) / 50,
@@ -207,10 +208,40 @@ def test_cached_wrist_rate_goes_stale_while_other_wrist_keeps_arriving(monkeypat
     assert rates["right_wrist"]["received_hz"] == pytest.approx(50, abs=0.1)
 
 
+def test_cached_head_frames_do_not_hide_behind_live_wrists_or_publisher(monkeypatch):
+    obj = collector(True)
+    now = [0.0]
+    monkeypatch.setattr("gear_sonic.scripts.run_data_exporter.time.monotonic", lambda: now[0])
+    heads = ("ego_view", "ego_view_left", "ego_view_depth")
+    names = (*heads, "left_wrist", "right_wrist")
+    for tick in range(150):
+        now[0] = tick / 50
+        obj.stream_rates.observe("camera", source_timestamp=1000 + tick / 50)
+        obj._observe_camera_rates({
+            "images": dict.fromkeys(names, object()),
+            "timestamps": {
+                name: 1000 + (min(tick, 49) if name in heads else tick) / 50
+                for name in names
+            },
+            "publisher_sequence": tick,
+        })
+        if tick == 49:
+            rates = obj.stream_rates.snapshot(obj.RATE_STREAMS)
+            for name in heads:
+                assert rates[name]["received_hz"] == pytest.approx(50, abs=0.1)
+    rates = obj.stream_rates.snapshot(obj.RATE_STREAMS)
+    for name in heads:
+        assert rates[name]["active"] is False
+        assert rates[name]["received_hz"] == 0
+    for name in ("camera", "left_wrist", "right_wrist"):
+        assert rates[name]["active"] is True
+        assert rates[name]["received_hz"] == pytest.approx(50, abs=0.1)
+
+
 @pytest.mark.parametrize("timestamp", [None, float("nan"), float("inf"), "invalid"])
 def test_wrist_rates_ignore_missing_images_and_invalid_timestamps(timestamp):
     obj = collector(True)
-    obj._observe_wrist_camera_rates({
+    obj._observe_camera_rates({
         "images": {"left_wrist": object()},
         "timestamps": {"left_wrist": timestamp, "right_wrist": 1000.0},
     })
@@ -244,11 +275,22 @@ def test_optional_recording_flags_stale_wrists_and_rejects_missing_or_wrong_size
     obj.latest_image_msg["camera_received_monotonic_ns"]["left_wrist"] = 100_000_000
     assert obj._validate_camera_inputs(1.01)["camera left_wrist is stale"] == pytest.approx(.91)
     obj.latest_image_msg["camera_received_monotonic_ns"]["left_wrist"] = 1_000_000_000
-    obj.latest_image_msg["images"]["right_wrist"] = np.zeros((720, 1280, 3))
+    obj.latest_image_msg["images"]["right_wrist"] = np.zeros((480, 640, 3))
     with pytest.raises(RuntimeError, match="right_wrist shape"):
         obj._validate_camera_inputs(1.01)
     obj.data_exporter.features = collector(False).data_exporter.features
     obj._validate_camera_inputs(1.01)
+
+
+def test_local_camera_queue_delay_is_flagged_despite_recent_receipt():
+    obj = collector(False)
+    obj.latest_image_msg.update({
+        "capture_monotonic_ns": {"ego_view": 400_000_000},
+        "publisher_monotonic_ns": 420_000_000,
+        "_publisher_clock_is_local": True,
+    })
+    warnings = obj._validate_camera_inputs(1.01)
+    assert warnings["camera ego_view is stale"] == pytest.approx(.61)
 
 
 @pytest.mark.parametrize("kwargs", [{"fps": 0}, {"capture_dim": (0, 720)}, {"buffer_size": 1}])

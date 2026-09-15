@@ -58,7 +58,9 @@ The headset defines the forward direction captured on each arm engagement;
 turning it while holding a grip does not change that arm's reference. Head
 motion itself does not drive the waist in this profile. Keep the headset facing
 the direction you intend to use as forward when engaging, including when it is
-worn around the neck. Reposition the controller while released, then engage
+worn around the neck. Heading comes from the headset's horizontal left–right
+axis, so pitching it through straight down does not reverse translation.
+Reposition the controller while released, then engage
 again to acquire a new reference without a target jump.
 
 Calibrated controller targets pass through directly. Releasing a grip holds

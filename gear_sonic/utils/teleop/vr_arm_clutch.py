@@ -41,7 +41,10 @@ class VRArmClutch:
             if self.pressed[side] and not self.tracking[side] and source_fresh:
                 if self.controller_frame:
                     head = Rotation.from_quat(pose[2, 3:], scalar_first=True).as_matrix()
-                    yaw = np.arctan2(-head[0, 1], head[0, 0])
+                    # Use one axis consistently. Mixing the left and forward
+                    # axes makes pitch distort heading and reverse translation
+                    # when the headset tips past straight down.
+                    yaw = np.arctan2(-head[0, 1], head[1, 1])
                     self.heading[side] = Rotation.from_euler("z", -yaw).as_matrix()
             if self.controller_frame:
                 pose[side, :3] = self.heading[side] @ pose[side, :3]

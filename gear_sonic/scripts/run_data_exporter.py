@@ -39,7 +39,7 @@ import zmq
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+from gear_sonic.camera.composed_camera import ComposedCameraClientSensor, estimate_camera_age_s
 from gear_sonic.camera.depth_preview import camera_images_with_depth_preview
 from gear_sonic.data.clock_sync import ClockClient, DEFAULT_CLOCK_PORT
 from gear_sonic.data.sender_sync import (
@@ -585,6 +585,9 @@ class GrootDataCollector:
 
     RATE_STREAMS = (
         "camera",
+        "ego_view",
+        "ego_view_left",
+        "ego_view_depth",
         "left_wrist",
         "right_wrist",
         "robot_state",
@@ -718,7 +721,7 @@ class GrootDataCollector:
         self._episode_flagged_frames = 0
         self._last_input_block_log = 0.0
         self.stream_rates = StreamRateTracker()
-        self._last_wrist_camera_timestamps: dict[str, float] = {}
+        self._last_camera_timestamps: dict[str, float] = {}
 
         self.current_stream_mode = 0
 
@@ -862,6 +865,10 @@ class GrootDataCollector:
             "finalizer": finalizer_status,
             "hub": hub_status,
             "stream_rates": self.stream_rates.snapshot(self.RATE_STREAMS),
+            "camera_buffer": (
+                self._image_subscriber.buffer_stats()
+                if hasattr(getattr(self, "_image_subscriber", None), "buffer_stats") else {}
+            ),
             "synchronization": self._sender_sync.status() if getattr(self, "_sender_sync", None) else None,
             "hand_freshness_enforced": False,
             "hand_disconnect_snapshot_retention": True,
@@ -879,15 +886,15 @@ class GrootDataCollector:
         except zmq.Again:
             pass
 
-    def _observe_wrist_camera_rates(self, message: dict) -> None:
-        """Count fresh captures sampled by the collector, independently per wrist."""
-        for name in ("left_wrist", "right_wrist"):
+    def _observe_camera_rates(self, message: dict) -> None:
+        """Count fresh captures sampled by the collector, independently per camera."""
+        for name in ("ego_view", "ego_view_left", "ego_view_depth", "left_wrist", "right_wrist"):
             if name not in message.get("images", {}):
                 continue
             timestamp = _timestamp_seconds(message.get("timestamps", {}).get(name))
-            if timestamp is None or timestamp == self._last_wrist_camera_timestamps.get(name):
+            if timestamp is None or timestamp == self._last_camera_timestamps.get(name):
                 continue
-            self._last_wrist_camera_timestamps[name] = timestamp
+            self._last_camera_timestamps[name] = timestamp
             # Source timestamps estimate capture cadence; observation times
             # measure delivery of distinct frames into this collector loop.
             # A shared publisher sequence belongs to the combined message and
@@ -1894,8 +1901,13 @@ class GrootDataCollector:
                 if _timestamp_seconds(message.get("timestamps", {}).get(source_name)) is None:
                     raise RuntimeError(f"camera {name} capture timestamp is unavailable")
             received_at = received.get(source_name)
-            if target_ns is None and received_at is not None and now - received_at / 1e9 > self.camera_max_age:
-                warnings[f"camera {name} is stale"] = now - received_at / 1e9
+            age = None if received_at is None else now - received_at / 1e9
+            if message.get("_publisher_clock_is_local"):
+                captured_age = estimate_camera_age_s(message, source_name, now_monotonic_ns=int(now * 1e9))
+                if captured_age is not None:
+                    age = captured_age
+            if target_ns is None and age is not None and age > self.camera_max_age:
+                warnings[f"camera {name} is stale"] = age
         return warnings
 
     def _add_images_to_frame_data(self, frame_data: dict, inputs: RecordingInputs | None = None) -> None:
@@ -2550,7 +2562,7 @@ class GrootDataCollector:
                                 ),
                                 received_timestamp=receiver_monotonic_ns / 1e9,
                             )
-                            self._observe_wrist_camera_rates(img_msg)
+                            self._observe_camera_rates(img_msg)
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
@@ -2697,9 +2709,9 @@ def main(config: SonicDataExporterConfig):
             "record_zed_stereo": config.record_zed_stereo,
             "max_episode_duration_s": config.max_episode_duration_s,
             "depth_video_encoding": (
-                {"format": "uint8_rgb", "visualization": "browser_ui",
-                 "colormap": "opencv_turbo", "normalization_percentiles": [2, 98],
-                 "fallback": "camera_depth_video"}
+                {"format": "uint8_rgb", "visualization": "camera_depth_video",
+                 "fallback": {"visualization": "raw_depth_preview", "colormap": "opencv_turbo",
+                              "normalization_percentiles": [2, 98], "invalid_color": "black"}}
                 if config.record_zed_stereo else None
             ),
             "recording_synchronization": {

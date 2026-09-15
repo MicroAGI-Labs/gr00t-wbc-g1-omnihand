@@ -44,7 +44,7 @@ def enqueue(finalizer, exporter, *, delete=False):
 
 def test_continuous_capture_owns_pixels_without_retaining_them_in_episode(tmp_path):
     exporter = exporter_at(tmp_path / "dataset")
-    assert exporter.max_video_buffer_bytes == 256 * 1024**2
+    assert exporter.max_video_buffer_bytes == 2 * 1024**3
     source = frame()
     for _ in range(3):
         exporter.add_frame(source)
@@ -64,26 +64,28 @@ def test_continuous_capture_owns_pixels_without_retaining_them_in_episode(tmp_pa
     assert not list((exporter.root / ".recording").rglob("*.mp4"))
 
 
-def test_full_queue_rejects_entire_row_before_appending(tmp_path, monkeypatch):
+@pytest.mark.parametrize("queue_rows", [1, 64])
+def test_full_queue_rejects_entire_row_before_appending(tmp_path, monkeypatch, queue_rows):
     release = threading.Event()
     original = VideoWriter._encode_frames
     def blocked(writer):
         assert release.wait(timeout=5)
         original(writer)
     monkeypatch.setattr(VideoWriter, "_encode_frames", blocked)
-    exporter = exporter_at(tmp_path / "dataset", max_video_buffer_bytes=16 * 16 * 3)
+    exporter = exporter_at(tmp_path / "dataset", max_video_buffer_bytes=queue_rows * 16 * 16 * 3)
     try:
-        exporter.add_frame(frame())
+        for _ in range(queue_rows):
+            exporter.add_frame(frame())
         with pytest.raises(RecordingMemoryLimitError):
             exporter.add_frame(frame())
-        assert exporter.episode_buffer["size"] == 1
-        assert exporter.episode_buffer["frame_index"] == [0]
-        assert len(exporter.episode_buffer[CAMERA]) == 1
-        assert exporter.buffered_video_bytes == 16 * 16 * 3
+        assert exporter.episode_buffer["size"] == queue_rows
+        assert exporter.episode_buffer["frame_index"] == list(range(queue_rows))
+        assert len(exporter.episode_buffer[CAMERA]) == queue_rows
+        assert exporter.buffered_video_bytes == queue_rows * 16 * 16 * 3
     finally:
         release.set()
         exporter.save_episode()
-    assert exporter.meta.total_frames == 1
+    assert exporter.meta.total_frames == queue_rows
 
 
 def test_failed_commit_preserves_measurements_and_compressed_video_paths(tmp_path, monkeypatch):
@@ -99,7 +101,8 @@ def test_failed_commit_preserves_measurements_and_compressed_video_paths(tmp_pat
         enqueue(finalizer, exporter)
         assert finalizer.wait_until_idle(timeout=5)
         assert "table unavailable" in finalizer.status()["error"]
-        with (exporter.root / "recovery/episode_000000.pkl").open("rb") as recovery_file:
+        recovery_path, = (exporter.root / "recovery").glob("episode_000000_*.pkl")
+        with recovery_path.open("rb") as recovery_file:
             recovered = pickle.load(recovery_file)
         assert isinstance(recovered["episode_buffer"][CAMERA][0], str)
         np.testing.assert_array_equal(recovered["episode_buffer"]["observation.state"][0], [1.0])

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import socket
 import time
+from collections import deque
 
 import numpy as np
+import pytest
 
 from gear_sonic.camera import sensor_server
 from gear_sonic.camera.composed_camera import (
@@ -129,3 +131,64 @@ def test_camera_age_does_not_compare_monotonic_clocks_across_hosts():
     )
 
     assert age == 0.15
+
+
+def test_local_camera_age_includes_time_spent_queued_before_receipt():
+    message = {
+        "capture_monotonic_ns": {"head": 1_000_000_000},
+        "publisher_monotonic_ns": 1_020_000_000,
+        "receiver_monotonic_ns": 1_600_000_000,
+        "_publisher_clock_is_local": True,
+    }
+    assert estimate_camera_age_s(message, "head", now_monotonic_ns=1_610_000_000) == 0.61
+
+
+@pytest.mark.parametrize("reserve", [0, 1])
+def test_receiver_skips_encoded_backlog_and_retains_recent_reserve(reserve):
+    client = object.__new__(ComposedCameraClientSensor)
+    client._background_target_depth = reserve + 1
+    client._wire_backlog_dropped = 0
+    queued = deque({"publisher_sequence": i} for i in range(1, 21))
+    client.receive_message_nonblocking = lambda **kwargs: queued.popleft() if queued else None
+    messages = client._receive_recent_messages()
+    assert [message["publisher_sequence"] for message, received in messages] == list(range(20 - reserve, 21))
+    assert client._wire_backlog_dropped == 19 - reserve
+    assert all(received > 0 for message, received in messages)
+
+
+def test_cached_camera_decode_tracks_each_capture_and_evicts_removed_views(monkeypatch):
+    client = object.__new__(ComposedCameraClientSensor)
+    client._decoded_image_cache = {}
+    original = ImageMessageSchema.deserialize
+    decoded_names = []
+    def deserialize(message):
+        decoded_names.append(set(message["images"]))
+        return original(message)
+    monkeypatch.setattr(ImageMessageSchema, "deserialize", staticmethod(deserialize))
+    head = np.zeros((2, 2, 3), dtype=np.uint8)
+    wrist = np.ones_like(head)
+    message = {"images": {"head": head, "wrist": wrist},
+               "timestamps": {"head": 10.0, "wrist": 10.0},
+               "capture_monotonic_ns": {"head": 100, "wrist": 100}}
+    first = client._decode_camera_message(message)
+    message["capture_monotonic_ns"] = {"head": 100, "wrist": 200}
+    message["timestamps"] = {"head": 10.0, "wrist": 10.1}
+    second = client._decode_camera_message(message)
+    assert decoded_names == [{"head", "wrist"}, {"wrist"}]
+    assert second["images"]["head"] is first["images"]["head"]
+    assert second["timestamps"] == {"head": 10.0, "wrist": 10.1}
+    # A repeated wall timestamp cannot hide a new monotonic capture.
+    message["capture_monotonic_ns"] = {"head": 300, "wrist": 200}
+    client._decode_camera_message(message)
+    assert decoded_names[-1] == {"head"}
+    client._decode_camera_message({"images": {"wrist": wrist}, "timestamps": {"wrist": 11.0}})
+    assert set(client._decoded_image_cache) == {"wrist"}
+
+
+def test_images_without_capture_identity_are_always_decoded():
+    client = object.__new__(ComposedCameraClientSensor)
+    client._decoded_image_cache = {}
+    first = np.zeros((2, 2, 3), dtype=np.uint8)
+    second = np.ones_like(first)
+    client._decode_camera_message({"images": {"head": first}})
+    assert client._decode_camera_message({"images": {"head": second}})["images"]["head"] is second

@@ -18,7 +18,7 @@ struct MotorCmd {
     float tau = 0, q = 0, dq = 0, kp = 0, kd = 0;
     uint8_t bytes[20]{};
     void modify_data(MotorCmd*) {
-        hex_len = 20; bytes[2] = id | (mode<<4);
+        hex_len = 20; bytes[2] = id | (mode<<4) | (timeout<<7);
         int16_t wire = tau*2560; std::memcpy(bytes+4,&wire,2);
     }
     uint8_t* get_motor_send_data() { return bytes; }
@@ -38,6 +38,9 @@ struct SerialPort {
         ++calls;
         if (const auto* log = std::getenv("DEX1_TEST_EXCHANGE_LOG"))
             std::ofstream(log,std::ios::app) << c->mode << '\n';
+        if (const auto* log = std::getenv("DEX1_TEST_TIMEOUT_CLEAR_LOG"))
+            std::ofstream(log,std::ios::app) << c->mode << ' ' << c->timeout << ' '
+                                           << c->tau << ' ' << c->kp << ' ' << c->kd << '\n';
         if (const auto* fd = std::getenv("DEX1_TEST_RX_MASTER_FD")) {
             const bool inject = std::getenv("DEX1_TEST_RX_AT_STARTUP") ? calls == 1 : c->mode == 1;
             if (inject) {
@@ -57,6 +60,12 @@ struct SerialPort {
         if (const auto* q = std::getenv("DEX1_TEST_ACTIVE_POSITION"))
             if (c->mode == 1) d->q = std::stof(q)*25;
         if (std::getenv("DEX1_TEST_STARTUP_ENABLED")) d->mode = 1;
+        if (const auto* delay = std::getenv("DEX1_TEST_DISABLE_ACK_DELAY"))
+            if (calls <= std::stoi(delay)) d->mode = 1;
+        if (const auto* delay = std::getenv("DEX1_TEST_TIMEOUT_ACK_DELAY"))
+            if (calls <= std::stoi(delay) || c->timeout != 0) d->timeout = 1;
+        if (const auto* error = std::getenv("DEX1_TEST_MOTOR_ERROR")) d->merror = std::stoi(error);
+        if (const auto* temp = std::getenv("DEX1_TEST_TEMPERATURE")) d->temp = std::stoi(temp);
         if (const auto* speed = std::getenv("DEX1_TEST_FEEDBACK_SPEED")) d->dq = std::stof(speed)*25;
         if (const auto* torque = std::getenv("DEX1_TEST_FEEDBACK_TORQUE")) d->tau = std::stof(torque)/25;
         if (std::getenv("DEX1_TEST_LOW_VOLTAGE")) d->bytes[5] = 20;

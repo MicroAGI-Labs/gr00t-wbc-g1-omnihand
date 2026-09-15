@@ -106,7 +106,7 @@ class ComposedCameraConfig:
     """USB capture rate; use 60 for JR wrist cameras."""
 
     usb_camera_resolution: tuple[int, int] = (640, 480)
-    """USB capture width/height; output remains 640x480 like ZED."""
+    """USB capture and published width/height; thor-jr uses native 1280x720."""
 
     usb_camera_mjpeg: bool = False
     """Request MJPEG on USB cameras (required for JR 1280x720 at 60 FPS)."""
@@ -451,6 +451,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
             from gear_sonic.camera.drivers.usb_camera import USBCameraConfig, USBCameraSensor
 
             usb_config = USBCameraConfig(
+                image_dim=self.config.usb_camera_resolution,
                 fps=self.config.usb_camera_fps,
                 capture_dim=self.config.usb_camera_resolution,
                 mjpeg=self.config.usb_camera_mjpeg,
@@ -725,6 +726,10 @@ def estimate_camera_age_s(
         and not isinstance(published_ns, bool)
         and published_ns >= captured_ns
     ):
+        if message.get("_publisher_clock_is_local"):
+            # Loopback publishers share CLOCK_MONOTONIC. Include time spent in
+            # TCP/ZMQ queues and decoding, not just time since dequeueing.
+            return max(0, now_ns - captured_ns) / 1e9
         # Both values originate on the publisher, so this interval remains
         # valid even when the receiver has a different boot-time clock origin.
         age_ns += published_ns - captured_ns
@@ -752,6 +757,9 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         self._staleness_warning_interval = 2.0
         self._background = background
         self._preserve_history = preserve_history
+        self._publisher_clock_is_local = server_ip in {"localhost", "127.0.0.1", "::1"}
+        self._decoded_image_cache: dict[str, tuple[tuple, np.ndarray]] = {}
+        self._wire_backlog_dropped = 0
         self._background_buffer = CameraFrameBuffer(background_queue_size, background_reserve)
         self._history_overflow = 0
         self._background_lock = threading.Lock()
@@ -783,11 +791,9 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
 
     def _receive_loop(self, server_ip: str, port: int) -> None:
         try:
-            # This thread is fast enough to drain the publisher continuously.
-            # Keep a short FIFO so a brief scheduler/GIL stall does not make
-            # ZMQ_CONFLATE discard frames that the 50 Hz collector could use.
-            # The foreground/non-threaded client remains conflated to preserve
-            # its latest-frame semantics.
+            # Preserve a short FIFO for normal 60 -> 50 Hz sampling. Drain
+            # encoded backlog before decoding so TCP buffering cannot make
+            # newly dequeued images hundreds of milliseconds old.
             self.start_client(server_ip, port, conflate=False, receive_hwm=self._background_buffer.capacity)
         except BaseException as exc:
             self._receiver_error = exc
@@ -796,18 +802,53 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         self._receiver_ready.set()
         try:
             while not self._receiver_stop.is_set():
-                message = self.receive_message_nonblocking(timeout_ms=200)
-                if message is None:
-                    continue
-                decoded = ImageMessageSchema.deserialize(message).asdict()
-                decoded["receiver_monotonic_ns"] = time.monotonic_ns()
-                with self._background_lock:
-                    self._background_buffer.put(decoded)
-                    self._buffer_camera_frames(decoded)
+                for message, received_ns in self._receive_recent_messages():
+                    decoded = self._decode_camera_message(message)
+                    decoded["receiver_monotonic_ns"] = received_ns
+                    decoded["_publisher_clock_is_local"] = self._publisher_clock_is_local
+                    with self._background_lock:
+                        self._background_buffer.put(decoded)
+                        self._buffer_camera_frames(decoded)
         except BaseException as exc:
             self._receiver_error = exc
         finally:
             self.stop_client()
+
+    def _receive_recent_messages(self) -> list[tuple[dict, int]]:
+        pending: deque = deque(maxlen=self._background_target_depth)
+        # Bound work even if a sender floods the socket. Normally there is
+        # only one packet; following a stall keep the newest reserve + frame.
+        for index in range(64):
+            message = self.receive_message_nonblocking(timeout_ms=200 if index == 0 else 0)
+            if message is None:
+                break
+            if len(pending) == pending.maxlen:
+                self._wire_backlog_dropped += 1
+            pending.append((message, time.monotonic_ns()))
+        return list(pending)
+
+    def _decode_camera_message(self, message: dict) -> dict:
+        # Combined publications can contain unchanged views. Decode each
+        # capture only once, including while another camera is stalled.
+        cached = self._decoded_image_cache
+        identities = {
+            name: (message.get("capture_monotonic_ns", {}).get(name),
+                   message.get("timestamps", {}).get(name))
+            for name in message.get("images", {})
+        }
+        changed = {
+            name: value for name, value in message.get("images", {}).items()
+            if identities[name] == (None, None) or name not in cached
+            or cached[name][0] != identities[name]
+        }
+        decoded = ImageMessageSchema.deserialize({**message, "images": changed}).asdict()
+        for name in identities.keys() - changed.keys():
+            decoded["images"][name] = cached[name][1]
+        self._decoded_image_cache = {
+            name: (identities[name], value) for name, value in decoded["images"].items()
+            if identities[name] != (None, None)
+        }
+        return decoded
 
     def _buffer_camera_frames(self, message: dict) -> None:
         """Keep bounded queues of distinct captures, independently per camera."""
@@ -910,6 +951,7 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
                 else ImageMessageSchema.deserialize(message).asdict()
             )
             self._latest_message.setdefault("receiver_monotonic_ns", time.monotonic_ns())
+            self._latest_message["_publisher_clock_is_local"] = self._publisher_clock_is_local
             self._last_new_message_time = current_time
 
             if self.idx % 10 == 0:
@@ -954,7 +996,7 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             self.stop_client()
 
     def buffer_stats(self) -> dict[str, int | float | None]:
-        return self._background_buffer.stats()
+        return {**self._background_buffer.stats(), "wire_backlog_dropped": self._wire_backlog_dropped}
 
     def fps(self) -> float:
         if len(self._avg_time_per_frame) == 0:

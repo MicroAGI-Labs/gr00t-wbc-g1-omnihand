@@ -104,10 +104,30 @@ def test_finalizer_preserves_owned_buffer_and_blocks_after_failure(tmp_path):
 
     assert "metadata failed" in finalizer.status()["error"]
     assert finalizer.status()["last_finalized_episode"] is None
-    with open(tmp_path / "recovery/episode_000000.pkl", "rb") as recovery_file:
+    recovery_path, = (tmp_path / "recovery").glob("episode_000000_*.pkl")
+    with recovery_path.open("rb") as recovery_file:
         recovery = pickle.load(recovery_file)
-    assert recovery["episode_buffer"] == {"episode_index": 0, "size": 2}
+    assert recovery["episode_buffer"]["episode_index"] == 0
+    assert recovery["episode_buffer"]["size"] == 2
+    assert recovery["recording"] == recovery["episode_buffer"]["_recording"]
+    assert recovery["recording"]["id"] in recovery_path.name
     assert not recovery["success"]
     assert writer.stop_timeouts == [30.0]
     assert not finalizer.can_record()
     finalizer.close()
+
+
+def test_repeated_failures_at_same_index_preserve_every_recovery(tmp_path):
+    exporter = FakeExporter(tmp_path)
+    exporter.error = OSError("disk write failed")
+    for _ in range(2):
+        finalizer = EpisodeFinalizer(exporter)
+        try:
+            _enqueue(finalizer)
+            assert finalizer.wait_until_idle(timeout=2)
+        finally:
+            finalizer.close()
+    paths = list((tmp_path / "recovery").glob("episode_000000_*.pkl"))
+    assert len(paths) == 2
+    payloads = [pickle.loads(path.read_bytes()) for path in paths]
+    assert payloads[0]["recording"]["id"] != payloads[1]["recording"]["id"]

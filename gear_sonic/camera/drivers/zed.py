@@ -9,6 +9,7 @@ and a float32 depth map.
 """
 
 from dataclasses import dataclass
+import json
 import time
 from typing import Any
 
@@ -68,6 +69,7 @@ class ZEDSensor(Sensor):
         self._sl = _load_zed_sdk()
         self._camera: Any | None = None
         self._image: Any | None = None
+        self._last_capture_monotonic_ns: int | None = None
 
         resolution_name = self.config.camera_resolution.upper()
         try:
@@ -127,7 +129,10 @@ class ZEDSensor(Sensor):
         if self._camera is None or self._left_image is None or self._right_image is None:
             return None
 
+        read_started_ns = time.monotonic_ns()
+        stage_times_ns = {}
         grab_status = self._camera.grab(self._runtime_params)
+        stage_times_ns["grab"] = time.monotonic_ns() - read_started_ns
         if grab_status != self._sl.ERROR_CODE.SUCCESS:
             print(f"[{self.mount_position}] ZED grab failed: {grab_status}")
             return None
@@ -142,6 +147,7 @@ class ZEDSensor(Sensor):
         images = {}
         for view, mat, name in ((self._sl.VIEW.LEFT, self._left_image, f"{self.mount_position}_left"),
                                 (self._sl.VIEW.RIGHT, self._right_image, self.mount_position)):
+            stage_started_ns = time.monotonic_ns()
             retrieve_status = self._camera.retrieve_image(mat, view, self._sl.MEM.CPU, self._output_resolution)
             if retrieve_status != self._sl.ERROR_CODE.SUCCESS:
                 print(f"[{self.mount_position}] ZED image retrieval failed: {retrieve_status}")
@@ -154,6 +160,7 @@ class ZEDSensor(Sensor):
             if self.config.rotate_180:
                 rgb = rgb[::-1, ::-1]
             images[name] = np.ascontiguousarray(rgb)
+            stage_times_ns[name] = time.monotonic_ns() - stage_started_ns
 
         depths = {}
         if self.config.record_depth and self._depth is not None:
@@ -162,6 +169,7 @@ class ZEDSensor(Sensor):
             # recorded video matches the ZED viewer instead of re-encoding
             # noisy float depth ourselves.
             if self._depth_view is not None and hasattr(self._sl.VIEW, "DEPTH"):
+                stage_started_ns = time.monotonic_ns()
                 view_status = self._camera.retrieve_image(
                     self._depth_view, self._sl.VIEW.DEPTH, self._sl.MEM.CPU, self._output_resolution
                 )
@@ -176,7 +184,9 @@ class ZEDSensor(Sensor):
                 if self.config.rotate_180:
                     depth_view = depth_view[::-1, ::-1]
                 images[depth_name] = depth_view
+                stage_times_ns["depth_view"] = time.monotonic_ns() - stage_started_ns
 
+            stage_started_ns = time.monotonic_ns()
             status = self._camera.retrieve_measure(self._depth, self._sl.MEASURE.DEPTH, self._sl.MEM.CPU,
                                                    self._output_resolution)
             if status != self._sl.ERROR_CODE.SUCCESS:
@@ -191,7 +201,9 @@ class ZEDSensor(Sensor):
             if self.config.rotate_180:
                 depth = depth[::-1, ::-1]
             depths[depth_name] = np.ascontiguousarray(depth)
+            stage_times_ns["depth_measure"] = time.monotonic_ns() - stage_started_ns
 
+        self._report_capture_delay(read_started_ns, sample_monotonic_ns, stage_times_ns)
         timestamps = {name: capture_time for name in images}
         timestamps.update({name: capture_time for name in depths})
         return {
@@ -200,6 +212,32 @@ class ZEDSensor(Sensor):
             "depths": depths,
             "sample_monotonic_ns": sample_monotonic_ns,
         }
+
+    def _report_capture_delay(self, read_started_ns, captured_ns, stage_times_ns) -> None:
+        """Log long captures without changing image timestamps or recovery behavior."""
+        read_ms = (time.monotonic_ns() - read_started_ns) / 1e6
+        capture_gap_ms = (
+            None if self._last_capture_monotonic_ns is None
+            else (captured_ns - self._last_capture_monotonic_ns) / 1e6
+        )
+        self._last_capture_monotonic_ns = captured_ns
+        if read_ms < 100 and (capture_gap_ms is None or capture_gap_ms < 100):
+            return
+        event = {
+            "camera": self.mount_position,
+            "captured_monotonic_ns": captured_ns,
+            "read_ms": round(read_ms, 3),
+            "capture_gap_ms": None if capture_gap_ms is None else round(capture_gap_ms, 3),
+            "stages_ms": {name: round(ns / 1e6, 3) for name, ns in stage_times_ns.items()},
+        }
+        # SDK's cumulative count includes frames superseded before grab(); it
+        # does not by itself diagnose USB loss. Read it only on a slow frame.
+        try:
+            event["sdk_dropped_frames"] = int(self._camera.get_frame_dropped_count())
+        except Exception:
+            # Optional diagnostics must not turn a valid frame into a failure.
+            pass
+        print(f"[ZED capture delay] {json.dumps(event)}", flush=True)
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
         from gear_sonic.camera.sensor_server import ImageMessageSchema

@@ -26,8 +26,8 @@ def test_wrist_frame_keeps_source_timestamp():
         frame,
         inputs({
             "images": {
-                "left_wrist": np.zeros((480, 640, 3), dtype=np.uint8),
-                "right_wrist": np.zeros((480, 640, 3), dtype=np.uint8),
+                "left_wrist": np.zeros((720, 1280, 3), dtype=np.uint8),
+                "right_wrist": np.zeros((720, 1280, 3), dtype=np.uint8),
             },
             "timestamps": {"left_wrist": 100.25, "right_wrist": 100.50},
         }),
@@ -44,8 +44,8 @@ def test_wrist_frame_rejects_missing_source_timestamp():
             {},
             inputs({
                 "images": {
-                    "left_wrist": np.zeros((480, 640, 3), dtype=np.uint8),
-                    "right_wrist": np.zeros((480, 640, 3), dtype=np.uint8),
+                    "left_wrist": np.zeros((720, 1280, 3), dtype=np.uint8),
+                    "right_wrist": np.zeros((720, 1280, 3), dtype=np.uint8),
                 },
                 "timestamps": {},
             }),

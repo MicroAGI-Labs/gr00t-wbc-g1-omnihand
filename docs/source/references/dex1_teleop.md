@@ -143,6 +143,17 @@ headset intent. Health violations still require **Reconnect hands**.
 If startup times out, check motor power and the adapter-to-motor cable even if
 the USB adapter appears in `/dev/serial/by-id`. The fault includes its port and
 motor ID. USB presence alone does not establish motor communication.
+If the first reply still reports an enabled drive, startup repeats only disabled
+queries within the same one-second budget. A healthy disabled acknowledgement is
+required before establishing the position reference or enabling a measured hold.
+A persistent refusal to disable remains a latched fault; voltage, temperature,
+and motor-error faults are never retried by this handshake.
+The disabled handshake also sends `timeout=0`, the HG protocol's documented
+communication-timeout clear value, and waits for feedback to acknowledge that
+the timeout flag is zero before enabling. A delayed acknowledgement is retried
+within the same one-second budget; a flag that stays set faults. This does not
+clear arbitrary `MError` codes or write calibration. See the
+[Unitree HG protocol](https://github.com/unitreerobotics/dex1_1_service/blob/2986d26eefa4136d4777493e6fd0b8bac7a4c6ae/include/unitreeMotor/include/motor_msg_HG.h).
 For a separately managed service, configure stroke timing on that service.
 
 To reuse that already-running service, on Thor:
@@ -220,6 +231,9 @@ The offset stays fixed until that worker exits; runtime position jumps still
 fault. Positions outside all three admitted startup representations still fault.
 Feedback and recording positions use the original profile coordinates; hand
 health also reports `encoder_position_rad` and `encoder_offset_rad` for diagnosis.
+There is no required default starting pose: any measured position admitted by
+this profile starts with a hold at that position. Clearing a timeout does not
+re-zero the encoder or move the gripper to its open or closed endpoint.
 Do not run the stock DDS gripper service or the standalone movement tools at
 the same time. Each native worker claims its port exclusively against new opens.
 

@@ -109,12 +109,14 @@ def assert_stopped(log):
         ("left", 5.30, 5.30, 0),
     ],
 )
+@pytest.mark.parametrize("timeout_delay", [0, 3])
 def test_startup_turn_preserves_profile_positions_and_measured_hold(
-    fake_worker, tmp_path, monkeypatch, side, raw, expected, offset
+    fake_worker, tmp_path, monkeypatch, side, raw, expected, offset, timeout_delay
 ):
     master, slave = os.openpty()
     log = tmp_path / "motor.log"
     monkeypatch.setenv("DEX1_TEST_FEEDBACK_POSITION", str(raw))
+    monkeypatch.setenv("DEX1_TEST_TIMEOUT_ACK_DELAY", str(timeout_delay))
     monkeypatch.setenv("DEX1_TEST_MOTOR_LOG", str(log))
     monkeypatch.setitem(dex1.USB_PORTS, side, os.ttyname(slave))
     backend = None
@@ -147,7 +149,6 @@ def test_startup_turn_preserves_profile_positions_and_measured_hold(
         (-2.36 + 4 * np.pi, {}, "position limit", False),
         (float("nan"), {}, "nonfinite feedback", False),
         (3.90671, {"DEX1_TEST_LOW_VOLTAGE": "1"}, "supply outside", False),
-        (3.90671, {"DEX1_TEST_STARTUP_ENABLED": "1"}, "drive not disabled", False),
         (3.90671, {"DEX1_TEST_ACTIVE_POSITION": str(3.90671 + 2 * np.pi)}, "position limit", True),
         (3.90671, {"DEX1_TEST_ACTIVE_POSITION": str(3.90671 - 2 * np.pi)}, "position limit", True),
         (-2.36, {"DEX1_TEST_ACTIVE_POSITION": "3.2"}, "position limit", True),
@@ -207,6 +208,65 @@ def test_native_startup_retries_only_disabled_communication(fake_worker, tmp_pat
             assert set(modes) == {0}
         if fault == "DEX1_TEST_LOW_VOLTAGE":
             assert len(modes) == 4  # health fault is never retried
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
+@pytest.mark.parametrize("delay,expected_exit", [(3, 0), (1000, 2)])
+@pytest.mark.parametrize("pending,detail", [
+    ("DEX1_TEST_DISABLE_ACK_DELAY", "drive not disabled during startup"),
+    ("DEX1_TEST_TIMEOUT_ACK_DELAY", "communication timeout not cleared during startup"),
+])
+def test_startup_waits_for_disabled_and_timeout_clear_before_enabling(
+    fake_worker, tmp_path, delay, expected_exit, pending, detail
+):
+    master, slave = os.openpty()
+    log = tmp_path / "exchanges.log"
+    clear_log = tmp_path / "timeout-clear.log"
+    try:
+        result = subprocess.run(
+            [str(fake_worker), os.ttyname(slave), "0", "-0.1", "5.75", "1.5", "1"],
+            input="C 1 0 2.5\n", capture_output=True, text=True, timeout=3,
+            env={**os.environ, pending: str(delay),
+                 "DEX1_TEST_EXCHANGE_LOG": str(log), "DEX1_TEST_TIMEOUT_CLEAR_LOG": str(clear_log)},
+        )
+        assert result.returncode == expected_exit, result.stderr
+        modes = [int(line) for line in log.read_text().splitlines()]
+        if expected_exit == 0:
+            assert modes[:5] == [0, 0, 0, 0, 1]
+            assert "startup recovered" in result.stderr
+        else:
+            assert len(modes) > 4 and set(modes) == {0}
+            assert detail in result.stderr
+            assert not result.stdout  # No valid startup state was published.
+        commands = [list(map(float, line.split())) for line in clear_log.read_text().splitlines()]
+        assert all(timeout == 0 for mode, timeout, torque, kp, kd in commands)
+        assert all(torque == kp == kd == 0 for mode, timeout, torque, kp, kd in commands if mode == 0)
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
+@pytest.mark.parametrize("fault,value,detail", [
+    ("DEX1_TEST_LOW_VOLTAGE", "1", "supply outside"),
+    ("DEX1_TEST_MOTOR_ERROR", "1", "motor fault"),
+    ("DEX1_TEST_TEMPERATURE", "60", "temperature limit"),
+])
+@pytest.mark.parametrize("pending", ["DEX1_TEST_DISABLE_ACK_DELAY", "DEX1_TEST_TIMEOUT_ACK_DELAY"])
+def test_pending_startup_never_retries_motor_health_faults(fake_worker, tmp_path, fault, value, detail, pending):
+    master, slave = os.openpty()
+    log = tmp_path / "exchanges.log"
+    try:
+        result = subprocess.run(
+            [str(fake_worker), os.ttyname(slave), "0", "-0.1", "5.75", "1.5", "1"],
+            input="C 1 0 2.5\n", capture_output=True, text=True, timeout=3,
+            env={**os.environ, pending: "1000", fault: value,
+                 "DEX1_TEST_EXCHANGE_LOG": str(log)},
+        )
+        assert result.returncode == 2, result.stderr
+        assert detail in result.stderr
+        assert log.read_text().splitlines() == ["0"] * 4  # One query and three final stop requests.
     finally:
         os.close(slave)
         os.close(master)

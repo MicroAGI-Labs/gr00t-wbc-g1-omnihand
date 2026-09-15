@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import json
 
 import numpy as np
 import pytest
@@ -261,6 +262,54 @@ def test_zed_sensor_returns_none_on_capture_failure(fake_sdk, failure_stage):
         fake_sdk.retrieve_status = fake_sdk.ERROR_CODE.FAILURE
 
     assert sensor.read() is None
+
+
+@pytest.mark.parametrize("slow_stage", ["grab", "ego_view_left", "ego_view", "depth_view", "depth_measure"])
+def test_zed_delay_log_identifies_stage_without_retiming_frame(monkeypatch, capsys, slow_stage):
+    sdk = FakeSDK(image=np.zeros((2, 3, 4), dtype=np.uint8))
+    sdk.VIEW = SimpleNamespace(LEFT="LEFT", RIGHT="RIGHT", DEPTH="DEPTH")
+    sdk.Mat = lambda: FakeMat(sdk.image.copy())
+    clock = [1_000_000_000]
+    monkeypatch.setattr(zed_driver, "_load_zed_sdk", lambda: sdk)
+    monkeypatch.setattr(zed_driver.time, "monotonic_ns", lambda: clock[0])
+    def delay(stage):
+        if stage == slow_stage:
+            clock[0] += 200_000_000
+        return sdk.ERROR_CODE.SUCCESS
+    sdk.camera.grab = lambda runtime: delay("grab")
+    sdk.camera.retrieve_image = lambda mat, view, *args: delay({
+        "LEFT": "ego_view_left", "RIGHT": "ego_view", "DEPTH": "depth_view",
+    }[view])
+    def retrieve_depth(mat, *args):
+        mat.image = sdk.depth
+        return delay("depth_measure")
+    sdk.camera.retrieve_measure = retrieve_depth
+    sdk.camera.get_frame_dropped_count = lambda: 42
+    sensor = zed_driver.ZEDSensor(config=zed_driver.ZEDConfig(image_dim=(3, 2)))
+    sample = sensor.read()
+    line = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("[ZED capture delay]"))
+    event = json.loads(line.removeprefix("[ZED capture delay] "))
+    assert event["stages_ms"][slow_stage] == 200
+    assert sum(event["stages_ms"].values()) == 200
+    assert event["read_ms"] == 200
+    assert event["sdk_dropped_frames"] == 42
+    assert sample["sample_monotonic_ns"] == (1_200_000_000 if slow_stage == "grab" else 1_000_000_000)
+    assert set(sample["images"]) == {"ego_view", "ego_view_left", "ego_view_depth"}
+
+
+def test_zed_logs_gap_between_reads_even_when_sdk_calls_are_fast(fake_sdk, monkeypatch, capsys):
+    clock = [1_000_000_000]
+    monkeypatch.setattr(zed_driver.time, "monotonic_ns", lambda: clock[0])
+    sensor = zed_driver.ZEDSensor(config=zed_driver.ZEDConfig(record_depth=False))
+    sensor.read()
+    assert "[ZED capture delay]" not in capsys.readouterr().out
+    clock[0] += 300_000_000
+    sensor.read()
+    line = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("[ZED capture delay]"))
+    event = json.loads(line.removeprefix("[ZED capture delay] "))
+    assert event["capture_gap_ms"] == 300
+    assert event["read_ms"] == 0
+    assert "sdk_dropped_frames" not in event  # Older SDKs may omit the optional counter.
 
 
 def test_zed_sensor_closes_camera_and_mat(fake_sdk):

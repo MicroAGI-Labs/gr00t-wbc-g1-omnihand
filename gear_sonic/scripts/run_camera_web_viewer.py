@@ -20,6 +20,7 @@ import signal
 import subprocess
 import threading
 import time
+from urllib.parse import parse_qs, urlsplit
 
 import cv2
 from huggingface_hub import HfApi
@@ -124,12 +125,45 @@ _INDEX_HTML = """<!doctype html>
     .pico-joints { max-height: 360px; overflow: auto; }
     #pico-detail { font-size: 12px; color: #9eabb8; overflow-wrap: anywhere; }
     @media (max-width: 700px) { .pico-content { grid-template-columns: 1fr; } }
+    #wrist-preview summary { cursor: pointer; font-size: 14px; font-weight: 650; }
+    .wrist-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; margin: 12px 0; }
+    .wrist-toolbar select { padding: 7px; color: #edf2f7; background: #11151a;
+                            border: 1px solid #465362; border-radius: 5px; }
+    .wrist-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .wrist-grid figure { margin: 0; min-width: 0; }
+    .wrist-grid figcaption { display: flex; justify-content: space-between; gap: 8px;
+                             font-size: 13px; margin-bottom: 8px; }
+    .wrist-grid a { color: #78bdf2; }
+    .wrist-image-box { overflow: auto; background: #090b0e; border-radius: 6px; }
+    .wrist-image-box img { width: 100%; max-width: 100%; max-height: none; box-shadow: none; }
+    .wrist-grid.actual-pixels img { width: auto; max-width: none; }
+    .wrist-feed-status { font-size: 12px; color: #9eabb8; margin-top: 7px; }
+    .wrist-image-box img.stale { opacity: .4; }
+    @media (max-width: 700px) { .wrist-grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <header><h1>SONIC · G1 Teleoperation</h1><span id="camera-status">connecting…</span></header>
   <main>
     <img id="stream" src="/stream.mjpg" alt="Waiting for camera stream">
+    <details id="wrist-preview" class="control-card rate-card" open>
+      <summary>Wrist camera preview</summary>
+      <div class="wrist-toolbar">
+        <span>1280 × 720 · native</span>
+        <label><input id="wrist-actual-pixels" type="checkbox"> Actual pixels</label>
+      </div>
+      <div id="wrist-grid" class="wrist-grid">
+        <figure><figcaption>Left wrist <a id="left-wrist-full" href="/cameras/left_wrist/preview.jpg" target="_blank" rel="noopener">Open full size</a></figcaption>
+          <div class="wrist-image-box"><img id="left-wrist-preview" alt="Waiting for left wrist camera"></div>
+          <div id="left-wrist-status" class="wrist-feed-status" role="status">Waiting for camera…</div>
+        </figure>
+        <figure><figcaption>Right wrist <a id="right-wrist-full" href="/cameras/right_wrist/preview.jpg" target="_blank" rel="noopener">Open full size</a></figcaption>
+          <div class="wrist-image-box"><img id="right-wrist-preview" alt="Waiting for right wrist camera"></div>
+          <div id="right-wrist-status" class="wrist-feed-status" role="status">Waiting for camera…</div>
+        </figure>
+      </div>
+      <div class="rate-note">Wrist feed and recordings use native 1280 × 720. Collapse this panel to pause preview downloads.</div>
+    </details>
     <details id="pico-panel" class="control-card rate-card">
       <summary>Raw PICO body · received <span id="pico-rate">— Hz</span> · <span id="pico-state" class="rate-idle">waiting…</span></summary>
       <div class="pico-toolbar">
@@ -210,6 +244,46 @@ _INDEX_HTML = """<!doctype html>
     </section>
   </main>
   <script>
+    const wristPanel = document.getElementById('wrist-preview');
+    document.getElementById('wrist-actual-pixels').addEventListener('change', event => {
+      document.getElementById('wrist-grid').classList.toggle('actual-pixels', event.target.checked);
+    });
+    for (const side of ['left', 'right']) {
+      const img = document.getElementById(`${side}-wrist-preview`);
+      const status = document.getElementById(`${side}-wrist-status`);
+      const full = document.getElementById(`${side}-wrist-full`);
+      let busy = false, previousUrl = null;
+      async function refreshWrist() {
+        if (busy || !wristPanel.open || document.hidden) return;
+        busy = true;
+        const endpoint = `/cameras/${side}_wrist/preview.jpg`;
+        const abort = new AbortController();
+        const timeout = setTimeout(() => abort.abort(), 2000);
+        try {
+          const response = await fetch(endpoint, {cache: 'no-store', signal: abort.signal});
+          if (!response.ok) throw new Error('preview unavailable');
+          const blob = await response.blob();
+          if (!wristPanel.open) return;
+          const nextUrl = URL.createObjectURL(blob);
+          img.src = nextUrl;
+          await img.decode();
+          if (previousUrl) URL.revokeObjectURL(previousUrl);
+          previousUrl = nextUrl;
+          img.classList.remove('stale');
+          status.textContent = `Live · ${img.naturalWidth} × ${img.naturalHeight}`;
+          full.href = endpoint;
+        } catch (_) {
+          img.classList.add('stale');
+          status.textContent = 'Camera preview unavailable · waiting for fresh frames…';
+        } finally {
+          clearTimeout(timeout);
+          busy = false;
+        }
+      }
+      setInterval(refreshWrist, 125);
+      wristPanel.addEventListener('toggle', refreshWrist);
+      refreshWrist();
+    }
     const picoPanel = document.getElementById('pico-panel');
     const picoCanvas = document.getElementById('pico-canvas');
     const picoContext = picoCanvas.getContext('2d');
@@ -316,6 +390,9 @@ _INDEX_HTML = """<!doctype html>
     let handCommandPending = false;
     const rateLabels = {
       camera: 'Camera server → collector',
+      ego_view: 'Head right camera → collector',
+      ego_view_left: 'Head left camera → collector',
+      ego_view_depth: 'Head depth camera → collector',
       left_wrist: 'Left wrist camera → collector',
       right_wrist: 'Right wrist camera → collector',
       robot_state: 'Robot/C++ → collector',
@@ -327,7 +404,8 @@ _INDEX_HTML = """<!doctype html>
       hand_state: 'Hand controller (state) → collector',
     };
     const collectorReceiverStreams = new Set([
-      'camera', 'left_wrist', 'right_wrist', 'robot_state', 'pico_pose', 'planner',
+      'camera', 'ego_view', 'ego_view_left', 'ego_view_depth',
+      'left_wrist', 'right_wrist', 'robot_state', 'pico_pose', 'planner',
       'manager_state', 'hand_state'
     ]);
     const minimumCollectorReceiverHz = 45;
@@ -402,7 +480,7 @@ _INDEX_HTML = """<!doctype html>
         const readiness = !sourcesReady
           ? 'source missing'
           : !modeReady
-            ? `enter ${status.required_stream_mode_name || 'teleop'} with A+X`
+            ? `enter ${status.required_stream_mode_name || 'teleop'} using the selected control profile`
             : 'sources and teleop ready';
         recordDetail.textContent =
           `episode ${status.episode_index} · ${status.frame_count} frames · ` +
@@ -410,7 +488,7 @@ _INDEX_HTML = """<!doctype html>
           `${status.dataset_root} · ${readiness} · ` +
           (status.recording
             ? 'headset: X+B saves success; Y+B saves failure; Y+A discards (on release)'
-            : 'headset: release X+B to start; A+X twice toggles teleop');
+            : 'headset: release X+B to record; default VR3PT starts with A+B+X+Y, then release/repress side grips');
         recordToggle.textContent = status.recording ? 'Stop & Save' : 'Start Recording';
         recordToggle.className = status.recording ? 'stop' : '';
         recordToggle.disabled = commandPending ||
@@ -654,7 +732,7 @@ class CameraWebViewerConfig:
     jpeg_quality: int = 80
     """JPEG quality used for the browser stream."""
 
-    max_tile_width: int = 960
+    max_tile_width: int = 1280
     """Maximum width of each camera tile."""
 
     recording_command_port: int = 5580
@@ -706,6 +784,7 @@ class CameraFrameHub:
         self._camera_samples: dict[str, deque[tuple[float, float]]] = {}
         self._camera_last_source: dict[str, float] = {}
         self._last_frame_time = 0.0
+        self._native_previews: dict[str, dict] = {}
         self._running = True
         self._client = SensorClient()
         self._client.start_client(config.camera_host, config.camera_port)
@@ -748,6 +827,36 @@ class CameraFrameHub:
             )
             return self._sequence, self._jpeg
 
+    def _update_native_previews(self, images: dict, timestamps: dict, now: float) -> None:
+        for name in ("left_wrist", "right_wrist"):
+            frame, timestamp = images.get(name), timestamps.get(name)
+            if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
+                continue
+            if not isinstance(timestamp, (int, float)) or not np.isfinite(timestamp):
+                continue
+            with self._condition:
+                previous = self._native_previews.get(name)
+                if previous is not None and previous["timestamp"] == timestamp:
+                    continue
+            ok, encoded = cv2.imencode(
+                ".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, self.config.jpeg_quality],
+            )
+            if not ok:
+                continue
+            with self._condition:
+                self._native_previews[name] = {
+                    "timestamp": timestamp, "received_at": now,
+                    "native": encoded.tobytes(),
+                }
+
+    def wrist_preview(self, name: str, resolution: str) -> bytes | None:
+        with self._condition:
+            preview = self._native_previews.get(name)
+            if preview is None or time.monotonic() - preview["received_at"] > 2.0:
+                return None
+            return preview.get(resolution)
+
     def _receive_loop(self) -> None:
         frame_period = 1.0 / max(self.config.fps, 1)
         next_frame_time = 0.0
@@ -770,6 +879,7 @@ class CameraFrameHub:
                 continue
 
             decoded = ImageMessageSchema.deserialize(message)
+            self._update_native_previews(decoded.images, decoded.timestamps, now)
             images = camera_images_with_depth_preview(decoded.images, decoded.depths)
             jpeg = compose_camera_jpeg(
                 images,
@@ -1167,7 +1277,8 @@ def make_handler(
         protocol_version = "HTTP/1.1"
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-            path = self.path.split("?", 1)[0]
+            url = urlsplit(self.path)
+            path = url.path
             if path == "/":
                 self._send_bytes("text/html; charset=utf-8", _INDEX_HTML)
             elif path == "/pico/body":
@@ -1195,6 +1306,16 @@ def make_handler(
                 _, jpeg = frame_hub.wait_for_jpeg(-1, timeout=2.0)
                 if jpeg is None:
                     self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "No camera frame yet")
+                else:
+                    self._send_bytes("image/jpeg", jpeg)
+            elif path in ("/cameras/left_wrist/preview.jpg", "/cameras/right_wrist/preview.jpg"):
+                resolution = parse_qs(url.query).get("resolution", ["native"])[0]
+                if resolution != "native":
+                    self.send_error(HTTPStatus.BAD_REQUEST, "Unsupported preview resolution")
+                    return
+                jpeg = frame_hub.wrist_preview(path.split("/")[2], resolution)
+                if jpeg is None:
+                    self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "No fresh native wrist preview")
                 else:
                     self._send_bytes("image/jpeg", jpeg)
             elif path == "/stream.mjpg":

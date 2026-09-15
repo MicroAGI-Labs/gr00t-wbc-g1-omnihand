@@ -267,6 +267,22 @@ def test_slow_turn_halves_yaw_without_translation(direct_streamer):
     np.testing.assert_array_equal(unpack_pose_message(streamer.packets[-1], "planner")["movement"], [0, 0, 0])
 
 
+@pytest.mark.parametrize("turn", [-1., 1.])
+@pytest.mark.parametrize("head_pitch", [0., 90., 110.])
+def test_joystick_turn_direction_is_independent_of_headset_pitch(direct_streamer, turn, head_pitch):
+    streamer, state, tick = direct_streamer
+    streamer.yaw_accumulator = manager.YawAccumulator()
+    streamer.locomotion.enabled = True
+    state.pose[2, 3:] = Rotation.from_euler("y", head_pitch, degrees=True).as_quat(scalar_first=True)
+    tick()  # Neutral input releases the locomotion interlock.
+    state.axes[2] = turn
+    tick()
+    packet = unpack_pose_message(streamer.packets[-1], "planner")
+    # Robot +Y is left: left stick input (-1) must turn toward +Y.
+    assert np.sign(packet["facing"][1]) == -np.sign(turn)
+    np.testing.assert_array_equal(packet["movement"], [0, 0, 0])
+
+
 def test_latched_tracking_loss_reanchors_after_stopping_without_ax(direct_streamer):
     streamer, state, tick = direct_streamer
     tick()

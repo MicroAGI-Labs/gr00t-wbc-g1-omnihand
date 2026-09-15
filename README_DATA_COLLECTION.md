@@ -326,7 +326,8 @@ do not mix their A+X instructions into the daily direct-controller workflow.
 
 Solo face buttons and recording chords execute when **all face buttons have
 been released**. AXBY does not also fire A, B, X, or a recording chord. XB does
-not also invoke B's arm return. A+X and B+Y have no action in this default profile.
+not also invoke B's arm return. A+X has no action in this default profile;
+B+Y saves a failed recording.
 
 Slow walking maps the active stick range to a **0.1–0.6 m/s command**, with half
 the normal turn rate. It does not force a constant 0.6 m/s velocity. Actual robot
@@ -344,7 +345,9 @@ The other arm retains its independent reference.
 Headset heading defines forward at engagement. Turning the headset while a grip
 is held does not rotate that arm's reference. Head motion does not continuously
 drive the waist in this profile. If the headset is worn around the neck, its
-orientation still matters when engaging a grip.
+orientation still matters when engaging a grip. Heading uses the horizontal
+projection of the headset's left–right axis, so tipping it forward through
+straight down does not reverse arm movement directions.
 
 Controller targets pass through without the removed optional motion conditioner,
 velocity/acceleration/jerk filters, or trace/tuning features. The explicitly
@@ -373,6 +376,9 @@ including Orin's checkout, when moving from the earlier protocol. Current hand
 controllers also accept v2; old controllers do not understand v3.
 
 ## Hand connection and fault recovery
+
+For a short symptom-to-recovery procedure and an evidence capture command, see
+[Teleop recovery](docs/source/references/teleop_recovery.md).
 
 The stack already retries recoverable connection failures. Routine USB transport
 loss does not require repeated clicks on **Reconnect Hands**. A persistent
@@ -441,7 +447,7 @@ because those cameras completed at different times.
 
 The `thor-jr` wrist profile selects the physical JR0001/JR0002 pair by stable
 `/dev/v4l/by-id` paths. It requests 1280×720 MJPEG capture at 60 FPS, two V4L
-buffers, continuous draining, and 640×480 RGB output. The profile also selects
+buffers, continuous draining, and native 1280×720 RGB output. The profile also selects
 60 Hz server publication. There is no fallback to an arbitrary video device
 when a configured side is missing or conflicting.
 
@@ -473,7 +479,7 @@ service installation and the fixed wrist profile.
 | Per-image wall timestamp | Host capture boundary, stored as `capture.<camera>_source_timestamp_ns` where defined. Useful for source identity; not a calibrated hardware exposure timestamp. |
 | Per-image `capture_monotonic_ns` | Host monotonic capture time, independent for each camera. Used by sender-time selection. |
 | Camera publisher timestamp/sequence | Packet publication identity; one packet can include channels captured at different times. |
-| Receiver monotonic timestamp | Arrival at the recorder. Independent of the publisher's clock on another host. |
+| Receiver monotonic timestamp | Dequeue at the recorder, before JPEG decoding. Independent of the publisher's clock on another host. |
 | LeRobot `timestamp` | Logical row time, `frame_index / fps`. Does not prove physical simultaneity or continuous acquisition. |
 
 A republished cached image keeps its capture identity. It must not count as a
@@ -481,10 +487,32 @@ new exposure or advance that camera's sender-time history. Stereo/depth channels
 from one ZED grab retain the same source timestamp. Separate USB cameras are
 not hardware-triggered together by this implementation.
 
+The background receiver drains queued encoded publications before JPEG decoding,
+retaining the newest frame plus its normal reserve after a backlog. Repeated
+captures reuse decoded images. Discarded queued publications are counted in
+`camera_buffer.wire_backlog_dropped` in recorder status. This limits latency
+after receiver stalls; it can drop captures when decoding cannot keep up.
+
 The UI's publisher rate estimates source cadence; receiver rate counts distinct
 captures consumed by the collector. A stalled wrist can drop to zero while the
 ego camera keeps running. The below-45-Hz highlighting is diagnostic, not an
 episode pass/fail threshold. Inspect the required cameras individually.
+
+### Native wrist preview in the browser
+
+The **Wrist camera preview** panel shows the same native 1280×720 RGB images
+used by the main camera view and recorder. **Actual pixels** enables scrolling
+at native size; **Open full size** opens the image in a new tab.
+
+Collapsing the panel pauses preview downloads. A stale feed is dimmed and marked
+unavailable after two seconds. There is no separate native preview camera stream
+or 640×480 wrist resize. Browser images may fit the available screen width while
+retaining their 16:9 proportions. The recorder saves both wrist videos at
+1280×720 and 50 FPS; ZED images retain their existing 640×480 dimensions.
+
+Existing 640×480 wrist datasets cannot be resumed with this schema. This Thor
+uses `/home/unitree/recordings/g1_teleop_native720` for subsequent recordings;
+the 19 episodes in `/home/unitree/recordings/g1_teleop` are preserved.
 
 ### ZED depth: transport versus dataset
 
@@ -495,7 +523,10 @@ applied. The right-eye RGB is the existing `ego_view`.
 `--record-zed-stereo` adds `ego_view_left` and `ego_view_depth` **video features**.
 The recorded depth feature is a 640×480, three-channel uint8 visualization:
 the SDK's depth view when supplied, otherwise a conversion of metric depth
-using the exporter's 0–10 m display range. It passes through the video encoder.
+using the frame's 2nd–98th percentile display range, with invalid pixels black.
+Both the browser and recorder preserve the SDK rendering when it is available.
+Depth aligns with `ego_view_left`; the existing `ego_view` RGB is the right eye.
+It passes through the video encoder.
 It is **not a lossless metric-depth dataset** and should not be used as one.
 Metric-depth archival would require a separate storage feature and validation.
 
@@ -565,8 +596,10 @@ and horizon to use. The exporter does not shift action labels into the future.
 
 Latest mode uses receiver-local monotonic freshness and available per-source
 age/identity checks. It does not subtract a raw Orin monotonic timestamp from a
-Thor monotonic timestamp. Receipt freshness alone cannot remove network delay;
-source and receive fields are kept for diagnosis. Sender-time mode below uses
+Thor monotonic timestamp. For loopback cameras, capture and receive clocks are
+shared, so camera freshness includes transport queuing and decoding. For remote
+cameras, receipt freshness alone cannot remove network delay; source and receive
+fields are kept for diagnosis. Sender-time mode below uses
 a common mapped acquisition timeline instead.
 
 In VR3PT/IK planner modes the row requires planner VR positions and orientations.
@@ -771,7 +804,7 @@ process can keep running after the worktree has moved to a new commit.
 
 ### Persistent local folder and manual upload
 
-This Thor is configured to append to `/home/unitree/recordings/g1_teleop` on
+This Thor is configured to append to `/home/unitree/recordings/g1_teleop_native720` on
 subsequent launches. The machine-local configuration is
 `/home/unitree/.config/sonic/recording.json`. Changing cameras, hand profile, or
 FPS requires a compatible schema or a different dataset folder.
@@ -813,17 +846,24 @@ that a take is durable locally or available remotely.
 ### Video and local finalization
 
 Video writers open lazily on an episode's first frame. Each uses a bounded
-50-frame queue and an encoding thread. Queue capacity is reduced if needed to
-fit a 256 MiB aggregate raw-image queue budget per take (about 220 MiB for five
-640×480 RGB cameras). Encoder working memory and measurement buffers are extra.
+queue and an encoding thread. Queue capacity is calculated from a 2 GiB
+aggregate raw-image queue budget per take, without a separate frame-count cap.
+Two native 1280×720 wrists plus three 640×480 ZED images allow 258 queued rows
+(about 5.16 seconds at 50 Hz). Memory is used as frames enter the queues.
+Encoder working memory and measurement buffers are extra.
 Images are compressed continuously as H.264 (veryfast, CRF 23, zerolatency).
 Every camera queue is checked before admitting a synchronized row; a full queue
 stops the take as unsuccessful rather than silently dropping a camera frame.
 
-Each take owns a unique `.recording/<id>/` directory on the dataset disk.
-On acceptance, video containers are closed and moved to their final paths,
-then the table and metadata are committed. No full-episode raw image buffer
-is retained.
+Each take owns a timestamped `.recording/<id>/` directory on the dataset disk,
+for example `episode_000004_20260912T090838.123456Z_<uuid>`. The UTC time is
+assigned at the first frame; the UUID keeps takes distinct even when their
+episode numbers and clock times match. `meta/info.json` records each saved
+take's ID and `started_at_utc` under `episode_recordings`.
+On acceptance, video containers are closed and linked to the standard numbered
+LeRobot paths. Their unique source paths remain available until the table and
+metadata commit, then staging links are removed. No full-episode raw image
+buffer is retained.
 
 At stop, `detach_episode()` hands the completed buffer and existing writers to
 the finalizer and creates an empty next buffer. It does not eagerly open the
@@ -839,10 +879,16 @@ The exporter checks episode timestamps before file work, preserves the source
 buffer, and restores in-memory metadata state when finalization raises. On
 failure, the finalizer attempts to stop its writers and persists the owned
 measurements, video references, and validation result to
-`recovery/episode_<index>.pkl` using a temporary
-file, flush/fsync, and replacement. The error remains visible and blocks new
-recordings. Recovery is for deliberate inspection/repair; it is not an automatic
-replay service or a guarantee against power loss during any multi-file write.
+`recovery/episode_<index>_<UTC-time>_<uuid>_<suffix>.pkl` using a temporary
+file, flush/fsync, and atomic publication without overwriting earlier recovery
+files. The error remains visible and blocks new recordings until restart.
+When saving after restart, files left at the next uncommitted episode number
+are preserved in a timestamped `recovery/*_uncommitted/` directory, with a
+metadata snapshot and `manifest.json` mapping their original paths. This frees
+the numbered paths for the new take without losing earlier videos. A dataset
+write lock and metadata checks prevent another recorder from replacing a
+committed episode. LeRobot filenames and upload compatibility are retained.
+Recovery of an earlier take remains a deliberate repair operation.
 
 ### Success and failure both save
 

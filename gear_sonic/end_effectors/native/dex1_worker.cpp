@@ -30,6 +30,7 @@ constexpr float kOutputTurn = 6.2831853071795864769f;
 void on_signal(int) { interrupted = 1; }
 void check(bool ok, const std::string& why) { if (!ok) throw std::runtime_error(why); }
 struct CommunicationError : std::runtime_error { using std::runtime_error::runtime_error; };
+struct StartupPending : std::runtime_error { using std::runtime_error::runtime_error; };
 double seconds(Clock::duration d) { return std::chrono::duration<double>(d).count(); }
 
 float startup_position_offset(float raw, float lower, float upper) {
@@ -64,6 +65,8 @@ MotorCmd command(int id, int mode, float tau = 0) {
     MotorCmd c;
     c.motorType = MotorType::M4010; c.hex_len = 0; c.id = id; c.mode = mode;
     c.tau = tau/25; c.q = c.dq = c.kp = c.kd = 0;
+    // HG protocol: sending timeout=0 clears the communication-timeout flag.
+    // This does not reset MError or write motor calibration.
     c.timeout = 0; c.Res = {}; c.res = 0;
     return c;
 }
@@ -139,8 +142,12 @@ struct Motor {
         check(data.merror == 0, "motor fault " + std::to_string(data.merror));
         check(voltage() >= 24 && voltage() <= 64, "supply outside 24-64 V");
         check(data.temp < 55 && data.get_motor_recv_data()[4] < 80, "temperature limit");
+        if (mode == 0 && data.timeout != 0)
+            throw StartupPending("communication timeout not cleared during startup");
         if (!position_reference_ready) {
-            check(mode == 0 && data.mode == 0, "drive not disabled during startup");
+            check(mode == 0, "startup requires a disabled command");
+            if (data.mode != 0)
+                throw StartupPending("drive not disabled during startup");
             position_offset = startup_position_offset(raw_q(), lower, upper);
             position_reference_ready = true;
             if (position_offset != 0)
@@ -160,6 +167,14 @@ struct Motor {
         // Python service may start a new disabled handshake and measured hold.
         const auto deadline = Clock::now() + std::chrono::seconds(1);
         int retries = 0;
+        const auto retry_disabled = [&] {
+            ++retries;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            // Only the disabled handshake may discard input and retry.
+            // Runtime queue faults unwind through stop() instead.
+            if (tcflush(lock_fd, TCIFLUSH) != 0)
+                throw CommunicationError("cannot clear motor receive queue: " + port_name);
+        };
         while (true) {
             try {
                 exchange(0);
@@ -175,12 +190,14 @@ struct Motor {
                 if (Clock::now() >= deadline)
                     throw CommunicationError(std::string(e.what()) +
                         "; startup timed out with drive disabled; check motor power and data cable");
-                ++retries;
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                // Only the disabled handshake may discard input and retry.
-                // Runtime queue faults unwind through stop() instead.
-                if (tcflush(lock_fd, TCIFLUSH) != 0)
-                    throw CommunicationError("cannot clear motor receive queue: " + port_name);
+                retry_disabled();
+            } catch (const StartupPending&) {
+                // After a USB interruption, the drive can still report the
+                // previous enabled state or timeout flag. Retry only mode 0
+                // with timeout=0 until both acknowledge. Health checks run
+                // first; a persistent startup refusal remains a latched fault.
+                if (Clock::now() >= deadline) throw;
+                retry_disabled();
             }
         }
     }
@@ -231,6 +248,7 @@ void self_test() {
         auto c = command(id, 1, tau); c.modify_data(&c);
         auto* p = c.get_motor_send_data(); int16_t wire; std::memcpy(&wire,p+4,2);
         check(c.hex_len == 20 && (p[2]&15) == id && ((p[2]>>4)&7) == 1, "packet address");
+        check((p[2]&0x80) == 0, "wire timeout clear bit");
         check(std::abs(wire*25.0f/2560) <= kTorque+.01f && (tau == 0 ? wire == 0 : tau*wire > 0), "wire torque");
         for (int i = 6; i < 16; ++i) check(p[i] == 0, "wire position/gains must be zero");
     }

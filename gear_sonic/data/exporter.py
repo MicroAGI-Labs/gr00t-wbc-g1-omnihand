@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import uuid
 from typing import Any
 
 import datasets
@@ -31,6 +30,11 @@ from PIL import Image as PILImage
 import torch
 from torchvision import transforms
 
+from gear_sonic.data.recording_identity import (
+    preserve_uncommitted_files,
+    recording_identity,
+    recording_write_lock,
+)
 from gear_sonic.data.video_writer import VideoWriter
 
 disable_progress_bars()
@@ -228,7 +232,7 @@ class Gr00tDataExporter(LeRobotDataset):
         tolerance_s: float = 1e-4,
         vcodec: str = "h264",
         overwrite_existing: bool = False,
-        max_video_buffer_bytes: int = 256 * 1024**2,
+        max_video_buffer_bytes: int = 2 * 1024**3,
     ) -> "Gr00tDataExporter":
         if max_video_buffer_bytes <= 0:
             raise ValueError("video memory budget must be positive")
@@ -305,8 +309,8 @@ class Gr00tDataExporter(LeRobotDataset):
         row_bytes = sum(int(np.prod(self.meta.shapes[key])) for key in self.video_keys)
         if row_bytes > self.max_video_buffer_bytes:
             raise RecordingMemoryLimitError("video queue budget cannot hold one camera row")
-        buffer_size = min(50, self.max_video_buffer_bytes // max(1, row_bytes))
-        staging_root = self.root / ".recording" / uuid.uuid4().hex
+        buffer_size = self.max_video_buffer_bytes // max(1, row_bytes)
+        staging_root = self.root / ".recording" / recording_identity(self.episode_buffer)["id"]
         try:
             for key in self.meta.video_keys:
                 video_writers[key] = VideoWriter(
@@ -339,6 +343,8 @@ class Gr00tDataExporter(LeRobotDataset):
 
         if self.episode_buffer is None:
             self.episode_buffer = self.create_episode_buffer()
+
+        recording_identity(self.episode_buffer)
 
         if self.video_keys and not self.video_writers:
             self.video_writers = self.create_video_writer()
@@ -405,18 +411,35 @@ class Gr00tDataExporter(LeRobotDataset):
         success: bool | None = None,
         validation: dict[str, Any] | None = None,
     ) -> None:
+        with recording_write_lock(self.root):
+            self._save_episode(
+                episode_data, video_writers=video_writers, discarded=discarded,
+                success=success, validation=validation,
+            )
+
+    def _save_episode(
+        self,
+        episode_data: dict | None = None,
+        *,
+        video_writers: dict[str, VideoWriter] | None = None,
+        discarded: bool = False,
+        success: bool | None = None,
+        validation: dict[str, Any] | None = None,
+    ) -> None:
         active_episode = episode_data is None
         # The deprecated discarded argument retains its old removal-marker
         # meaning. A failed outcome alone must never mark a take for removal.
         if success is None:
             success = not discarded
         source_buffer = self.episode_buffer if active_episode else episode_data
+        identity = recording_identity(source_buffer)
         # Finalization pops and stacks fields. Retain a detached source buffer
         # unchanged so a failed background job can persist it for recovery.
         # Video columns contain staging paths, never whole-episode pixels.
         episode_buffer = {
             key: list(value) if key in self.video_keys else copy.deepcopy(value)
             for key, value in source_buffer.items()
+            if key != "_recording"
         }
         writers = self.video_writers if video_writers is None else video_writers
 
@@ -451,6 +474,8 @@ class Gr00tDataExporter(LeRobotDataset):
             self.fps,
             self.tolerance_s,
         )
+
+        preserve_uncommitted_files(self.root, episode_index)
 
         metadata_state = {
             attribute: copy.deepcopy(getattr(self.meta, attribute))
@@ -540,6 +565,9 @@ class Gr00tDataExporter(LeRobotDataset):
                 or {"passed": bool(success), "errors": []},
             }
             self.meta.info["episode_quality"] = quality
+            identities = dict(self.meta.info.get("episode_recordings", {}))
+            identities[str(episode_index)] = dict(identity)
+            self.meta.info["episode_recordings"] = identities
             self.meta.save_episode(
                 episode_index,
                 episode_length,
@@ -554,6 +582,7 @@ class Gr00tDataExporter(LeRobotDataset):
         quality_path = self.root / "meta" / "episode_quality.jsonl"
         quality_record = {
             "episode_index": episode_index,
+            "recording": dict(identity),
             "success": bool(success),
             "validation": validation or {"passed": bool(success), "errors": []},
         }
@@ -568,6 +597,19 @@ class Gr00tDataExporter(LeRobotDataset):
             # The success flag is also stored per frame. Do not turn a fully
             # committed episode into a false finalizer failure over this audit log.
             print(f"[Exporter] Could not append episode quality record: {exc}")
+
+        # Keep the take's unique source paths until the dataset commit succeeds.
+        # A failed save can then recover its own videos even if the index is reused.
+        for key, writer in writers.items():
+            source = Path(writer.output_path)
+            destination = self.root / self.meta.get_video_file_path(episode_index, key)
+            if source != destination and source.parent.parent == self.root / ".recording":
+                try:
+                    source.unlink()
+                    self._remove_empty_staging_directory(source.parent)
+                    writer.output_path = destination
+                except OSError as exc:
+                    print(f"[Exporter] Saved episode; could not clean staged video {source}: {exc}")
 
         if active_episode:
             self.episode_buffer = self.create_episode_buffer()
@@ -593,9 +635,9 @@ class Gr00tDataExporter(LeRobotDataset):
             if source != destination:
                 if destination.exists():
                     raise FileExistsError(f"Refusing to overwrite existing video: {destination}")
-                os.replace(source, destination)
-                writer.output_path = destination
-                self._remove_empty_staging_directory(source.parent)
+                # Atomic no-overwrite publication; retain the timestamped source
+                # until metadata commits, so failed saves keep stable video paths.
+                os.link(source, destination)
             video_paths[key] = str(destination)
         return video_paths
 

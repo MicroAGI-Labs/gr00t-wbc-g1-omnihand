@@ -20,8 +20,8 @@ from gear_sonic.end_effectors.profiles import HandProfile, raw_hand_name
 
 EGO_VIEW_HEIGHT: int = 480
 EGO_VIEW_WIDTH: int = 640
-WRIST_VIEW_HEIGHT: int = 480
-WRIST_VIEW_WIDTH: int = 640
+WRIST_VIEW_HEIGHT: int = 720
+WRIST_VIEW_WIDTH: int = 1280
 FPS: int = 50
 
 
@@ -673,7 +673,7 @@ def get_features_sonic_vla(
 
 
 def get_wrist_camera_features() -> dict:
-    """Optional wrist videos and their original host capture timestamps."""
+    """Native 1280x720 wrist videos and their original host capture timestamps."""
     features = {}
     for name in ("left_wrist", "right_wrist"):
         features[f"observation.images.{name}"] = {
