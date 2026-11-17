@@ -47,7 +47,8 @@ service is managed separately with systemd. Check the service with:
 ```
 
 The physical profile is device-specific: left is JR motor 0 with the measured
-`-0.10..5.75` guard, and right is motor 1 with the `-2.60..3.10` guard. Do not
+`-2.60..3.10` guard, and right is motor 1 with the `-0.10..5.75` guard (the
+`dex1.v1` profile in `gear_sonic/end_effectors/profiles.py`). Do not
 run another gripper service on those serial ports. Confirm physical left/right
 motion during the first hardware run; USB enumeration alone does not establish
 the motor connection.
