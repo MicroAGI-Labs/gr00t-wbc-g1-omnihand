@@ -141,6 +141,11 @@ DEX3 = HandProfile(
     ),
 )
 
+# NOTE (atlas-os-g1d-runtime ADR 0003, 2026-11-18): on the G1-D these two grippers' motors measured the other way
+# round: the robot's LEFT jaw is motor id 0 and travels about 0.08 (closed) .. 5.36 (open) rad, the RIGHT jaw is motor
+# id 1 and travels about -2.37 .. 2.89 rad (dex1_bench calibrate, with the robot's left confirmed physically). That
+# matches docs/source/references/dex1_teleop.md (left -0.10..5.75, right -2.60..3.10), not the side assignment below.
+# Check this rig's motor-to-side mapping (Dex1Backend MOTOR_IDS and USB_PORTS) before relying on these limits.
 DEX1 = HandProfile(
     "dex1.v1",
     SideProfile(("left_gripper_motor_joint",), (-2.60,), (3.10,), (9.0,), (2.84,), (-2.36,)),
